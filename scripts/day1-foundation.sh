@@ -16,6 +16,7 @@ CUDA_DIR="$WORKSPACE/ggml/src/ggml-cuda"
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 cd "$WORKSPACE"
@@ -268,14 +269,16 @@ echo -e "${BLUE}[5/5]${NC} Configuring CMake build..."
 
 cd "$WORKSPACE/build"
 
-cmake .. \
+if cmake .. \
     -DGGML_CUDA=ON \
     -DCMAKE_CUDA_ARCHITECTURES=121 \
     -DCMAKE_BUILD_TYPE=Release \
-    -GNinja \
-    > /dev/null 2>&1
-
-echo -e "${GREEN}✓${NC}  CMake configured with -DCMAKE_CUDA_ARCHITECTURES=121"
+    -GNinja; then
+    echo -e "${GREEN}✓${NC}  CMake configured with -DCMAKE_CUDA_ARCHITECTURES=121"
+else
+    echo -e "${RED}✗${NC}  CMake configuration failed!"
+    exit 1
+fi
 
 echo ""
 echo "================================================================"
