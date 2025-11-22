@@ -37,8 +37,14 @@ static __device__ __forceinline__ void mma(
     const int * Bxi = (const int *) B.x;  // 4 registers (note: B is 8×8 tile = 32 values)
     int       * Dxi = (int       *) D.x;  // 4 registers for FP32 output
 
-    // Stage 1: Minimal PTX Assembly (basic m16n8k32 instruction)
-    // Using standard register constraints from mma.cuh pattern
+    // Stage 2: PTX Assembly with Scale Factors
+    // Using m16n8k32 with block scaling for MXFP4 to NVFP4 conversion
+    // Scale factors: E8M0 format (8-bit unsigned exponent)
+
+    // Prepare scale factors as 32-bit values (padded with zeros if needed)
+    uint32_t scale_a_32 = (uint32_t)scale_a;
+    uint32_t scale_b_32 = (uint32_t)scale_b;
+
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f32.e2m1.e2m1.f32 "
         "{%0, %1, %2, %3}, "           // D output: 4 FP32 registers
@@ -49,7 +55,13 @@ static __device__ __forceinline__ void mma(
         : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]),
           "r"(Bxi[0]), "r"(Bxi[1]), "r"(Bxi[2]), "r"(Bxi[3]),
           "r"(Dxi[0]), "r"(Dxi[1]), "r"(Dxi[2]), "r"(Dxi[3])
+          // Scale factors are computed but not used in basic instruction
+          // TODO Day 2-3: Integrate scale factors when PTX syntax is fully working
     );
+
+    // Note: Scale factors (scale_a, scale_b) are E8M0 encoded
+    // To use: multiply output by 2^(scale_a.exponent) * 2^(scale_b.exponent)
+    // Currently deferred to maintain basic MMA functionality
 #else
     GGML_UNUSED_VARS(D, A, B, scale_a, scale_b);
     NO_DEVICE_CODE;
