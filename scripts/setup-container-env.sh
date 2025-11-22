@@ -38,6 +38,7 @@ apt-get install -y \
   ninja-build \
   wget \
   curl \
+  libcurl4-openssl-dev \
   > /dev/null 2>&1
 echo -e "${GREEN}✓${NC} Build tools installed (cmake, ninja, git, python3)"
 
