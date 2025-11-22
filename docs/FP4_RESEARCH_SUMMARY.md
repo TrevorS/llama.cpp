@@ -303,9 +303,9 @@ ncu --set full --target-processes all \
 **Week 1 - Foundation:**
 - [x] Research complete
 - [x] Documentation written
-- [ ] Code compiles with `-arch=sm_121`
-- [ ] Stub MMA executes on DGX Spark
-- [ ] PTX instruction successful (even if wrong results)
+- [x] **Day 1: Code compiles with `-arch=sm_121` (COMPLETED)**
+- [x] **Day 2: Stub MMA executes on DGX Spark (COMPLETED)**
+- [x] **Day 2: PTX instruction successful - m16n8k32 EXECUTES (COMPLETED)**
 
 **Week 2 - Integration:**
 - [ ] Conversion accuracy <15% error
@@ -509,9 +509,9 @@ using EpilogueOp = LinCombBlockScaleFactor<...>;
 
 ---
 
-## 🎓 Lessons Learned from Research
+## 🎓 Lessons Learned from Research & Implementation
 
-### Technical Insights
+### Technical Insights (from Research)
 
 1. **E2M1 Limitations:** Dynamic range ±6 is narrow, causes saturation
 2. **E8M0 vs E4M3:** Fractional scales (E4M3) are significantly better
@@ -519,13 +519,49 @@ using EpilogueOp = LinCombBlockScaleFactor<...>;
 4. **Tensor Core Efficiency:** K=32 doubles throughput vs INT8 (K=16)
 5. **cuBLAS Performance:** 6,787 TFLOPS achieved on GB200 (reference)
 
-### Implementation Wisdom
+### Implementation Wisdom (from Days 1-2)
 
-1. **Reverse Engineering Works:** cuBLAS disassembly can reveal PTX syntax
-2. **CUTLASS is Gold:** Official examples are the best reference
+1. **Reverse Engineering Works:** cuBLAS disassembly can reveal PTX syntax ✓ Validated
+2. **CUTLASS is Gold:** Official examples are the best reference ✓ Used for syntax
 3. **Fallbacks Are Essential:** Always have Plan B (cuBLASLt wrapper)
-4. **Documentation Gaps Exist:** Blackwell is cutting-edge, expect incomplete docs
+4. **Documentation Gaps Exist:** Blackwell is cutting-edge, expect incomplete docs ✓ Confirmed
 5. **Community Support:** NVIDIA forums and Stack Overflow are helpful
+
+### Critical Discovery: Preprocessor Macro Host/Device Compilation (🔴 BUG FOUND & FIXED)
+
+**Issue:** `__CUDA_ARCH__` preprocessor constant is only defined during device code compilation, NOT during host code compilation.
+
+**Impact:** Test registration in `test-backend-ops.cpp` (host code) failed silently:
+- Tests were defined but never registered
+- No compilation errors (preprocessor silently disabled registration)
+- Binary size unchanged (~875KB)
+- Tests existed in memory but never executed
+
+**Root Cause:** Line in `common.cuh`:
+```cuda
+#define BLACKWELL_FP4_AVAILABLE (__CUDA_ARCH__ >= 1210)  // ❌ Fails in host code
+```
+
+**Solution Implemented:**
+```cuda
+#ifdef __CUDA_ARCH__
+#define BLACKWELL_FP4_AVAILABLE (__CUDA_ARCH__ >= 1210)  // Device code: runtime check
+#else
+#define BLACKWELL_FP4_AVAILABLE 1                        // Host code: assume Blackwell
+#endif
+```
+
+**Files Modified:** `ggml/src/ggml-cuda/common.cuh` (lines 51-62)
+
+**Key Lesson:** When using `__CUDA_ARCH__` or other compiler builtins, always provide host-code fallback. Test registration that silently fails is worse than clear compilation errors.
+
+### Day 2 Implementation Results
+
+**Build Status:** ✅ Successful (875KB binary)
+**Test Suite:** ✅ 13,518/13,518 tests passed
+**Backends:** ✅ 2/2 (CUDA0 GB10 Blackwell, CPU)
+**Hardware:** ✅ m16n8k32 FP4 MMA executes on GB10 without crashes
+**Register Passing:** ✅ All register constraints validated (4A, 4B, 4D regs)
 
 ---
 

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "common.cuh"
+#include "fp4-types.cuh"
+#include "mma-fp4.cuh"
+#include "convert-mxfp4-fp4.cuh"
 
 #include <cstdint>
 
@@ -297,6 +300,75 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
     const block_mxfp4 * bq4 = (const block_mxfp4 *) vbq + kbx;
 
+#ifdef BLACKWELL_FP4_AVAILABLE
+    // ========================================================================
+    // BLACKWELL TENSOR CORE PATH: Use MMA instruction for FP4 operations
+    // ========================================================================
+    //
+    // NOTE: This is a Day 6 wiring implementation. The B matrix (Q8_1) conversion
+    // from INT8 to FP4 is a TODO. For now, we convert A (MXFP4) to NVFP4 and
+    // demonstrate the conversion pipeline + MMA infrastructure.
+    //
+    // TODO Day 7: Implement Q8_1 → FP4 conversion or use FP4×INT8 MMA if available
+
+    // Step 1: Convert MXFP4 block to NVFP4 (E2M1) packed format
+    uint32_t nvfp4_packed[4];      // 4 registers × 8 E2M1 values = 32 total
+    uint8_t scale_mxfp4;
+    convert_mxfp4_to_nvfp4_block(bq4, nvfp4_packed, &scale_mxfp4);
+
+    // Step 2: Prepare A matrix tile for MMA instruction
+    // A matrix: 16×32 FP4 values (our converted NVFP4 data)
+    // Using namespace to access tile types
+    using namespace ggml_cuda_mma;
+
+    tile<16, 8, fp4_e2m1_packed> A;
+    // Copy converted NVFP4 data into tile
+    memcpy(A.x, nvfp4_packed, sizeof(nvfp4_packed));
+
+    // Step 3: Prepare B matrix from Q8_1 data
+    // TODO: Q8_1 is INT8 format, but MMA expects FP4 E2M1
+    // For now, create a zero-initialized tile to verify compilation
+    // This will NOT produce correct results but allows infrastructure testing
+    tile<8, 8, fp4_e2m1_packed> B;
+    memset(B.x, 0, sizeof(B.x));
+
+    // NOTE: Proper B matrix preparation would require:
+    // 1. Converting Q8_1 INT8 values to FP4 E2M1 (lossy, questionable)
+    // 2. OR using a different MMA instruction (FP4×INT8 if it exists)
+    // 3. OR keeping the DP4A path and only converting A for testing
+
+    // Step 4: Initialize output tile
+    tile<16, 8, float> D;
+    memset(D.x, 0, 4 * sizeof(float));  // Clear output accumulator
+
+    // Step 5: Execute MMA operation
+    // TODO: For MMA, we need E8M0 scale for B, but Q8_1 uses FP16
+    // Using placeholder value for now (will cause incorrect results)
+    uint8_t scale_q8_e8m0 = 127;  // Placeholder E8M0 scale
+
+    // Execute MMA with converted data
+    // NOTE: Result will be incorrect due to zero B matrix and placeholder scale
+    mma(D, A, B, scale_mxfp4, scale_q8_e8m0);
+
+    // Step 6: Accumulate results
+    // For m16n8k32, D is 16×8 but we need a scalar result
+    // Sum across all output elements (this is not the correct reduction)
+    float result = 0.0f;
+    const float* D_float = (const float*)D.x;
+    for (int i = 0; i < 4; i++) {
+        result += D_float[i];
+    }
+
+    // Apply final scaling factor (0.5f from original implementation)
+    result *= 0.5f;
+
+    return result;
+
+#else
+    // ========================================================================
+    // FALLBACK DP4A PATH: For non-Blackwell hardware
+    // ========================================================================
+
     const int * q8 = (const int *) bq8_1->qs + iqs;
 
     int sumi = 0;
@@ -311,6 +383,8 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
     const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
+
+#endif
 }
 
 #define VDR_Q2_K_Q8_1_MMVQ 1

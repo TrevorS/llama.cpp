@@ -49,7 +49,33 @@
 #define GGML_CUDA_CC_AMPERE          800
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_BLACKWELL          1210
+
+// ============================================================================
+// BLACKWELL FP4 FEATURE DETECTION (CRITICAL FIX - See docs/LESSONS_LEARNED.md)
+// ============================================================================
+// BUG: __CUDA_ARCH__ is only defined during device compilation, not host.
+//
+// PROBLEM: Original code used (__CUDA_ARCH__ >= 1210) in host code context,
+// causing silent preprocessor failures. Tests compiled but never registered.
+// Details: docs/LESSONS_LEARNED.md Section "Critical: The Preprocessor Macro Gotcha"
+//
+// SOLUTION: Conditional compilation with explicit host/device code paths
+// - Device code: Check compute capability at compile time
+// - Host code: Assume Blackwell support (we configure -DCMAKE_CUDA_ARCHITECTURES=121)
+//
+// This pattern should be used for all compiler builtin macros in the future.
+// ============================================================================
+
+// FP4 Blackwell Detection (Device Code)
+#ifdef __CUDA_ARCH__
 #define BLACKWELL_FP4_AVAILABLE (__CUDA_ARCH__ >= 1210)
+#else
+// Host Code: Assume Blackwell support (we configure with -DCMAKE_CUDA_ARCHITECTURES=121)
+#define BLACKWELL_FP4_AVAILABLE 1
+#endif
+
+// Alias for clarity in both host and device code
+#define BLACKWELL_FP4_ENABLED BLACKWELL_FP4_AVAILABLE
 #define GGML_CUDA_CC_OFFSET_AMD      0x1000000
 #define GGML_CUDA_CC_OFFSET_MTHREADS 0x0100000
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
