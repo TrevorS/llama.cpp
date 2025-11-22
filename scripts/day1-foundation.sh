@@ -19,6 +19,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 cd "$WORKSPACE"
+git config --global --add safe.directory /workspace 2>/dev/null || true
 
 # ============================================================================
 # Step 1: Add Blackwell Detection to common.cuh

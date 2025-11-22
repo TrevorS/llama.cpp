@@ -81,6 +81,7 @@ fi
 echo ""
 echo -e "${BLUE}[5/6]${NC} Verifying git repository..."
 cd /workspace
+git config --global --add safe.directory /workspace
 BRANCH=$(git branch --show-current)
 STATUS=$(git status --short | wc -l)
 echo -e "${GREEN}✓${NC} Branch: $BRANCH"
