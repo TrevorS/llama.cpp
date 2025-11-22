@@ -6494,6 +6494,178 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// ============================================================================
+// FP4 Tensor Core Tests (Blackwell GB10)
+// ============================================================================
+
+#ifdef BLACKWELL_FP4_AVAILABLE
+
+// Test Level 0: Execution Test
+struct test_fp4_execution : public test_case {
+    const int64_t m, n, k;
+
+    test_fp4_execution(int64_t m = 16, int64_t n = 8, int64_t k = 32)
+        : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return "m=" + std::to_string(m) + ", n=" + std::to_string(n) + ", k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.5;
+    }
+};
+
+// Test Level 1: Zero Test
+struct test_fp4_zero : public test_case {
+    const int64_t m, n, k;
+
+    test_fp4_zero(int64_t m = 16, int64_t n = 8, int64_t k = 32)
+        : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return "zero_m=" + std::to_string(m) + ", n=" + std::to_string(n) + ", k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.0f, 0.0f);
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+};
+
+// Test Level 2: Identity Test
+struct test_fp4_identity : public test_case {
+    const int64_t m, n, k;
+
+    test_fp4_identity(int64_t m = 16, int64_t n = 16, int64_t k = 32)
+        : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return "identity_m=" + std::to_string(m) + ", n=" + std::to_string(n) + ", k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            size_t nels = ggml_nelements(t);
+            std::vector<float> data(nels, 0.0f);
+            int64_t rows = t->ne[1];
+            int64_t cols = t->ne[0];
+            for (int64_t i = 0; i < std::min(rows, cols); i++) {
+                data[i * cols + i] = 1.0f;
+            }
+            std::vector<uint8_t> dataq(ggml_row_size(t->type, nels));
+            ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, nels, nels, nullptr);
+            ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.15;
+    }
+};
+
+// Test Level 3: Simple Values Test
+struct test_fp4_simple_values : public test_case {
+    const int64_t m, n, k;
+
+    test_fp4_simple_values(int64_t m = 16, int64_t n = 8, int64_t k = 32)
+        : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return "simple_m=" + std::to_string(m) + ", n=" + std::to_string(n) + ", k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 1.0f, 1.0f);
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.15;
+    }
+};
+
+// Test Level 4: Correctness Test
+struct test_fp4_correctness : public test_case {
+    const int64_t m, n, k;
+
+    test_fp4_correctness(int64_t m = 32, int64_t n = 16, int64_t k = 64)
+        : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return "correct_m=" + std::to_string(m) + ", n=" + std::to_string(n) + ", k=" + std::to_string(k);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        return ggml_mul_mat(ctx, a, b);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.0f, 2.0f);
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.20;
+    }
+};
+
+#endif // BLACKWELL_FP4_AVAILABLE
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
@@ -7841,6 +8013,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // FP4 Tensor Core MMA Tests (Blackwell GB10)
+    #ifdef BLACKWELL_FP4_AVAILABLE
+    test_cases.emplace_back(new test_fp4_execution());
+    test_cases.emplace_back(new test_fp4_zero());
+    test_cases.emplace_back(new test_fp4_identity());
+    test_cases.emplace_back(new test_fp4_simple_values());
+    test_cases.emplace_back(new test_fp4_correctness());
+    #endif
 
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
