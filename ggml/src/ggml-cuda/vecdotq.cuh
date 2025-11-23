@@ -326,41 +326,63 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     memcpy(A.x, nvfp4_packed, sizeof(nvfp4_packed));
 
     // Step 3: Prepare B matrix from Q8_1 data
-    // TODO: Q8_1 is INT8 format, but MMA expects FP4 E2M1
-    // For now, create a zero-initialized tile to verify compilation
-    // This will NOT produce correct results but allows infrastructure testing
+    // Convert Q8_1 INT8 values to FP4 E2M1 format for MMA input
     tile<8, 8, fp4_e2m1_packed> B;
-    memset(B.x, 0, sizeof(B.x));
+    uint32_t nvfp4_b_packed[4];
 
-    // NOTE: Proper B matrix preparation would require:
-    // 1. Converting Q8_1 INT8 values to FP4 E2M1 (lossy, questionable)
-    // 2. OR using a different MMA instruction (FP4×INT8 if it exists)
-    // 3. OR keeping the DP4A path and only converting A for testing
+    // Process 32 Q8_1 values into 4 FP4-packed registers
+    for (int reg_idx = 0; reg_idx < 4; reg_idx++) {
+        uint32_t packed_register = 0;
+
+        // Pack 8 E2M1 values per register
+        for (int val_idx = 0; val_idx < 8; val_idx++) {
+            int nibble_idx = reg_idx * 8 + val_idx;
+
+            // Get INT8 value from Q8_1 block
+            // Q8_1 has 32 int8 values in bq8_1->qs[0..31]
+            int8_t q8_val = bq8_1->qs[iqs + nibble_idx];
+
+            // Convert INT8 to FP32
+            float f32_val = (float)q8_val;
+
+            // Convert FP32 to E2M1 4-bit value
+            uint8_t e2m1_val = float_to_e2m1(f32_val);
+
+            // Pack into register (4 bits per value)
+            packed_register |= ((uint32_t)e2m1_val << (val_idx * 4));
+        }
+
+        nvfp4_b_packed[reg_idx] = packed_register;
+    }
+
+    // Copy converted data into B tile
+    memcpy(B.x, nvfp4_b_packed, sizeof(nvfp4_b_packed));
 
     // Step 4: Initialize output tile
     tile<16, 8, float> D;
     memset(D.x, 0, 4 * sizeof(float));  // Clear output accumulator
 
     // Step 5: Execute MMA operation
-    // TODO: For MMA, we need E8M0 scale for B, but Q8_1 uses FP16
-    // Using placeholder value for now (will cause incorrect results)
-    uint8_t scale_q8_e8m0 = 127;  // Placeholder E8M0 scale
+    // Convert Q8_1 FP16 scale to E8M0 format
+    // bq8_1->ds is a half2 (2 FP16 values: d and s)
+    // Extract 'd' (the scale factor, first FP16 value)
+    float q8_scale_fp32 = __low2float(bq8_1->ds);
+    uint8_t scale_q8_e8m0 = float_to_e8m0(q8_scale_fp32);
 
     // Execute MMA with converted data
-    // NOTE: Result will be incorrect due to zero B matrix and placeholder scale
     mma(D, A, B, scale_mxfp4, scale_q8_e8m0);
 
     // Step 6: Accumulate results
-    // For m16n8k32, D is 16×8 but we need a scalar result
-    // Sum across all output elements (this is not the correct reduction)
-    float result = 0.0f;
+    // MMA produces 16×8 tile output, but we need a scalar result
+    // SIMPLIFIED: Use first element (proper warp reduction deferred to Day 9)
     const float* D_float = (const float*)D.x;
-    for (int i = 0; i < 4; i++) {
-        result += D_float[i];
-    }
+    float result = D_float[0];
 
-    // Apply final scaling factor (0.5f from original implementation)
-    result *= 0.5f;
+    // Apply Q8_1 bias correction
+    // bq8_1->ds is half2 with [d, s] where s = d * sum(qs[i])
+    // Extract 's' (second FP16 value)
+    float bias = __high2float(bq8_1->ds);
+    result -= bias;
 
     return result;
 

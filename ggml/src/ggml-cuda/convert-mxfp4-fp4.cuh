@@ -104,6 +104,32 @@ __device__ __forceinline__ uint8_t float_to_e2m1(float x) {
     return result;
 }
 
+// ============================================================================
+// Helper: Convert FP32 to E8M0 format
+// ============================================================================
+// E8M0 = 8-bit unsigned exponent, no mantissa
+// Represents values 2^0 to 2^255
+// Used for scale factors in quantized inference
+// ============================================================================
+static __device__ __forceinline__ uint8_t float_to_e8m0(float x) {
+    // Handle zero
+    if (x == 0.0f) return 0;
+    if (x < 0.0f) x = -x;  // Take absolute value
+
+    // Extract IEEE-754 exponent
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(float));
+    int32_t exp_bits = ((bits >> 23) & 0xFF);
+    int32_t exp_unbiased = exp_bits - 127;  // Remove IEEE bias
+
+    // E8M0 is direct exponent representation (0-255 = 2^0 to 2^255)
+    // Clamp to valid range
+    if (exp_unbiased < 0) return 0;      // Underflow
+    if (exp_unbiased > 255) return 255;  // Overflow
+
+    return (uint8_t)exp_unbiased;
+}
+
 // MXFP4 → NVFP4 Block Conversion Pipeline
 // Converts a full 32-value MXFP4 block (16 bytes + scale) to E2M1 packed format
 // Input:  block_mxfp4 (32 nibbles in 16 bytes + E8M0 scale factor)

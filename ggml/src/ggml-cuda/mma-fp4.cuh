@@ -19,13 +19,11 @@
 
 #include "common.cuh"
 #include "fp4-types.cuh"
+#include "mma.cuh"
 
 #ifdef BLACKWELL_FP4_AVAILABLE
 
 namespace ggml_cuda_mma {
-
-// Forward declaration from mma.cuh
-template <int I, int J, typename T> struct tile;
 
 // ============================================================================
 // FP4 E2M1 MMA: m16n8k32 (32 FP4 values in K dimension)
