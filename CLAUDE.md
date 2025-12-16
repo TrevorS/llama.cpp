@@ -151,3 +151,47 @@ int big_number;
 ```
 
 Function pattern: `<class>_<action>_<noun>` (e.g., `llama_model_init`, `llama_sampler_get_seed`)
+
+## Development Notes (Learned from Experience)
+
+### Docker Environment
+
+- **ALWAYS run tests in Docker** - The dev container has all dependencies pre-installed
+- **Architecture matters**: NVIDIA CUDA containers for arm64 (DGX Spark) need to be built correctly
+- If you see "cannot execute binary file", the image was built for the wrong architecture - rebuild it
+- Container is configured for Blackwell GB10 (CUDA arch 121) with unified memory support
+
+### Running Python Tests
+
+```bash
+# Run tests in Docker container (preferred method)
+docker compose -f docker-compose.dev.yml run --rm dev python3 tests/your_test.py
+
+# Or with the built image directly
+docker run --rm -v "$(pwd)":/app/src llama-cpp-dev:latest python3 tests/your_test.py
+```
+
+### GGUF Python Library
+
+- Constants are in `gguf-py/gguf/constants.py`
+- `MODEL_ARCH` is an `IntEnum` - add new architectures with `= auto()`
+- `MODEL_ARCH_NAMES` dict maps enum to string names (like "qwen3omnimoe")
+- `MODEL_TENSOR_NAMES` dict defines which tensors each architecture expects
+- Metadata keys use `{arch}` placeholder that gets replaced at runtime
+- M-RoPE support: `Keys.Rope.DIMENSION_SECTIONS` already exists for multimodal position encoding
+
+### Adding New Model Architecture
+
+1. Add enum to `MODEL_ARCH` class
+2. Add string mapping to `MODEL_ARCH_NAMES` dict
+3. Add tensor list to `MODEL_TENSOR_NAMES` dict
+4. For MoE models, include `FFN_*_EXP` tensors for experts
+5. For models with shared experts, include `FFN_*_SHEXP` tensors
+
+### Current Project: Qwen3-Omni
+
+Implementation docs:
+- `docs/qwen3-omni-tasks.md` - Task breakdown
+- `docs/qwen3-omni-requirements.md` - Requirements
+- `docs/qwen3-omni-implementation-plan.md` - Architecture details
+- `docs/qwen3-notes.md` - Implementation progress notes

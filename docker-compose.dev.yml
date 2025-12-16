@@ -1,4 +1,5 @@
 # Docker Compose for llama.cpp development
+# Optimized for DGX Spark (Blackwell GB10)
 #
 # Usage:
 #   Build:     docker compose -f docker-compose.dev.yml build
@@ -6,10 +7,11 @@
 #   With GPU:  docker compose -f docker-compose.dev.yml run --rm dev
 #
 # Inside container:
-#   rebuild              # Rebuild llama.cpp
+#   rebuild              # Rebuild llama.cpp from /app/src
 #   rebuild -t llama-cli # Build specific target
 #   convert-model ...    # Run model conversion
-#   llama-cli --help     # Run compiled tools
+#   llama-cli --help     # Run compiled tools (from cloned repo)
+#   /app/src/build/bin/llama-cli  # Run compiled tools (from mounted source)
 
 services:
   dev:
@@ -17,10 +19,9 @@ services:
       context: .
       dockerfile: Dockerfile.dev
       args:
-        CUDA_VERSION: "12.6.3"
+        CUDA_VERSION: "13.0.1"
         UBUNTU_VERSION: "22.04"
-        # Set specific GPU arch for faster builds (optional)
-        # CUDA_DOCKER_ARCH: "89"  # RTX 40xx
+        CUDA_DOCKER_ARCH: "121"  # Blackwell GB10
     image: llama-cpp-dev:latest
     container_name: llama-cpp-dev
     volumes:
@@ -30,9 +31,12 @@ services:
       - ~/models:/models
       # Mount HuggingFace cache for faster model downloads
       - ~/.cache/huggingface:/root/.cache/huggingface
+      # Mount ccache for faster rebuilds
+      - ~/.cache/ccache:/root/.cache/ccache
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - HF_HOME=/root/.cache/huggingface
+      - CCACHE_DIR=/root/.cache/ccache
     deploy:
       resources:
         reservations:
@@ -40,7 +44,8 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    ipc: host
+    shm_size: 16g
     stdin_open: true
     tty: true
-    working_dir: /app
-
+    working_dir: /app/src

@@ -1,21 +1,21 @@
 #
 # Development Dockerfile for llama.cpp model development
-# Based on dgx-spark-benchmarks pattern - clone from git, mount source for dev
+# Optimized for DGX Spark (Blackwell GB10 - compute capability 12.1)
 #
 # Usage:
-#   Build:    docker build -f Dockerfile.dev -t llama-cpp-dev .
-#   Run:      docker run --gpus all -it -v $(pwd):/app/src llama-cpp-dev
-#   Rebuild:  (inside container) cd /app/src && rebuild
+#   Build:    docker compose -f docker-compose.dev.yml build
+#   Run:      docker compose -f docker-compose.dev.yml run --rm dev
+#   Rebuild:  (inside container) rebuild
 #
 ARG UBUNTU_VERSION=22.04
-ARG CUDA_VERSION=12.6.3
+ARG CUDA_VERSION=13.0.1
 ARG BASE_CUDA_DEV_CONTAINER=nvcr.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 
 FROM ${BASE_CUDA_DEV_CONTAINER}
 
-# CUDA architecture to build for (defaults to all supported archs)
-# Common values: 86 (RTX 30xx), 89 (RTX 40xx), 90 (H100), 121 (Blackwell)
-ARG CUDA_DOCKER_ARCH=default
+# CUDA architecture to build for
+# 121 = Blackwell GB10 (DGX Spark)
+ARG CUDA_DOCKER_ARCH="121"
 
 # Install build dependencies
 RUN apt-get update && \
@@ -33,7 +33,8 @@ RUN apt-get update && \
         curl \
         vim \
         less \
-        jq && \
+        jq \
+        file && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -56,12 +57,13 @@ RUN pip install --upgrade pip setuptools wheel && \
         "gguf>=0.10.0" && \
     pip cache purge
 
-# Configure and build
+# Configure and build with DGX Spark optimizations
 RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
         export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
     cmake -B build \
         -GNinja \
+        -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
         -DGGML_NATIVE=OFF \
         -DGGML_CUDA=ON \
         -DGGML_BACKEND_DL=ON \
@@ -77,15 +79,38 @@ ENV PATH="/app/build/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/app/build:${LD_LIBRARY_PATH}"
 
 # Create helper scripts
-RUN echo '#!/bin/bash\nset -e\ncmake --build /app/build --config RelWithDebInfo -j${1:-$(nproc)} "$@"' > /usr/local/bin/rebuild && \
-    chmod +x /usr/local/bin/rebuild
+# rebuild: Rebuild llama.cpp from /app/src using same build config
+RUN cat > /usr/local/bin/rebuild << 'EOF'
+#!/bin/bash
+set -e
+cd /app/src
+if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then
+    export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=121"
+fi
+cmake -B build \
+    -GNinja \
+    -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+    -DGGML_NATIVE=OFF \
+    -DGGML_CUDA=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    ${CMAKE_ARGS} \
+    -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined .
+cmake --build build --config RelWithDebInfo -j${1:-$(nproc)} "${@:2}"
+EOF
+RUN chmod +x /usr/local/bin/rebuild
 
-RUN echo '#!/bin/bash\nset -e\npython3 /app/convert_hf_to_gguf.py "$@"' > /usr/local/bin/convert-model && \
+# convert-model: Run model conversion
+RUN echo '#!/bin/bash\nset -e\npython3 /app/src/convert_hf_to_gguf.py "$@"' > /usr/local/bin/convert-model && \
     chmod +x /usr/local/bin/convert-model
 
 # Source directory will be mounted here for development
 RUN mkdir -p /app/src
 
-WORKDIR /app
+WORKDIR /app/src
 
-ENTRYPOINT ["/bin/bash"]
+# Use sh for better docker compatibility (bash available via explicit invocation)
+SHELL ["/bin/bash", "-c"]
+ENTRYPOINT ["/bin/sh"]
