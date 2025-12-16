@@ -1,0 +1,91 @@
+#
+# Development Dockerfile for llama.cpp model development
+# Based on dgx-spark-benchmarks pattern - clone from git, mount source for dev
+#
+# Usage:
+#   Build:    docker build -f Dockerfile.dev -t llama-cpp-dev .
+#   Run:      docker run --gpus all -it -v $(pwd):/app/src llama-cpp-dev
+#   Rebuild:  (inside container) cd /app/src && rebuild
+#
+ARG UBUNTU_VERSION=22.04
+ARG CUDA_VERSION=12.6.3
+ARG BASE_CUDA_DEV_CONTAINER=nvcr.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+FROM ${BASE_CUDA_DEV_CONTAINER}
+
+# CUDA architecture to build for (defaults to all supported archs)
+# Common values: 86 (RTX 30xx), 89 (RTX 40xx), 90 (H100), 121 (Blackwell)
+ARG CUDA_DOCKER_ARCH=default
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y \
+        build-essential \
+        cmake \
+        ninja-build \
+        ccache \
+        git \
+        python3 \
+        python3-pip \
+        python3-venv \
+        libcurl4-openssl-dev \
+        libgomp1 \
+        curl \
+        vim \
+        less \
+        jq && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Clone llama.cpp repository
+RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
+    git checkout master
+
+# Install Python dependencies for model conversion
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+        -r requirements.txt \
+        huggingface-hub \
+        safetensors \
+        torch \
+        transformers \
+        sentencepiece \
+        protobuf \
+        tiktoken \
+        "gguf>=0.10.0" && \
+    pip cache purge
+
+# Configure and build
+RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
+        export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
+    fi && \
+    cmake -B build \
+        -GNinja \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CUDA=ON \
+        -DGGML_BACKEND_DL=ON \
+        -DLLAMA_BUILD_TESTS=ON \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        ${CMAKE_ARGS} \
+        -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
+    cmake --build build --config RelWithDebInfo -j$(nproc)
+
+# Add build/bin to PATH for easy access to compiled tools
+ENV PATH="/app/build/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/app/build:${LD_LIBRARY_PATH}"
+
+# Create helper scripts
+RUN echo '#!/bin/bash\nset -e\ncmake --build /app/build --config RelWithDebInfo -j${1:-$(nproc)} "$@"' > /usr/local/bin/rebuild && \
+    chmod +x /usr/local/bin/rebuild
+
+RUN echo '#!/bin/bash\nset -e\npython3 /app/convert_hf_to_gguf.py "$@"' > /usr/local/bin/convert-model && \
+    chmod +x /usr/local/bin/convert-model
+
+# Source directory will be mounted here for development
+RUN mkdir -p /app/src
+
+WORKDIR /app
+
+ENTRYPOINT ["/bin/bash"]
