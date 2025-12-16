@@ -71,6 +71,7 @@ class SentencePieceTokenTypes(IntEnum):
 class ModelType(IntEnum):
     TEXT = 1
     MMPROJ = 2
+    TALKER = 3
 
 
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
@@ -80,6 +81,7 @@ class ModelBase:
     _model_classes: dict[ModelType, dict[str, type[ModelBase]]] = {
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
+        ModelType.TALKER: {},
     }
 
     dir_model: Path
@@ -730,7 +732,12 @@ class ModelBase:
         assert names
 
         def func(modelcls: AnyModel) -> AnyModel:
-            model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
+            if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ:
+                model_type = ModelType.MMPROJ
+            elif hasattr(gguf.MODEL_ARCH, 'QWEN3OMNI_TALKER') and modelcls.model_arch == gguf.MODEL_ARCH.QWEN3OMNI_TALKER:
+                model_type = ModelType.TALKER
+            else:
+                model_type = ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
             return modelcls
@@ -4237,6 +4244,305 @@ class Qwen3MoeModel(Qwen2MoeModel):
             return
 
         super().set_vocab()
+
+
+@ModelBase.register("Qwen3OmniMoeForConditionalGeneration")
+class Qwen3OmniThinkerModel(Qwen3MoeModel):
+    model_arch = gguf.MODEL_ARCH.QWEN3OMNIMOE
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Qwen3-Omni has a nested thinker_config like Qwen2.5-Omni
+        # Merge it into hparams for the base class to use
+        import copy
+        self.global_config = copy.deepcopy(self.hparams)
+        if "thinker_config" in self.global_config:
+            thinker_config = self.global_config["thinker_config"]
+            # Merge thinker_config into hparams
+            for key, value in thinker_config.items():
+                if key not in ["audio_config", "vision_config"]:
+                    self.hparams[key] = value
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # Write M-RoPE dimension sections for multimodal [temporal, spatial_y, spatial_x]
+        self.gguf_writer.add_rope_dimension_sections([24, 20, 20])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Strip thinker prefix if present
+        if name.startswith("thinker."):
+            name = name.replace("thinker.", "", 1)
+
+        # Filter out non-Thinker components
+        if (name.startswith("audio_tower.")
+                or name.startswith("visual.")
+                or name.startswith("talker.")
+                or name.startswith("code2wav.")):
+            return []
+
+        return super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen3OmniMoeForConditionalGeneration")
+class Qwen3OmniMmprojModel(MmprojModel):
+    """Qwen3-Omni MMProj (audio encoder).
+
+    Qwen3-Omni has a nested config structure where audio config is in
+    thinker_config.audio_config. This class handles the extraction and
+    conversion of Whisper-style audio encoder tensors to GGUF format.
+    """
+    has_vision_encoder = False
+    has_audio_encoder = True
+
+    def __init__(self, *args, **kwargs):
+        # Override n_embd_text extraction before calling super().__init__
+        # because Qwen3-Omni has nested config at thinker_config.text_config
+        import json
+        dir_model = args[0] if args else kwargs.get("dir_model")
+        config_path = dir_model / "config.json"
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        # Get n_embd_text from nested thinker_config.text_config
+        thinker_config = config.get("thinker_config", config)
+        text_config = thinker_config.get("text_config", thinker_config)
+        self._n_embd_text_override = text_config.get("hidden_size", 2048)
+
+        super().__init__(*args, **kwargs)
+        assert self.hparams_audio is not None
+        # Normalize audio config to match expected keys (Whisper naming)
+        self.hparams_audio["hidden_size"] = self.hparams_audio["d_model"]
+        self.hparams_audio["intermediate_size"] = self.hparams_audio["encoder_ffn_dim"]
+        self.hparams_audio["num_attention_heads"] = self.hparams_audio["encoder_attention_heads"]
+        self.hparams_audio["num_hidden_layers"] = self.hparams_audio["encoder_layers"]
+
+        # Override the wrong n_embd_text that MmprojModel found
+        self.n_embd_text = self._n_embd_text_override
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_audio is not None
+        # Qwen3-Omni uses 128 mel bins (vs Whisper's 80)
+        self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["num_mel_bins"])
+        self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-5))
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        # Qwen3-Omni doesn't use vision at inference (audio-only for now)
+        return None
+
+    def get_audio_config(self) -> dict[str, Any] | None:
+        # Qwen3-Omni has nested config at thinker_config.audio_config
+        thinker_config = self.global_config.get("thinker_config", self.global_config)
+        return thinker_config.get("audio_config")
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # SinusoidsPositionEmbedding for audio encoder
+        assert self.hparams_audio is not None
+        max_timescale = 10000
+        length = 1500
+        channels = self.hparams_audio["hidden_size"]
+        log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
+        scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+        pos_embd = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1).to(dtype=torch.float32)
+        yield ("audio_tower.embed_positions.weight", pos_embd)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if ".conv" in name and ".weight" in name:
+            return gguf.GGMLQuantizationType.F16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Strip thinker prefix if present
+        if name.startswith("thinker."):
+            name = name.replace("thinker.", "")
+
+        # Only process audio_tower tensors (Qwen3-Omni doesn't use vision at inference)
+        if name.startswith("audio_tower"):
+            # Process audio tensors
+            if "conv1.bias" in name or "conv2.bias" in name:
+                # Transpose conv1 and conv2 bias
+                data_torch = data_torch.unsqueeze(-1)
+            if "audio_bos_eos_token" in name:
+                # This tensor is left unused in transformers code
+                return []
+            return [(self.map_tensor_name(name), data_torch)]
+
+        # Filter out all other tensors (thinker LLM, talker, etc.)
+        return []
+
+
+@ModelBase.register("Qwen3OmniMoeForConditionalGeneration")
+class Qwen3OmniTalkerModel(Qwen2MoeModel):
+    """Qwen3-Omni Talker (speech synthesis model + Code2Wav vocoder).
+
+    This model is exported using the --talker CLI flag.
+    Contains:
+    - Talker transformer (20 layers, MoE with 128 experts)
+    - Code predictor (5 layers + 15 lm heads)
+    - Code2Wav vocoder (HiFi-GAN with pre-transformer + ConvNeXt upsample + decoder)
+    """
+    model_arch = gguf.MODEL_ARCH.QWEN3OMNI_TALKER
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Qwen3-Omni has nested configs - extract talker_config
+        import copy
+        self.global_config = copy.deepcopy(self.hparams)
+        if "talker_config" in self.global_config:
+            talker_config = self.global_config["talker_config"]
+            # Talker model parameters are in text_config (not top level)
+            text_config = talker_config.get("text_config", {})
+            # Merge text_config into hparams for base class
+            for key, value in text_config.items():
+                self.hparams[key] = value
+            # Also merge top-level talker_config for Talker-specific metadata
+            for key, value in talker_config.items():
+                if key != "text_config":
+                    self.global_config[key] = value
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        arch_name = gguf.MODEL_ARCH_NAMES[self.model_arch]
+
+        # Talker-specific parameters
+        if (accept_hidden_layer := self.global_config.get("accept_hidden_layer")) is not None:
+            self.gguf_writer.add_key_value(
+                gguf.Keys.Talker.ACCEPT_HIDDEN_LAYER.format(arch=arch_name),
+                accept_hidden_layer,
+                gguf.GGUFValueType.UINT32
+            )
+
+        if (text_proj_dim := self.global_config.get("text_proj_dim")) is not None:
+            self.gguf_writer.add_key_value(
+                gguf.Keys.Talker.TEXT_PROJ_DIM.format(arch=arch_name),
+                text_proj_dim,
+                gguf.GGUFValueType.UINT32
+            )
+
+        if (codec_vocab_size := self.global_config.get("codec_vocab_size")) is not None:
+            self.gguf_writer.add_key_value(
+                gguf.Keys.Talker.CODEC_VOCAB_SIZE.format(arch=arch_name),
+                codec_vocab_size,
+                gguf.GGUFValueType.UINT32
+            )
+
+        if (num_codebooks := self.global_config.get("num_codebooks")) is not None:
+            self.gguf_writer.add_key_value(
+                gguf.Keys.Talker.NUM_CODEBOOKS.format(arch=arch_name),
+                num_codebooks,
+                gguf.GGUFValueType.UINT32
+            )
+
+        # Code2Wav parameters (skipped for now - architecture too complex)
+        # TODO: Add Code2Wav metadata once tensor mappings are complete
+
+    def set_vocab(self):
+        # Talker uses codec embeddings (not a text tokenizer)
+        # The codec_vocab_size is typically 2048
+        # We use a simple byte-level vocab to satisfy GGUF requirements
+        codec_vocab_size = self.global_config.get("codec_vocab_size", 2048)
+
+        # Create simple token list for codec tokens
+        tokens: list[bytes] = []
+        toktypes: list[int] = []
+
+        for i in range(codec_vocab_size):
+            tokens.append(f"<codec_{i}>".encode("utf-8"))
+            toktypes.append(gguf.TokenType.NORMAL)
+
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        # Add special tokens (minimal set)
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Only process talker.* and code2wav.* tensors
+        if not (name.startswith("talker.") or name.startswith("code2wav.")):
+            return []
+
+        # Handle talker transformer tensors (talker.model.*)
+        if name.startswith("talker.model."):
+            # Strip "talker.model." prefix -> becomes "model." (standard transformer)
+            name = name.replace("talker.model.", "model.", 1)
+
+            # Talker uses codec_embedding instead of embed_tokens
+            # Map it to TOKEN_EMBD for compatibility
+            if name == "model.codec_embedding.weight":
+                name = "model.embed_tokens.weight"
+
+            # Handle individual expert tensors - delegate to Qwen2MoeModel's expert handling
+            expert_suffixes = (
+                "experts.gate_up_proj", "experts.gate_up_proj.weight",
+                "experts.down_proj", "experts.down_proj.weight",
+                "experts.gate_proj", "experts.gate_proj.weight",
+                "experts.up_proj", "experts.up_proj.weight"
+            )
+            if "experts" in name and not name.endswith(expert_suffixes):
+                # This is an individual expert tensor like model.layers.0.mlp.experts.0.gate_proj.weight
+                # Let the parent class handle stacking them
+                return super().modify_tensors(data_torch, name, bid)
+
+            # Map the tensor (will use standard transformer mappings)
+            return super().modify_tensors(data_torch, name, bid)
+
+        # Other talker.* tensors (code_predictor, projections, etc.)
+        # TODO: Add complete Talker component mappings (code_predictor, hidden_projection, etc.)
+        if name.startswith("talker."):
+            try:
+                mapped_name = self.map_tensor_name(name)
+                return [(mapped_name, data_torch)]
+            except ValueError:
+                logger.warning(f"Skipping unmapped Talker tensor: {name}")
+                return []
+
+        # Code2Wav tensors (HiFi-GAN vocoder)
+        if name.startswith("code2wav."):
+            # Handle decoder block tensors specially (nested indices)
+            # Pattern: code2wav.decoder.{dec_bid}.block.{blk_idx}.*
+            import re
+            dec_blk_match = re.match(r'code2wav\.decoder\.(\d+)\.block\.(\d+)\.(.+)', name)
+            if dec_blk_match:
+                dec_bid = int(dec_blk_match.group(1))
+                blk_idx = int(dec_blk_match.group(2))
+                suffix = dec_blk_match.group(3)
+                # Compute flattened bid = dec_bid * 10 + blk_idx
+                flat_bid = dec_bid * 10 + blk_idx
+                # Map suffix to tensor name
+                suffix_map = {
+                    'alpha': 'snake_alpha',
+                    'beta': 'snake_beta',
+                    'conv.weight': 'conv.weight',
+                    'conv.bias': 'conv.bias',
+                    'conv1.conv.weight': 'conv1.weight',
+                    'conv1.conv.bias': 'conv1.bias',
+                    'conv2.conv.weight': 'conv2.weight',
+                    'conv2.conv.bias': 'conv2.bias',
+                    'act1.alpha': 'act1_alpha',
+                    'act1.beta': 'act1_beta',
+                    'act2.alpha': 'act2_alpha',
+                    'act2.beta': 'act2_beta',
+                }
+                mapped_suffix = suffix_map.get(suffix)
+                if mapped_suffix:
+                    gguf_name = f"code2wav.dec_blk.{flat_bid}.{mapped_suffix}"
+                    return [(gguf_name, data_torch)]
+                else:
+                    logger.warning(f"Skipping unmapped Code2Wav decoder block suffix: {name}")
+                    return []
+
+            try:
+                mapped_name = self.map_tensor_name(name)
+                return [(mapped_name, data_torch)]
+            except ValueError:
+                logger.warning(f"Skipping unmapped Code2Wav tensor: {name}")
+                return []
+
+        return []
 
 
 @ModelBase.register("Qwen3NextForCausalLM")
@@ -10748,6 +11054,10 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
     )
     parser.add_argument(
+        "--talker", action="store_true",
+        help="(Experimental) Export talker (speech synthesis) model. This will only work on some multimodal models. A prefix 'talker-' will be added to the output file name.",
+    )
+    parser.add_argument(
         "--mistral-format", action="store_true",
         help="Whether the model is stored following the Mistral format.",
     )
@@ -10877,7 +11187,12 @@ def main() -> None:
 
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
-        model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
+        if args.talker:
+            model_type = ModelType.TALKER
+        elif args.mmproj:
+            model_type = ModelType.MMPROJ
+        else:
+            model_type = ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
             model_architecture = get_model_architecture(hparams, model_type)
