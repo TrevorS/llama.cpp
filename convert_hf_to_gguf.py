@@ -4405,11 +4405,26 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
         super().set_gguf_parameters()
         arch_name = gguf.MODEL_ARCH_NAMES[self.model_arch]
 
+        # Override block_count with Talker layer count (20 layers, not Thinker's 48)
+        talker_config = self.global_config.get("talker_config", {})
+        text_config = talker_config.get("text_config", {})
+        n_layer = text_config.get("num_hidden_layers", 20)
+        self.gguf_writer.add_block_count(n_layer)
+
         # Talker-specific parameters
         if (accept_hidden_layer := self.global_config.get("accept_hidden_layer")) is not None:
             self.gguf_writer.add_key_value(
                 gguf.Keys.Talker.ACCEPT_HIDDEN_LAYER.format(arch=arch_name),
                 accept_hidden_layer,
+                gguf.GGUFValueType.UINT32
+            )
+
+        # thinker_hidden_size is needed for text_projection and hidden_projection layers
+        # These project from thinker hidden dim (2048) to talker hidden dim (1024)
+        if (thinker_hidden_size := self.global_config.get("thinker_hidden_size")) is not None:
+            self.gguf_writer.add_key_value(
+                gguf.Keys.Talker.THINKER_HIDDEN_SIZE.format(arch=arch_name),
+                thinker_hidden_size,
                 gguf.GGUFValueType.UINT32
             )
 
@@ -4439,30 +4454,26 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
 
     def set_vocab(self):
         # Talker uses codec embeddings (not a text tokenizer)
-        # The codec_vocab_size is typically 2048
-        # We use a simple byte-level vocab to satisfy GGUF requirements
-        codec_vocab_size = self.global_config.get("codec_vocab_size", 2048)
+        # Use "none" tokenizer model like WavTokenizerDec - no merges needed
+        self._set_vocab_none()
 
-        # Create simple token list for codec tokens
-        tokens: list[bytes] = []
-        toktypes: list[int] = []
-
-        for i in range(codec_vocab_size):
-            tokens.append(f"<codec_{i}>".encode("utf-8"))
-            toktypes.append(gguf.TokenType.NORMAL)
-
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        # Add special tokens (minimal set)
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+        # Set vocab_size for the codec embedding layer
+        # The codec_embedding.weight shape is [vocab_size, n_embd]
+        # Get it from talker_config or infer from tensor
+        talker_config = self.global_config.get("talker_config", {})
+        text_config = talker_config.get("text_config", {})
+        # vocab_size in config is the actual embedding table size (includes special tokens)
+        vocab_size = text_config.get("vocab_size", 3072)
+        self.gguf_writer.add_vocab_size(vocab_size)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Only process talker.* and code2wav.* tensors
         if not (name.startswith("talker.") or name.startswith("code2wav.")):
+            return []
+
+        # Skip Code Predictor and Code2Wav for now (not yet implemented in C++)
+        # TODO: Enable when C++ inference is implemented
+        if name.startswith("talker.code_predictor.") or name.startswith("code2wav."):
             return []
 
         # Handle talker transformer tensors (talker.model.*)

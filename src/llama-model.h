@@ -197,6 +197,65 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm = nullptr;
 };
 
+// Qwen3-Omni Talker code predictor layer (5 layers)
+struct llama_layer_talker_cp {
+    struct ggml_tensor * attn_norm   = nullptr;
+    struct ggml_tensor * wq          = nullptr;
+    struct ggml_tensor * wk          = nullptr;
+    struct ggml_tensor * wv          = nullptr;
+    struct ggml_tensor * wo          = nullptr;
+    struct ggml_tensor * attn_q_norm = nullptr;
+    struct ggml_tensor * attn_k_norm = nullptr;
+    struct ggml_tensor * ffn_norm    = nullptr;
+    struct ggml_tensor * ffn_gate    = nullptr;
+    struct ggml_tensor * ffn_up      = nullptr;
+    struct ggml_tensor * ffn_down    = nullptr;
+};
+
+// Qwen3-Omni Code2Wav pre-transformer layer (8 layers)
+struct llama_layer_c2w_pre {
+    struct ggml_tensor * attn_norm   = nullptr;
+    struct ggml_tensor * wq          = nullptr;
+    struct ggml_tensor * wk          = nullptr;
+    struct ggml_tensor * wv          = nullptr;
+    struct ggml_tensor * wo          = nullptr;
+    struct ggml_tensor * attn_scale  = nullptr;
+    struct ggml_tensor * ffn_norm    = nullptr;
+    struct ggml_tensor * ffn_gate    = nullptr;
+    struct ggml_tensor * ffn_up      = nullptr;
+    struct ggml_tensor * ffn_down    = nullptr;
+    struct ggml_tensor * ffn_scale   = nullptr;
+};
+
+// Qwen3-Omni Code2Wav upsample block (4 blocks)
+struct llama_layer_c2w_up {
+    struct ggml_tensor * conv        = nullptr;  // transpose conv
+    struct ggml_tensor * dwconv      = nullptr;  // depthwise conv
+    struct ggml_tensor * norm        = nullptr;
+    struct ggml_tensor * pwconv1     = nullptr;  // pointwise conv 1
+    struct ggml_tensor * pwconv2     = nullptr;  // pointwise conv 2
+    struct ggml_tensor * gamma       = nullptr;  // layer scale
+};
+
+// Qwen3-Omni Code2Wav decoder block (HiFi-GAN)
+struct llama_layer_c2w_dec {
+    struct ggml_tensor * snake_alpha = nullptr;  // outer Snake alpha
+    struct ggml_tensor * snake_beta  = nullptr;  // outer Snake beta
+};
+
+// Qwen3-Omni Code2Wav decoder residual block
+struct llama_layer_c2w_dec_blk {
+    struct ggml_tensor * snake_alpha = nullptr;
+    struct ggml_tensor * snake_beta  = nullptr;
+    struct ggml_tensor * conv        = nullptr;  // single conv (for some blocks)
+    struct ggml_tensor * conv1       = nullptr;  // dual conv 1 (for some blocks)
+    struct ggml_tensor * conv2       = nullptr;  // dual conv 2 (for some blocks)
+    struct ggml_tensor * act1_alpha  = nullptr;
+    struct ggml_tensor * act1_beta   = nullptr;
+    struct ggml_tensor * act2_alpha  = nullptr;
+    struct ggml_tensor * act2_beta   = nullptr;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -457,6 +516,34 @@ struct llama_model {
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // Qwen3-Omni Talker projection layers
+    struct ggml_tensor * talker_text_proj_fc1      = nullptr;
+    struct ggml_tensor * talker_text_proj_fc1_b    = nullptr;
+    struct ggml_tensor * talker_text_proj_fc2      = nullptr;
+    struct ggml_tensor * talker_text_proj_fc2_b    = nullptr;
+    struct ggml_tensor * talker_hidden_proj_fc1    = nullptr;
+    struct ggml_tensor * talker_hidden_proj_fc1_b  = nullptr;
+    struct ggml_tensor * talker_hidden_proj_fc2    = nullptr;
+    struct ggml_tensor * talker_hidden_proj_fc2_b  = nullptr;
+    struct ggml_tensor * talker_codec_head         = nullptr;
+    std::vector<struct ggml_tensor *> talker_codec_embd;  // 16 codebook embeddings
+
+    // Qwen3-Omni Talker code predictor
+    std::vector<struct ggml_tensor *> talker_cp_codec_embd;  // 15 codebook embeddings
+    struct ggml_tensor * talker_cp_output_norm   = nullptr;
+    std::vector<struct ggml_tensor *> talker_cp_lm_head;  // 15 lm heads
+    std::vector<llama_layer_talker_cp> talker_cp_layers;  // 5 layers
+
+    // Qwen3-Omni Code2Wav vocoder
+    struct ggml_tensor * c2w_code_embd           = nullptr;
+    struct ggml_tensor * c2w_pre_output_norm     = nullptr;
+    struct ggml_tensor * c2w_dec_conv_in         = nullptr;
+    struct ggml_tensor * c2w_dec_conv_out        = nullptr;
+    std::vector<llama_layer_c2w_pre> c2w_pre_layers;       // 8 layers
+    std::vector<llama_layer_c2w_up> c2w_up_blocks;         // 4 blocks
+    std::vector<llama_layer_c2w_dec> c2w_dec_blocks;       // decoder blocks
+    std::vector<llama_layer_c2w_dec_blk> c2w_dec_res_blks; // decoder residual blocks
 
     std::vector<llama_layer> layers;
 

@@ -226,6 +226,7 @@ class Keys:
     class Talker:
         # Talker model configuration (Qwen3-Omni speech synthesis)
         ACCEPT_HIDDEN_LAYER   = "{arch}.talker.accept_hidden_layer"   # which Thinker layer to extract from
+        THINKER_HIDDEN_SIZE   = "{arch}.talker.thinker_hidden_size"   # Thinker model hidden dimension (2048)
         TEXT_PROJ_DIM         = "{arch}.talker.text_proj_dim"         # text projection output dimension
         CODEC_VOCAB_SIZE      = "{arch}.talker.codec_vocab_size"      # codec vocabulary size (3072)
         NUM_CODEBOOKS         = "{arch}.talker.num_codebooks"         # number of codebook embeddings (16)
