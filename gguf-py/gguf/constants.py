@@ -800,10 +800,18 @@ class MODEL_TENSOR(IntEnum):
     C2W_UP_PWCONV1       = auto()  # upsample.{bid}.1.pwconv1 - pointwise conv 1
     C2W_UP_PWCONV2       = auto()  # upsample.{bid}.1.pwconv2 - pointwise conv 2
     C2W_UP_GAMMA         = auto()  # upsample.{bid}.1.gamma - layer scale
+    # Upsample biases
+    C2W_UP_CONV_B        = auto()  # upsample.{bid}.0.conv.bias - transpose conv bias
+    C2W_UP_DWCONV_B      = auto()  # upsample.{bid}.1.dwconv.conv.bias - depthwise conv bias
+    C2W_UP_NORM_B        = auto()  # upsample.{bid}.1.norm.bias - layer norm bias
+    C2W_UP_PWCONV1_B     = auto()  # upsample.{bid}.1.pwconv1.bias - pointwise conv 1 bias
+    C2W_UP_PWCONV2_B     = auto()  # upsample.{bid}.1.pwconv2.bias - pointwise conv 2 bias
     # HiFi-GAN decoder (Snake activation + residual blocks)
     C2W_DEC_CONV_IN      = auto()  # decoder.0.conv - initial conv
     C2W_DEC_SNAKE_ALPHA  = auto()  # decoder.{bid}.alpha - outer Snake alpha
     C2W_DEC_SNAKE_BETA   = auto()  # decoder.{bid}.beta - outer Snake beta
+    C2W_DEC_UPSAMPLE     = auto()  # decoder.{bid}.convtr - transpose conv for upsampling
+    C2W_DEC_UPSAMPLE_B   = auto()  # decoder.{bid}.convtr.bias - transpose conv bias
     C2W_DEC_BLK_SNAKE_A  = auto()  # decoder.{bid}.block.{idx}.alpha - block Snake alpha
     C2W_DEC_BLK_SNAKE_B  = auto()  # decoder.{bid}.block.{idx}.beta - block Snake beta
     C2W_DEC_BLK_CONV     = auto()  # decoder.{bid}.block.{idx}.conv - single conv
@@ -813,6 +821,8 @@ class MODEL_TENSOR(IntEnum):
     C2W_DEC_BLK_ACT1_B   = auto()  # decoder.{bid}.block.{idx}.act1.beta
     C2W_DEC_BLK_ACT2_A   = auto()  # decoder.{bid}.block.{idx}.act2.alpha
     C2W_DEC_BLK_ACT2_B   = auto()  # decoder.{bid}.block.{idx}.act2.beta
+    C2W_DEC_FINAL_SNAKE_A = auto()  # decoder.5.alpha - final Snake alpha
+    C2W_DEC_FINAL_SNAKE_B = auto()  # decoder.5.beta - final Snake beta
     C2W_DEC_CONV_OUT     = auto()  # decoder.6.conv - final output conv
 
 
@@ -1257,10 +1267,18 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.C2W_UP_PWCONV1:            "code2wav.up.{bid}.pwconv1",
     MODEL_TENSOR.C2W_UP_PWCONV2:            "code2wav.up.{bid}.pwconv2",
     MODEL_TENSOR.C2W_UP_GAMMA:              "code2wav.up.{bid}.gamma",
+    # Upsample biases
+    MODEL_TENSOR.C2W_UP_CONV_B:             "code2wav.up.{bid}.conv.bias",
+    MODEL_TENSOR.C2W_UP_DWCONV_B:           "code2wav.up.{bid}.dwconv.bias",
+    MODEL_TENSOR.C2W_UP_NORM_B:             "code2wav.up.{bid}.norm.bias",
+    MODEL_TENSOR.C2W_UP_PWCONV1_B:          "code2wav.up.{bid}.pwconv1.bias",
+    MODEL_TENSOR.C2W_UP_PWCONV2_B:          "code2wav.up.{bid}.pwconv2.bias",
     # HiFi-GAN decoder (uses flattened bid = dec_blk * 10 + inner_blk for nested blocks)
     MODEL_TENSOR.C2W_DEC_CONV_IN:           "code2wav.dec.conv_in",
     MODEL_TENSOR.C2W_DEC_SNAKE_ALPHA:       "code2wav.dec.{bid}.snake_alpha",
     MODEL_TENSOR.C2W_DEC_SNAKE_BETA:        "code2wav.dec.{bid}.snake_beta",
+    MODEL_TENSOR.C2W_DEC_UPSAMPLE:          "code2wav.dec.{bid}.upsample",
+    MODEL_TENSOR.C2W_DEC_UPSAMPLE_B:        "code2wav.dec.{bid}.upsample.bias",
     MODEL_TENSOR.C2W_DEC_BLK_SNAKE_A:       "code2wav.dec_blk.{bid}.snake_alpha",
     MODEL_TENSOR.C2W_DEC_BLK_SNAKE_B:       "code2wav.dec_blk.{bid}.snake_beta",
     MODEL_TENSOR.C2W_DEC_BLK_CONV:          "code2wav.dec_blk.{bid}.conv",
@@ -1270,6 +1288,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.C2W_DEC_BLK_ACT1_B:        "code2wav.dec_blk.{bid}.act1_beta",
     MODEL_TENSOR.C2W_DEC_BLK_ACT2_A:        "code2wav.dec_blk.{bid}.act2_alpha",
     MODEL_TENSOR.C2W_DEC_BLK_ACT2_B:        "code2wav.dec_blk.{bid}.act2_beta",
+    MODEL_TENSOR.C2W_DEC_FINAL_SNAKE_A:     "code2wav.dec.final_snake_alpha",
+    MODEL_TENSOR.C2W_DEC_FINAL_SNAKE_B:     "code2wav.dec.final_snake_beta",
     MODEL_TENSOR.C2W_DEC_CONV_OUT:          "code2wav.dec.conv_out",
 }
 
@@ -1943,10 +1963,18 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.C2W_UP_PWCONV1,
         MODEL_TENSOR.C2W_UP_PWCONV2,
         MODEL_TENSOR.C2W_UP_GAMMA,
+        # Upsample biases
+        MODEL_TENSOR.C2W_UP_CONV_B,
+        MODEL_TENSOR.C2W_UP_DWCONV_B,
+        MODEL_TENSOR.C2W_UP_NORM_B,
+        MODEL_TENSOR.C2W_UP_PWCONV1_B,
+        MODEL_TENSOR.C2W_UP_PWCONV2_B,
         # HiFi-GAN decoder
         MODEL_TENSOR.C2W_DEC_CONV_IN,
         MODEL_TENSOR.C2W_DEC_SNAKE_ALPHA,
         MODEL_TENSOR.C2W_DEC_SNAKE_BETA,
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE,
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE_B,
         MODEL_TENSOR.C2W_DEC_BLK_SNAKE_A,
         MODEL_TENSOR.C2W_DEC_BLK_SNAKE_B,
         MODEL_TENSOR.C2W_DEC_BLK_CONV,
@@ -1956,6 +1984,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.C2W_DEC_BLK_ACT1_B,
         MODEL_TENSOR.C2W_DEC_BLK_ACT2_A,
         MODEL_TENSOR.C2W_DEC_BLK_ACT2_B,
+        MODEL_TENSOR.C2W_DEC_FINAL_SNAKE_A,
+        MODEL_TENSOR.C2W_DEC_FINAL_SNAKE_B,
         MODEL_TENSOR.C2W_DEC_CONV_OUT,
     ],
     MODEL_ARCH.PLAMO: [

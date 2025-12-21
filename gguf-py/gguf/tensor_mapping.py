@@ -1850,59 +1850,94 @@ class TensorNameMap:
             "code2wav.upsample.{bid}.1.gamma",  # layer scale
         ),
 
-        # HiFi-GAN decoder (Snake activation + residual blocks)
-        MODEL_TENSOR.C2W_DEC_CONV_IN: (
-            "code2wav.decoder.0.conv",  # initial conv
+        # Upsample biases (ConvNeXt)
+        MODEL_TENSOR.C2W_UP_CONV_B: (
+            "code2wav.upsample.{bid}.0.conv.bias",  # transpose conv bias
         ),
 
+        MODEL_TENSOR.C2W_UP_DWCONV_B: (
+            "code2wav.upsample.{bid}.1.dwconv.conv.bias",  # depthwise conv bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_NORM_B: (
+            "code2wav.upsample.{bid}.1.norm.bias",  # layer norm bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV1_B: (
+            "code2wav.upsample.{bid}.1.pwconv1.bias",  # pointwise conv 1 bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV2_B: (
+            "code2wav.upsample.{bid}.1.pwconv2.bias",  # pointwise conv 2 bias
+        ),
+
+        # HiFi-GAN decoder (Snake activation + residual blocks)
+        # Structure: decoder.0 = conv_in, decoder.1-4 = upsample stages,
+        #            decoder.5 = final snake, decoder.6 = conv_out
+        MODEL_TENSOR.C2W_DEC_CONV_IN: (
+            "code2wav.decoder.0.conv",  # initial conv (1024→1536)
+        ),
+
+        # Outer Snake for each stage (stage 1-4: decoder.{stage}.block.0.alpha/beta)
         MODEL_TENSOR.C2W_DEC_SNAKE_ALPHA: (
-            "code2wav.decoder.{bid}.alpha",  # outer Snake alpha (bid >= 1)
+            "code2wav.decoder.{bid}.block.0.alpha",  # outer Snake alpha (bid = stage 1-4)
         ),
 
         MODEL_TENSOR.C2W_DEC_SNAKE_BETA: (
-            "code2wav.decoder.{bid}.beta",  # outer Snake beta (bid >= 1)
+            "code2wav.decoder.{bid}.block.0.beta",  # outer Snake beta (bid = stage 1-4)
         ),
 
-        # Decoder block tensors use flattened bid = dec_blk * 10 + inner_blk
-        # These patterns use {bid} which will be computed in converter
-        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_A: (
-            "code2wav.decoder.{bid}.block.0.alpha",  # handled specially in converter
+        # Upsample conv for each stage (decoder.{stage}.block.1.conv)
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE: (
+            "code2wav.decoder.{bid}.block.1.conv",  # transpose conv for upsampling (bid = stage 1-4)
         ),
 
-        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_B: (
-            "code2wav.decoder.{bid}.block.0.beta",  # handled specially in converter
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE_B: (
+            "code2wav.decoder.{bid}.block.1.conv.bias",  # transpose conv bias (bid = stage 1-4)
         ),
 
-        MODEL_TENSOR.C2W_DEC_BLK_CONV: (
-            "code2wav.decoder.{bid}.block.0.conv",  # handled specially in converter
-        ),
-
-        MODEL_TENSOR.C2W_DEC_BLK_CONV1: (
-            "code2wav.decoder.{bid}.block.0.conv1.conv",  # handled specially in converter
-        ),
-
-        MODEL_TENSOR.C2W_DEC_BLK_CONV2: (
-            "code2wav.decoder.{bid}.block.0.conv2.conv",  # handled specially in converter
-        ),
-
+        # ResBlock tensors - 3 blocks per stage at decoder.{stage}.block.{2,3,4}
+        # bid is flattened: stage * 10 + (block_idx - 2), so stage 1, block 2 = 10
+        # These are handled manually in converter, mappings are for output tensor names only
         MODEL_TENSOR.C2W_DEC_BLK_ACT1_A: (
-            "code2wav.decoder.{bid}.block.0.act1.alpha",  # handled specially in converter
+            "code2wav.dec_blk.{bid}.act1_alpha",  # flattened from decoder.X.block.Y.act1.alpha
         ),
 
         MODEL_TENSOR.C2W_DEC_BLK_ACT1_B: (
-            "code2wav.decoder.{bid}.block.0.act1.beta",  # handled specially in converter
+            "code2wav.dec_blk.{bid}.act1_beta",  # flattened from decoder.X.block.Y.act1.beta
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV1: (
+            "code2wav.dec_blk.{bid}.conv1",  # flattened from decoder.X.block.Y.conv1.conv
         ),
 
         MODEL_TENSOR.C2W_DEC_BLK_ACT2_A: (
-            "code2wav.decoder.{bid}.block.0.act2.alpha",  # handled specially in converter
+            "code2wav.dec_blk.{bid}.act2_alpha",  # flattened from decoder.X.block.Y.act2.alpha
         ),
 
         MODEL_TENSOR.C2W_DEC_BLK_ACT2_B: (
-            "code2wav.decoder.{bid}.block.0.act2.beta",  # handled specially in converter
+            "code2wav.dec_blk.{bid}.act2_beta",  # flattened from decoder.X.block.Y.act2.beta
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV2: (
+            "code2wav.dec_blk.{bid}.conv2",  # flattened from decoder.X.block.Y.conv2.conv
+        ),
+
+        # Unused - retained for potential future use
+        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_A: (
+            "code2wav.dec_blk.{bid}.snake_alpha",  # not used by current model
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_B: (
+            "code2wav.dec_blk.{bid}.snake_beta",  # not used by current model
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV: (
+            "code2wav.dec_blk.{bid}.conv",  # not used by current model
         ),
 
         MODEL_TENSOR.C2W_DEC_CONV_OUT: (
-            "code2wav.decoder.6.conv",  # qwen3omni - final output conv
+            "code2wav.decoder.6.conv",  # final output conv (1536→1)
         ),
 
         # NextN/MTP tensors for GLM4_MOE

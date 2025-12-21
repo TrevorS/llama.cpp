@@ -4265,8 +4265,9 @@ class Qwen3OmniThinkerModel(Qwen3MoeModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        # Write M-RoPE dimension sections for multimodal [temporal, spatial_y, spatial_x]
-        self.gguf_writer.add_rope_dimension_sections([24, 20, 20])
+        # Write M-RoPE dimension sections for multimodal [temporal, spatial_y, spatial_x, padding]
+        # Padded to 4 elements as expected by llama.cpp
+        self.gguf_writer.add_rope_dimension_sections([24, 20, 20, 0])
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Strip thinker prefix if present
@@ -4411,6 +4412,19 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
         n_layer = text_config.get("num_hidden_layers", 20)
         self.gguf_writer.add_block_count(n_layer)
 
+        # Override embedding_length with Talker hidden size (1024, not Thinker's 2048)
+        n_embd = text_config.get("hidden_size", 1024)
+        self.gguf_writer.add_embedding_length(n_embd)
+        logger.info(f"gguf: Talker embedding length = {n_embd}")
+
+        # Override other architecture-specific values from Talker config
+        if (n_head := text_config.get("num_attention_heads")) is not None:
+            self.gguf_writer.add_head_count(n_head)
+        if (n_head_kv := text_config.get("num_key_value_heads")) is not None:
+            self.gguf_writer.add_head_count_kv(n_head_kv)
+        if (n_ctx := text_config.get("max_position_embeddings")) is not None:
+            self.gguf_writer.add_context_length(n_ctx)
+
         # Talker-specific parameters
         if (accept_hidden_layer := self.global_config.get("accept_hidden_layer")) is not None:
             self.gguf_writer.add_key_value(
@@ -4471,11 +4485,6 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
         if not (name.startswith("talker.") or name.startswith("code2wav.")):
             return []
 
-        # Skip Code Predictor and Code2Wav for now (not yet implemented in C++)
-        # TODO: Enable when C++ inference is implemented
-        if name.startswith("talker.code_predictor.") or name.startswith("code2wav."):
-            return []
-
         # Handle talker transformer tensors (talker.model.*)
         if name.startswith("talker.model."):
             # Strip "talker.model." prefix -> becomes "model." (standard transformer)
@@ -4513,47 +4522,119 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
 
         # Code2Wav tensors (HiFi-GAN vocoder)
         if name.startswith("code2wav."):
-            # Handle decoder block tensors specially (nested indices)
-            # Pattern: code2wav.decoder.{dec_bid}.block.{blk_idx}.*
-            import re
-            dec_blk_match = re.match(r'code2wav\.decoder\.(\d+)\.block\.(\d+)\.(.+)', name)
-            if dec_blk_match:
-                dec_bid = int(dec_blk_match.group(1))
-                blk_idx = int(dec_blk_match.group(2))
-                suffix = dec_blk_match.group(3)
-                # Compute flattened bid = dec_bid * 10 + blk_idx
-                flat_bid = dec_bid * 10 + blk_idx
-                # Map suffix to tensor name
-                suffix_map = {
-                    'alpha': 'snake_alpha',
-                    'beta': 'snake_beta',
-                    'conv.weight': 'conv.weight',
-                    'conv.bias': 'conv.bias',
-                    'conv1.conv.weight': 'conv1.weight',
-                    'conv1.conv.bias': 'conv1.bias',
-                    'conv2.conv.weight': 'conv2.weight',
-                    'conv2.conv.bias': 'conv2.bias',
-                    'act1.alpha': 'act1_alpha',
-                    'act1.beta': 'act1_beta',
-                    'act2.alpha': 'act2_alpha',
-                    'act2.beta': 'act2_beta',
-                }
-                mapped_suffix = suffix_map.get(suffix)
-                if mapped_suffix:
-                    gguf_name = f"code2wav.dec_blk.{flat_bid}.{mapped_suffix}"
-                    return [(gguf_name, data_torch)]
-                else:
-                    logger.warning(f"Skipping unmapped Code2Wav decoder block suffix: {name}")
-                    return []
+            # Handle decoder tensors with complex nested structure
+            if name.startswith("code2wav.decoder."):
+                mapped_name = self._map_c2w_decoder_tensor(name)
+                if mapped_name:
+                    return [(mapped_name, data_torch)]
+                logger.warning(f"Skipping unmapped decoder tensor: {name}")
+                return []
 
+            # Skip bias tensors for pre_transformer (C++ implementation doesn't use them)
+            # But allow upsample biases through - they are important for audio quality
+            if ".bias" in name and "upsample" not in name:
+                return []
+
+            # Handle other code2wav tensors (embedding, pre_transformer, upsampler) via standard mapping
             try:
                 mapped_name = self.map_tensor_name(name)
+
+                # Depthwise convolution weights need permutation for ggml_conv_1d_dw
+                # HuggingFace: [out_channels, 1, kernel_size] = [1024, 1, 7]
+                # GGML expects: [kernel_size, 1, out_channels] = [7, 1, 1024] in memory
+                # This permutation changes both shape declaration AND memory layout
+                if "dwconv" in name and name.endswith(".weight"):
+                    # Permute [C, 1, K] -> [K, 1, C]
+                    data_torch = data_torch.permute(2, 1, 0).contiguous()
+                    logger.info(f"Permuted dwconv weight {name}: {data_torch.shape}")
+
                 return [(mapped_name, data_torch)]
             except ValueError:
                 logger.warning(f"Skipping unmapped Code2Wav tensor: {name}")
                 return []
 
         return []
+
+    def _map_c2w_decoder_tensor(self, name: str) -> str | None:
+        """Map HiFi-GAN decoder tensor names to GGUF format.
+
+        Original structure:
+        - decoder.0.conv - conv_in (1024→1536)
+        - decoder.{1-4}.block.0.alpha/beta - outer Snake
+        - decoder.{1-4}.block.1.conv - upsample transpose conv
+        - decoder.{1-4}.block.{2-4}.act1.alpha/beta - resblock act1
+        - decoder.{1-4}.block.{2-4}.conv1.conv - resblock conv1
+        - decoder.{1-4}.block.{2-4}.act2.alpha/beta - resblock act2
+        - decoder.{1-4}.block.{2-4}.conv2.conv - resblock conv2
+        - decoder.5.alpha/beta - final Snake
+        - decoder.6.conv - conv_out (1536→1)
+        """
+        import re
+
+        # conv_in: decoder.0.conv.weight/bias
+        if name == "code2wav.decoder.0.conv.weight":
+            return "code2wav.dec.conv_in.weight"
+        if name == "code2wav.decoder.0.conv.bias":
+            return "code2wav.dec.conv_in.bias"
+
+        # conv_out: decoder.6.conv.weight/bias
+        if name == "code2wav.decoder.6.conv.weight":
+            return "code2wav.dec.conv_out.weight"
+        if name == "code2wav.decoder.6.conv.bias":
+            return "code2wav.dec.conv_out.bias"
+
+        # Final Snake: decoder.5.alpha/beta
+        m = re.match(r"code2wav\.decoder\.5\.(alpha|beta)", name)
+        if m:
+            return f"code2wav.dec.final_snake_{m.group(1)}"
+
+        # Stage tensors: decoder.{stage}.block.{blk}.*
+        m = re.match(r"code2wav\.decoder\.(\d+)\.block\.(\d+)\.(.*)", name)
+        if m:
+            stage = int(m.group(1))  # 1-4
+            blk = int(m.group(2))    # 0, 1, or 2-4
+            rest = m.group(3)
+
+            if stage < 1 or stage > 4:
+                return None
+
+            # Outer Snake: block.0.alpha/beta
+            if blk == 0:
+                if rest == "alpha":
+                    return f"code2wav.dec.{stage}.snake_alpha"
+                elif rest == "beta":
+                    return f"code2wav.dec.{stage}.snake_beta"
+
+            # Upsample conv: block.1.conv.weight/bias
+            if blk == 1 and rest == "conv.weight":
+                return f"code2wav.dec.{stage}.upsample.weight"
+            if blk == 1 and rest == "conv.bias":
+                return f"code2wav.dec.{stage}.upsample.bias"
+
+            # ResBlocks: block.{2,3,4}.*
+            if blk >= 2 and blk <= 4:
+                # Use flattened index: stage * 10 + (blk - 2)
+                # stage 1, blk 2 → 10; stage 1, blk 3 → 11; stage 1, blk 4 → 12
+                flat_idx = stage * 10 + (blk - 2)
+
+                if rest == "act1.alpha":
+                    return f"code2wav.dec_blk.{flat_idx}.act1_alpha"
+                elif rest == "act1.beta":
+                    return f"code2wav.dec_blk.{flat_idx}.act1_beta"
+                elif rest == "conv1.conv.weight":
+                    return f"code2wav.dec_blk.{flat_idx}.conv1.weight"
+                elif rest == "conv1.conv.bias":
+                    return f"code2wav.dec_blk.{flat_idx}.conv1.bias"
+                elif rest == "act2.alpha":
+                    return f"code2wav.dec_blk.{flat_idx}.act2_alpha"
+                elif rest == "act2.beta":
+                    return f"code2wav.dec_blk.{flat_idx}.act2_beta"
+                elif rest == "conv2.conv.weight":
+                    return f"code2wav.dec_blk.{flat_idx}.conv2.weight"
+                elif rest == "conv2.conv.bias":
+                    return f"code2wav.dec_blk.{flat_idx}.conv2.bias"
+
+        return None
 
 
 @ModelBase.register("Qwen3NextForCausalLM")

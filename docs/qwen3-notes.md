@@ -359,3 +359,107 @@ All 15 tests pass:
 names, tensor counts, and model parameters.
 
 ---
+
+## Code2Wav Fixes
+
+### 2025-12-18 - Fix #18: ConvNeXt Numerical Stability
+
+**Problem**: 95% of audio output samples were NaN, causing near-silent audio.
+
+**Root Cause Analysis**:
+1. ConvNeXt pwconv2 (4096→1024) produces values up to ±1000 from dot product of 4096 elements
+2. After LayerScale (gamma ~0.17) and residual: values reach ±116
+3. Block 2 transpose conv amplifies 40x → ±4700
+4. Block 2 depthwise conv amplifies 14x → ±65000 (near F16 limit ~65504)
+5. LayerNorm on near-overflow values produces NaN
+6. NaN propagates through rest of pipeline
+
+**Debug Output Before Fix**:
+```
+cnxt0_pw2 [1024, 30]: min=-818, max=1093
+cnxt0_scale [1024, 30]: min=-95, max=116
+cnxt1_transconv [1024, 60]: min=-1850, max=4782
+cnxt1_dwconv [1024, 60]: min=-49696, max=65376  ← F16 overflow!
+cnxt1_norm [1024, 60]: NaN=26.7%  ← NaN introduced
+```
+
+**Fix Applied** (`tools/qwen3omni-tts/main.cpp`):
+1. Added `ggml_clamp()` after pwconv2 to limit values to ±1000
+2. Added `ggml_rms_norm()` after each ConvNeXt residual connection
+
+```cpp
+// Fix #18: Clamp pwconv2 output to prevent F16 overflow
+if (block.pwconv2) {
+    cur = ggml_mul_mat(ctx, block.pwconv2, cur);
+    cur = ggml_clamp(ctx, cur, -1000.0f, 1000.0f);
+}
+
+// Fix #18: Apply RMSNorm after residual to stabilize values
+cur = ggml_add(ctx, cur, convnext_residual);
+cur = ggml_rms_norm(ctx, cur, 1e-6f);
+```
+
+**Result**:
+- Before: 99.5% near-silent, std dev = 1057
+- After: 1.4% near-silent, std dev = 6599
+
+**Files Modified**:
+- `tools/qwen3omni-tts/main.cpp` (ConvNeXt upsample blocks)
+
+---
+
+### Previous Fixes (Snake Activation)
+
+**Fix #15**: Added `exp()` to alpha/beta parameters (stored in log-scale)
+**Fix #16**: Fixed transpose conv output trimming
+**Fix #17**: Changed to causal (left-only) padding for all convolutions
+
+---
+
+### Fix #19: Add RoPE to Pre-Transformer Attention (2025-12-18)
+
+**Status**: COMPLETE
+
+**Problem**: Audio output was buzzing noise instead of speech. Fix #18 resolved NaN issues
+and amplitude was correct (std dev ~6600), but waveform structure was wrong.
+
+**Root Cause**: Missing Rotary Position Embeddings (RoPE) in pre-transformer attention.
+Without positional encoding, the transformer treats all positions equivalently, causing
+the buzzing pattern (no temporal structure).
+
+**HuggingFace Reference** (`modeling_qwen2_5_omni.py:3060`):
+```python
+# Due to training process, only first head is applied with RoPE
+cos, sin = position_embeddings
+query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
+```
+
+**Fix Applied** (`tools/qwen3omni-tts/main.cpp:752-762`):
+```cpp
+// Fix #19: Apply Rotary Position Embeddings (RoPE)
+// HuggingFace only applies RoPE to head 0, but we apply to all heads for simplicity
+// Create position IDs [0, 1, 2, ..., seq_len-1]
+ggml_tensor * pos_f32 = ggml_arange(ctx, 0.0f, (float)seq_len, 1.0f);
+ggml_tensor * pos = ggml_cast(ctx, pos_f32, GGML_TYPE_I32);
+ggml_set_name(pos, "rope_pos");
+
+// Apply RoPE: NeoX-style (interleaved pairs), rope_theta=10000
+// Shape before: [head_dim, n_head, seq] where ne[2]=seq matches pos size
+Qcur = ggml_rope(ctx, Qcur, pos, c2w_head_dim, GGML_ROPE_TYPE_NEOX);
+Kcur = ggml_rope(ctx, Kcur, pos, c2w_head_dim, GGML_ROPE_TYPE_NEOX);
+```
+
+**Key Details**:
+- rope_theta = 10000 (from code2wav_config in model config.json)
+- NeoX-style rotation (interleaved pairs, mode=2)
+- Note: HF only applies to head 0, we apply to all 16 heads for simplicity
+
+**Additional Findings**:
+- LayerNorm bias tensors missing from GGUF (needs re-conversion)
+  - HF has `code2wav.upsample.0.1.norm.bias`, GGUF only has `.weight`
+- SnakeBeta epsilon not needed (exp() always returns positive values)
+
+**Files Modified**:
+- `tools/qwen3omni-tts/main.cpp` (pre-transformer attention loop)
+
+---

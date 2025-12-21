@@ -14,6 +14,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+    int32_t  n_layer_output;  // extract hidden states from this layer (0 = all layers)
 
     float rope_freq_base;
     float rope_freq_scale;

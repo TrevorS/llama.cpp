@@ -47,6 +47,7 @@ llama_context::llama_context(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
+    cparams.n_layer_output   = params.n_layer_output;
     cparams.warmup           = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -2379,6 +2380,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
+        /*.n_layer_output              =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
