@@ -56,6 +56,7 @@ struct tts_params {
     bool thinker_only = false;    // Test mode: only run Thinker extraction
     bool skip_code2wav = false;   // Skip Code2Wav for faster testing
     bool use_mmap = true;         // Use mmap for model loading (disable for UMA systems)
+    bool code2wav_only = false;   // Internal: skip Thinker when --load-tokens provided
 };
 
 // Special tokens for Talker (from talker_config in config.json)
@@ -884,9 +885,11 @@ static ggml_tensor * build_code2wav_graph(
         // Attention norm (RMSNorm with Code2Wav epsilon)
         if (layer.attn_norm) {
             cur = build_rms_norm(ctx, cur, layer.attn_norm, C2W_RMS_NORM_EPS);
-            // Debug: Track after attn norm (first layer only)
-            if (debug_tensors && il == 0) {
-                ggml_set_name(cur, "pretrans_layer0_after_attn_norm");
+            // Debug: Track after attn norm (layer 0 and 7)
+            if (debug_tensors && (il == 0 || il == 7)) {
+                char name[64];
+                snprintf(name, sizeof(name), "pretrans_layer%d_after_attn_norm", il);
+                ggml_set_name(cur, name);
                 ggml_set_output(cur);
                 debug_tensors->push_back(cur);
             }
@@ -905,19 +908,16 @@ static ggml_tensor * build_code2wav_graph(
             Kcur = ggml_reshape_3d(ctx, Kcur, c2w_head_dim, c2w_n_head, seq_len);
             Vcur = ggml_reshape_3d(ctx, Vcur, c2w_head_dim, c2w_n_head, seq_len);
 
-            // Apply RoPE (rotary position embeddings)
-            // Create position tensor as a graph operation using arange
-            // ggml_arange creates [0, 1, 2, ..., n-1] as F32, then cast to I32 for rope
+            // Apply RoPE (rotary position embeddings) to all heads
+            // Note: HuggingFace Code2Wav applies RoPE to all heads (not just head 0)
             ggml_tensor * pos_f32 = ggml_arange(ctx, 0, seq_len, 1);
             ggml_tensor * pos = ggml_cast(ctx, pos_f32, GGML_TYPE_I32);
             ggml_set_name(pos, "rope_pos");
 
-            // Apply RoPE: rope_dim = head_dim, mode = NEOX (interleaved)
-            // n_ctx_orig = 2048, freq_base = 10000, freq_scale = 1.0
             Qcur = ggml_rope_ext(ctx, Qcur, pos, nullptr, c2w_head_dim, GGML_ROPE_TYPE_NEOX,
-                                  2048, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                                 2048, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             Kcur = ggml_rope_ext(ctx, Kcur, pos, nullptr, c2w_head_dim, GGML_ROPE_TYPE_NEOX,
-                                  2048, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                                 2048, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
             // Permute for attention: [head_dim, n_head, seq] -> [head_dim, seq, n_head]
             Qcur = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
@@ -957,18 +957,38 @@ static ggml_tensor * build_code2wav_graph(
             cur = ggml_mul_mat(ctx, layer.wo, KQV);
         }
 
+        // Debug: Track attention output before LayerScale (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_attn_out", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
+        }
+
         // LayerScale for attention
         if (layer.attn_scale) {
             cur = ggml_mul(ctx, cur, layer.attn_scale);
+        }
+
+        // Debug: Track attention output after LayerScale (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_attn_scaled", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
         }
 
         // Residual
         cur = ggml_add(ctx, cur, inpSA);
         ggml_tensor * ffn_inp = cur;
 
-        // Debug: Track after first attention residual
-        if (debug_tensors && il == 0) {
-            ggml_set_name(cur, "pretrans_layer0_after_attn_res");
+        // Debug: Track after attention residual (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_after_attn_res", il);
+            ggml_set_name(cur, name);
             ggml_set_output(cur);
             debug_tensors->push_back(cur);
         }
@@ -978,13 +998,58 @@ static ggml_tensor * build_code2wav_graph(
             cur = build_rms_norm(ctx, cur, layer.ffn_norm, C2W_RMS_NORM_EPS);
         }
 
+        // Debug: Track after FFN norm (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_ffn_norm", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
+        }
+
         // FFN (SwiGLU)
         if (layer.ffn_gate && layer.ffn_up && layer.ffn_down) {
             ggml_tensor * gate = ggml_mul_mat(ctx, layer.ffn_gate, cur);
             ggml_tensor * up = ggml_mul_mat(ctx, layer.ffn_up, cur);
+
+            // Debug: Track FFN intermediates (layer 7 only)
+            if (debug_tensors && il == 7) {
+                ggml_set_name(gate, "pretrans_layer7_ffn_gate_raw");
+                ggml_set_output(gate);
+                debug_tensors->push_back(gate);
+                ggml_set_name(up, "pretrans_layer7_ffn_up");
+                ggml_set_output(up);
+                debug_tensors->push_back(up);
+            }
+
             gate = ggml_silu(ctx, gate);
+
+            // Debug: Track after silu (layer 7 only)
+            if (debug_tensors && il == 7) {
+                ggml_set_name(gate, "pretrans_layer7_ffn_gate_silu");
+                ggml_set_output(gate);
+                debug_tensors->push_back(gate);
+            }
+
             cur = ggml_mul(ctx, gate, up);
+
+            // Debug: Track gate*up (layer 7 only)
+            if (debug_tensors && il == 7) {
+                ggml_set_name(cur, "pretrans_layer7_ffn_gate_up");
+                ggml_set_output(cur);
+                debug_tensors->push_back(cur);
+            }
+
             cur = ggml_mul_mat(ctx, layer.ffn_down, cur);
+        }
+
+        // Debug: Track FFN output before LayerScale (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_ffn_out", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
         }
 
         // LayerScale for FFN
@@ -992,8 +1057,26 @@ static ggml_tensor * build_code2wav_graph(
             cur = ggml_mul(ctx, cur, layer.ffn_scale);
         }
 
+        // Debug: Track FFN output after LayerScale (layer 0 and 7)
+        if (debug_tensors && (il == 0 || il == 7)) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_ffn_scaled", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
+        }
+
         // Residual
         cur = ggml_add(ctx, cur, ffn_inp);
+
+        // Debug: Track full layer output (all layers)
+        if (debug_tensors) {
+            char name[64];
+            snprintf(name, sizeof(name), "pretrans_layer%d_output", il);
+            ggml_set_name(cur, name);
+            ggml_set_output(cur);
+            debug_tensors->push_back(cur);
+        }
     }
 
     // Debug: Track before output norm
@@ -2571,15 +2654,22 @@ static bool parse_args(int argc, char ** argv, tts_params & params) {
         }
     }
 
-    if (params.thinker_path.empty()) {
-        fprintf(stderr, "Error: Thinker model path is required (--thinker)\n");
-        return false;
+    // If --load-tokens is provided with a Talker model, we can skip Thinker entirely
+    if (!params.load_tokens_path.empty() && !params.talker_path.empty()) {
+        params.code2wav_only = true;
+        printf("Code2Wav-only mode: loading tokens from %s\n", params.load_tokens_path.c_str());
+    } else {
+        // Normal mode - require Thinker and prompt
+        if (params.thinker_path.empty()) {
+            fprintf(stderr, "Error: Thinker model path is required (--thinker)\n");
+            return false;
+        }
+        if (params.prompt.empty()) {
+            fprintf(stderr, "Error: Prompt is required (-p) unless using --load-tokens with --talker\n");
+            return false;
+        }
     }
-    if (params.prompt.empty()) {
-        fprintf(stderr, "Error: Prompt is required (-p)\n");
-        return false;
-    }
-    if (!params.thinker_only && params.talker_path.empty()) {
+    if (!params.thinker_only && !params.code2wav_only && params.talker_path.empty()) {
         fprintf(stderr, "Note: No Talker model specified, running in thinker-only mode\n");
         params.thinker_only = true;
     }
@@ -2610,6 +2700,66 @@ int main(int argc, char ** argv) {
 
     printf("\n=== Qwen3-Omni TTS Pipeline ===\n\n");
     fflush(stdout);
+
+    // ========================================
+    // Code2Wav-only mode: skip Thinker and Talker, just run vocoder
+    // ========================================
+    if (params.code2wav_only) {
+        printf("Loading Talker model (Code2Wav only): %s\n", params.talker_path.c_str());
+
+        llama_model_params mparams = llama_model_default_params();
+        mparams.n_gpu_layers = params.n_gpu_layers;
+        mparams.use_mmap = params.use_mmap;
+
+        llama_model * talker_model = llama_model_load_from_file(params.talker_path.c_str(), mparams);
+        if (!talker_model) {
+            fprintf(stderr, "Error: Failed to load Talker model\n");
+            return 1;
+        }
+
+        // Load tokens from file
+        auto all_codebook_tokens = load_codebook_tokens(params.load_tokens_path);
+        if (all_codebook_tokens.empty()) {
+            fprintf(stderr, "Error: Failed to load tokens from %s\n", params.load_tokens_path.c_str());
+            llama_model_free(talker_model);
+            return 1;
+        }
+        printf("Loaded %zu frames from %s\n", all_codebook_tokens.size(), params.load_tokens_path.c_str());
+
+        // Run Code2Wav
+        printf("\nRunning Code2Wav vocoder...\n");
+        fflush(stdout);
+
+        if (!talker_model->c2w_code_embd || talker_model->c2w_pre_layers.empty()) {
+            fprintf(stderr, "Error: Code2Wav tensors not found in model\n");
+            llama_model_free(talker_model);
+            return 1;
+        }
+
+        printf("Code2Wav has %zu pre-transformer layers\n", talker_model->c2w_pre_layers.size());
+
+        std::vector<float> audio_samples = run_code2wav_ggml(talker_model, all_codebook_tokens, params.verbose, params.dump_tensors_path);
+
+        int n_samples = audio_samples.size();
+
+        // Apply fade in/out
+        int fade_samples = std::min(500, n_samples / 8);
+        for (int i = 0; i < fade_samples; ++i) {
+            float fade = static_cast<float>(i) / fade_samples;
+            audio_samples[i] *= fade;
+            audio_samples[n_samples - 1 - i] *= fade;
+        }
+
+        if (write_wav(params.output_path, audio_samples.data(), n_samples, params.sample_rate)) {
+            printf("\nWrote audio to: %s\n", params.output_path.c_str());
+            printf("Duration: %.2f seconds (%d samples at %d Hz)\n",
+                   static_cast<float>(n_samples) / params.sample_rate, n_samples, params.sample_rate);
+        }
+
+        llama_model_free(talker_model);
+        llama_backend_free();
+        return 0;
+    }
 
     // ========================================
     // Step 1: Load Thinker model

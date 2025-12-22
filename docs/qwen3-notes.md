@@ -558,6 +558,200 @@ Located in `tools/qwen3omni-tts/`:
 - `compare_all_stages.py` - Main pipeline comparison
 - `compare_transconv.py` - Transposed conv verification
 - `check_memory_layout.py` - GGML layout verification
-- `fixed_compare.py`, `proper_compare.py` - Earlier debugging scripts
+- `debug_norm.py` - LayerNorm divergence analysis
+- `debug_norm_weights.py` - LayerNorm weight verification
+- `debug_dwconv.py` - Depthwise conv verification
+- `debug_pretrans.py` - Pre-transformer stage analysis
+
+---
+
+## Deep Dive Analysis (2025-12-22)
+
+Systematic investigation of correlation drops at each pipeline stage.
+
+### Updated Correlation Table
+
+| Stage | Correlation | Std Ratio | Notes |
+|-------|-------------|-----------|-------|
+| Embedding input | 1.0000 | 1.00 | Perfect match |
+| Pre-transformer | 1.0000 | 1.00 | **PERFECT** (was 0.72 due to comparison bug) |
+| Transposed conv 0 | 0.9743 | 0.75 | Stable |
+| Depthwise conv 0 | 0.9547 | 0.87 | Slight drop |
+| LayerNorm 0 | 0.8943 | 0.86 | -0.06 drop |
+| Pointwise conv 1 | 0.9825 | 0.80 | Recovers |
+| GELU 0 | 0.9038 | 0.69 | -0.08 drop |
+| Pointwise conv 2 | 0.8730 | 0.70 | Continues |
+| **Block 0 output** | **0.9272** | 0.72 | Residual helps |
+| **Final audio** | **0.9498** | - | Good! |
+
+> **Note (2025-12-22)**: The pre-transformer row was updated from 0.9765/0.72 to 1.0/1.0 after
+> discovering the HF debug script was using GELU instead of SiLU. See "Pre-Transformer Perfect Match"
+> section below for details.
+
+### Root Cause Analysis
+
+1. **Embedding Input**: Perfect 1.0 correlation confirms tokens are processed identically
+
+2. ~~**Pre-transformer Variance**: C++ output has 72% of HF variance (std ratio 0.72)~~
+   - ~~RMSNorm implementation verified correct~~
+   - ~~Error accumulates through 8 transformer layers~~
+   - ~~Not a bug, just numerical precision differences~~
+   - **UPDATE (2025-12-22)**: This was INCORRECT. The 0.72 ratio was caused by the HF debug
+     script using GELU instead of SiLU. Pre-transformer is now verified PERFECT (1.0 correlation)
+
+3. **LayerNorm Drop** (-0.06): LayerNorm amplifies input differences
+   - Verified: applying HF LayerNorm to C++ input gives same result
+   - Error comes from upstream (dwconv differences)
+
+4. **GELU Drop** (-0.08): GELU's nonlinear shape amplifies differences
+   - Linear layers (pw1) recover correlation
+   - Nonlinear ops (GELU, LayerNorm) amplify it
+
+5. **Gamma Scaling**: Verified CORRECT (1.0 correlation between C++ and HF gamma)
+   - Initially showed 0.42 correlation due to comparing wrong tensors
+   - C++ `cnxt0_scale` = gamma × pw2 (before residual)
+   - HF `11_cnxt0_out` = transconv + gamma × pw2 (after residual)
+   - Correct comparison: C++ (transconv + scale) vs HF out = 0.9272
+
+### Code2Wav-Only Mode
+
+Added `--load-tokens` + `--talker` combination for easier testing:
+- Skips Thinker model loading entirely
+- Loads codec tokens from text file (16 lines, space-separated)
+- Runs Code2Wav directly for rapid iteration
+
+Usage:
+```bash
+./llama-qwen3omni-tts \
+  --talker model.gguf \
+  --load-tokens tokens.txt \
+  --output test.wav \
+  --dump-tensors /debug/
+```
+
+### Conclusions
+
+1. **Pipeline is fundamentally correct** - 0.95 final correlation
+2. **Pre-transformer is PERFECT** - All 8 layers show 1.0 correlation after fixing comparison bug
+3. **Residual connections help** - They restore correlation (0.87 → 0.93)
+4. **Nonlinear ops amplify error** - GELU and LayerNorm cause biggest drops
+5. **Audio is recognizably speech** - "Garbled male voice" is expected at 0.95 correlation
+6. **Remaining divergence is in ConvNeXt/HiFi-GAN** - Not in pre-transformer
+
+---
+
+## Pre-Transformer Perfect Match (2025-12-22)
+
+### Issue: 0.72 Std Ratio Investigation
+
+Initial analysis showed pre-transformer output had 72% of HuggingFace variance.
+Systematic layer-by-layer debugging revealed the issue was NOT in C++.
+
+### Root Cause: HF Debug Script Bug
+
+The debug script `debug_hf_pretrans_layers.py` was setting:
+```python
+code2wav_config.hidden_act = "gelu"  # WRONG!
+```
+
+But the model checkpoint uses `hidden_act: silu`.
+
+### Investigation Process
+
+1. Compared layer-by-layer outputs (layers 0-7)
+2. Found layer 7 FFN had 2x variance difference
+3. Verified FFN weights are IDENTICAL (correlation 1.0)
+4. Traced to gate_proj → silu → down_proj sequence
+5. Discovered activation mismatch: C++ using SiLU, HF debug using GELU
+
+### Fix Applied
+
+Removed the `hidden_act = "gelu"` override in `debug_hf_pretrans_layers.py`.
+
+### Verification Results (Post-Fix)
+
+| Layer | Correlation | Std Ratio | Status |
+|-------|-------------|-----------|--------|
+| Layer 0 | 1.000000 | 1.0000 | PERFECT |
+| Layer 1 | 1.000000 | 1.0000 | PERFECT |
+| Layer 2 | 1.000000 | 1.0000 | PERFECT |
+| Layer 3 | 1.000000 | 1.0000 | PERFECT |
+| Layer 4 | 1.000000 | 1.0000 | PERFECT |
+| Layer 5 | 1.000000 | 1.0000 | PERFECT |
+| Layer 6 | 1.000000 | 1.0000 | PERFECT |
+| Layer 7 | 1.000000 | 1.0000 | PERFECT |
+| Final output | 1.000000 | 1.0000 | PERFECT |
+
+### Conclusion
+
+The C++ Code2Wav pre-transformer is **numerically identical** to HuggingFace.
+The 0.72 std ratio was a comparison artifact from an incorrect reference.
+
+### Debug Scripts Created
+
+- `debug_hf_pretrans_layers.py` - Dumps per-layer intermediate tensors from HF
+- `debug_hf_code2wav.py` - Dumps full Code2Wav pipeline tensors (ConvNeXt, HiFi-GAN)
+- `compare_layer7.py` - Compares layer 7 intermediates between C++ and HF
+- `compare_ffn_weights.py` - Verifies FFN weights match between GGUF and HF
+
+**Critical Bug Fixed (2025-12-22):** Both HF debug scripts originally had `hidden_act = "gelu"`
+hardcoded, but the model uses `"silu"`. This caused ~2x variance differences in comparisons.
+The bug affected both `debug_hf_pretrans_layers.py` (line 69, fixed earlier) and
+`debug_hf_code2wav.py` (line 86, fixed today). After fixing, all comparisons show perfect match.
+
+---
+
+## Current Verification Status Summary
+
+| Component | Status | Correlation | Notes |
+|-----------|--------|-------------|-------|
+| Codebook Embedding | ✅ VERIFIED | 1.0 | Perfect match |
+| Pre-Transformer (8 layers) | ✅ VERIFIED | 1.0 | All layers perfect |
+| ConvNeXt Transconv | ✅ VERIFIED | 1.0 | Memory layout correct |
+| ConvNeXt Block 0 (all ops) | ✅ VERIFIED | 0.9999+ | DWConv, LayerNorm, PW1, GELU, PW2 all perfect |
+| ConvNeXt Block 1 (all ops) | ✅ VERIFIED | 0.9999+ | All operations match HuggingFace |
+| HiFi-GAN conv_in | ✅ VERIFIED | 0.9999+ | Perfect match |
+| HiFi-GAN Stage 0-3 | ✅ VERIFIED | 0.9999+ | Snake + TransConv + ResBlocks all correct |
+| Final Audio (before clamp) | ✅ VERIFIED | 0.999994 | MAE: 0.00033, Max diff: 0.015 |
+| Final Audio (after clamp) | ✅ VERIFIED | 0.999994 | Perfect match with HuggingFace |
+
+### Code2Wav Pipeline: FULLY VERIFIED ✅
+
+**Date: 2025-12-22**
+
+The entire Code2Wav pipeline has been verified against HuggingFace with near-perfect numerical accuracy:
+
+```
+Pre-Transformer Output    | corr=1.000000 ratio=1.0000 [PERFECT]
+ConvNeXt0 TransConv       | corr=1.000000 ratio=1.0000 [PERFECT]
+ConvNeXt0 DWConv          | corr=1.000000 ratio=1.0000 [PERFECT]
+ConvNeXt0 LayerNorm       | corr=1.000000 ratio=1.0000 [PERFECT]
+ConvNeXt0 PW1             | corr=0.999999 ratio=1.0000 [PERFECT]
+ConvNeXt0 GELU            | corr=0.999998 ratio=1.0001 [PERFECT]
+ConvNeXt0 PW2             | corr=0.999998 ratio=1.0000 [PERFECT]
+ConvNeXt1 TransConv       | corr=0.999999 ratio=1.0000 [PERFECT]
+ConvNeXt1 DWConv          | corr=1.000000 ratio=1.0001 [PERFECT]
+ConvNeXt1 LayerNorm       | corr=0.999999 ratio=1.0000 [PERFECT]
+ConvNeXt1 PW1             | corr=0.999998 ratio=1.0000 [PERFECT]
+ConvNeXt1 GELU            | corr=0.999998 ratio=1.0000 [PERFECT]
+ConvNeXt1 PW2             | corr=0.999997 ratio=0.9999 [PERFECT]
+ConvNeXt Full Output      | corr=0.999998 ratio=1.0000 [PERFECT]
+HiFi Stage0 (conv_in)     | corr=0.999999 ratio=1.0000 [PERFECT]
+Stage3 Full Output        | corr=0.999991 ratio=1.0001 [PERFECT]
+Final Snake Output        | corr=0.999991 ratio=1.0001 [PERFECT]
+Final Conv_out            | corr=0.999994 ratio=1.0001 [PERFECT]
+```
+
+**Final Audio Comparison:**
+- C++ before_clamp: min=-1.587888, max=1.996097
+- HF 12_dec6:       min=-1.578169, max=1.999208
+- Correlation: 0.9999942
+- MAE: 0.000332
+- Max diff: 0.0154
+
+### Next Steps
+
+1. **Talker Investigation**: Codec token generation still differs from HF - this is the remaining issue
+2. **End-to-End Testing**: With verified Code2Wav, focus on Talker output quality
 
 ---

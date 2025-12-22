@@ -83,7 +83,8 @@ def main():
     # Patch missing attrs that the transformer model expects
     code2wav_config.vocab_size = 1024 * 16 + 1  # 16 codebooks * 1024 vocab + 1
     code2wav_config.pad_token_id = 0
-    code2wav_config.hidden_act = "gelu"
+    # NOTE: Do NOT override hidden_act - model uses "silu" per checkpoint
+    print(f"  Using hidden_act: {code2wav_config.hidden_act}")
 
     model = Qwen3OmniMoeCode2Wav(code2wav_config)
 
