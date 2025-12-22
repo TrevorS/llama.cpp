@@ -4548,6 +4548,11 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
                     data_torch = data_torch.permute(2, 1, 0).contiguous()
                     logger.info(f"Permuted dwconv weight {name}: {data_torch.shape}")
 
+                # NOTE: ConvTranspose1d weights do NOT need permutation!
+                # GGUF writer reverses dimensions when writing (for GGML ne[] order).
+                # HuggingFace [Cin, Cout, K] -> GGUF stores -> GGML reads ne[0]=K, ne[1]=Cout, ne[2]=Cin
+                # This is exactly what ggml_conv_transpose_1d expects.
+
                 return [(mapped_name, data_torch)]
             except ValueError:
                 logger.warning(f"Skipping unmapped Code2Wav tensor: {name}")

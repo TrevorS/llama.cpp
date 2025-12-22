@@ -736,6 +736,12 @@ static ggml_tensor * build_snake(ggml_context * ctx, ggml_tensor * x,
 }
 
 // Build RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+// Code2Wav uses eps=1e-5 (from HF config.rms_norm_eps), other models use 1e-6
+static constexpr float C2W_RMS_NORM_EPS = 1e-5f;
+
+// Code2Wav pre-transformer sliding window attention size (from HF config.sliding_window)
+static constexpr int C2W_SLIDING_WINDOW = 72;
+
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps = 1e-6f) {
     x = ggml_rms_norm(ctx, x, eps);
@@ -832,7 +838,8 @@ static ggml_tensor * build_code2wav_graph(
         ggml_tensor * input_embd,  // [c2w_n_embd, n_frames]
         int n_frames,
         bool verbose,
-        std::vector<ggml_tensor *> * debug_tensors = nullptr) {
+        std::vector<ggml_tensor *> * debug_tensors = nullptr,
+        ggml_tensor ** out_attn_mask = nullptr) {
 
     const int c2w_n_embd = 1024;
     const int c2w_n_head = 16;
@@ -847,12 +854,17 @@ static ggml_tensor * build_code2wav_graph(
     ggml_tensor * cur = input_embd;
     int seq_len = n_frames;
 
-    // NOTE: HuggingFace Code2Wav uses sliding_window=72, but for simplicity we use
-    // standard causal masking via ggml_diag_mask_inf(). For short sequences (~200 tokens)
-    // the difference is negligible since window=72 covers most positions anyway.
+    // Build sliding window causal mask for pre-transformer (window=72)
+    // Mask is [seq, seq] with 0.0 for valid positions, filled later before compute
+    ggml_tensor * c2w_attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, seq_len);
+    ggml_set_name(c2w_attn_mask, "c2w_attn_mask");
+    ggml_set_input(c2w_attn_mask);
+    if (out_attn_mask) {
+        *out_attn_mask = c2w_attn_mask;
+    }
 
     // =========================================================================
-    // Pre-transformer: 8 layers with causal attention
+    // Pre-transformer: 8 layers with sliding window causal attention
     // =========================================================================
     if (verbose) {
         printf("  Building pre-transformer (%d layers)...\n", c2w_n_layer);
@@ -869,9 +881,9 @@ static ggml_tensor * build_code2wav_graph(
             debug_tensors->push_back(cur);
         }
 
-        // Attention norm (RMSNorm)
+        // Attention norm (RMSNorm with Code2Wav epsilon)
         if (layer.attn_norm) {
-            cur = build_rms_norm(ctx, cur, layer.attn_norm);
+            cur = build_rms_norm(ctx, cur, layer.attn_norm, C2W_RMS_NORM_EPS);
             // Debug: Track after attn norm (first layer only)
             if (debug_tensors && il == 0) {
                 ggml_set_name(cur, "pretrans_layer0_after_attn_norm");
@@ -920,17 +932,10 @@ static ggml_tensor * build_code2wav_graph(
             // KQ = mul_mat(K, Q) gives [seq, seq, n_head]
             ggml_tensor * KQ = ggml_mul_mat(ctx, Kcur, Qcur);
 
-            // Scale
+            // Scale + sliding window mask + softmax (combined for efficiency)
+            // Sliding window mask limits attention to past 72 tokens (matching HF)
             float scale = 1.0f / sqrtf((float)c2w_head_dim);
-            KQ = ggml_scale(ctx, KQ, scale);
-
-            // Apply causal mask (prevent attending to future positions)
-            // ggml_diag_mask_inf sets elements above diagonal to -inf
-            // n_past=0 means mask all positions above the diagonal
-            KQ = ggml_diag_mask_inf(ctx, KQ, 0);
-
-            // Softmax
-            KQ = ggml_soft_max(ctx, KQ);
+            KQ = ggml_soft_max_ext(ctx, KQ, c2w_attn_mask, scale, 0.0f);
 
             // Attention output: KQ @ V
             // KQ: [seq, seq, n_head], V: [head_dim, seq, n_head]
@@ -968,9 +973,9 @@ static ggml_tensor * build_code2wav_graph(
             debug_tensors->push_back(cur);
         }
 
-        // FFN norm
+        // FFN norm (RMSNorm with Code2Wav epsilon)
         if (layer.ffn_norm) {
-            cur = build_rms_norm(ctx, cur, layer.ffn_norm);
+            cur = build_rms_norm(ctx, cur, layer.ffn_norm, C2W_RMS_NORM_EPS);
         }
 
         // FFN (SwiGLU)
@@ -998,9 +1003,9 @@ static ggml_tensor * build_code2wav_graph(
         debug_tensors->push_back(cur);
     }
 
-    // Pre-transformer output norm
+    // Pre-transformer output norm (RMSNorm with Code2Wav epsilon)
     if (model->c2w_pre_output_norm) {
-        cur = build_rms_norm(ctx, cur, model->c2w_pre_output_norm);
+        cur = build_rms_norm(ctx, cur, model->c2w_pre_output_norm, C2W_RMS_NORM_EPS);
     }
 
     // Debug: Track after pre-transformer
@@ -1452,12 +1457,9 @@ static ggml_tensor * build_code2wav_graph(
     return cur;
 }
 
-// Chunked decode constants
-// HuggingFace uses chunk_size=300, left_context=25, but CUDA IM2COL has limits
-// CUDA IM2COL fails above ~30 frames in transposed convolutions
-// Total frames per chunk = chunk_size + context, so keep total <= 30
-static const int CODE2WAV_CHUNK_SIZE = 20;        // 20 new frames per chunk
-static const int CODE2WAV_LEFT_CONTEXT = 10;      // 10 context frames (total 30)
+// Chunked decode constants (matching HuggingFace)
+static const int CODE2WAV_CHUNK_SIZE = 300;       // 300 new frames per chunk
+static const int CODE2WAV_LEFT_CONTEXT = 25;      // 25 context frames
 static const int CODE2WAV_TOTAL_UPSAMPLE = 1920;  // 4 (ConvNeXt) × 480 (HiFi-GAN)
 
 // Run Code2Wav vocoder for a single chunk using ggml graph
@@ -1631,8 +1633,9 @@ static std::vector<float> run_code2wav_chunk(
     if (verbose) {
         printf("  Building compute graph...\n");
     }
+    ggml_tensor * attn_mask = nullptr;
     ggml_tensor * output = build_code2wav_graph(ctx, gf, model, input_tensor, n_frames, verbose,
-                                                 collect_debug ? &debug_tensors : nullptr);
+                                                 collect_debug ? &debug_tensors : nullptr, &attn_mask);
 
     // Step 3: Allocate graph
     if (verbose) {
@@ -1648,6 +1651,22 @@ static std::vector<float> run_code2wav_chunk(
 
     // Step 4: Set input data
     ggml_backend_tensor_set(input_tensor, input_data.data(), 0, input_data.size() * sizeof(float));
+
+    // Step 4b: Fill sliding window attention mask
+    // For each query position q, attend only to key positions k where:
+    // 1. k <= q (causal: no future tokens)
+    // 2. q - k < sliding_window (sliding window: no distant past tokens)
+    if (attn_mask) {
+        std::vector<float> mask_data(n_frames * n_frames);
+        for (int q = 0; q < n_frames; q++) {
+            for (int k = 0; k < n_frames; k++) {
+                int idx = q * n_frames + k;
+                bool masked = (k > q) || (q - k >= C2W_SLIDING_WINDOW);
+                mask_data[idx] = masked ? -INFINITY : 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    }
 
     // Step 5: Compute graph
     if (verbose) {
