@@ -168,7 +168,7 @@ llm_build_qwen3omni_talker::llm_build_qwen3omni_talker(const llama_model & model
         }
 
         cur = ggml_add(ctx0, moe_out, ffn_inp);
-
+        // NOTE: build_cvec returns cur unchanged if no cvec, so l_out == residual output
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 

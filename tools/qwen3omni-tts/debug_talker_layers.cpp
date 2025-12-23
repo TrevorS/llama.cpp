@@ -26,6 +26,27 @@
 #include "llama-context.h"
 #include "llama-graph.h"
 
+// CUDA headers for error checking (when available)
+#if defined(GGML_USE_CUDA)
+#include <cuda_runtime.h>
+#define CUDA_CHECK_ERROR(msg) do { \
+    cudaError_t err = cudaGetLastError(); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error [%s]: %s\n", msg, cudaGetErrorString(err)); \
+    } \
+} while(0)
+#define CUDA_SYNC_AND_CHECK(msg) do { \
+    cudaError_t sync_err = cudaDeviceSynchronize(); \
+    if (sync_err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Sync Error [%s]: %s\n", msg, cudaGetErrorString(sync_err)); \
+    } \
+    CUDA_CHECK_ERROR(msg); \
+} while(0)
+#else
+#define CUDA_CHECK_ERROR(msg) ((void)0)
+#define CUDA_SYNC_AND_CHECK(msg) ((void)0)
+#endif
+
 struct debug_params {
     std::string model_path;
     std::string prefill_path;
@@ -243,6 +264,9 @@ int main(int argc, char ** argv) {
 
     printf("\nRunning prefill with %d tokens...\n", n_tokens);
 
+    // Clear any pending CUDA errors before decode
+    CUDA_CHECK_ERROR("before decode");
+
     // Run decode
     int ret = llama_decode(ctx, batch);
     if (ret != 0) {
@@ -252,6 +276,9 @@ int main(int argc, char ** argv) {
         llama_model_free(model);
         return 1;
     }
+
+    // Check for CUDA errors after decode
+    CUDA_SYNC_AND_CHECK("after llama_decode");
 
     printf("Decode complete. Extracting layer outputs...\n");
 
@@ -316,6 +343,7 @@ int main(int argc, char ** argv) {
     // Extract each layer's output
     printf("\n=== Per-Layer Outputs ===\n");
     std::vector<float> layer_data;
+    std::vector<int> problematic_layers;  // Track layers with issues
     for (int il = 0; il < model_n_layer; ++il) {
         char tensor_name[64];
         snprintf(tensor_name, sizeof(tensor_name), "l_out-%d", il);
@@ -359,16 +387,49 @@ int main(int argc, char ** argv) {
         std::vector<uint32_t> shape = {(uint32_t)ne1, (uint32_t)ne0};  // [n_tokens, n_embd]
         save_tensor(out_path, transposed.data(), shape);
 
-        // Print stats
+        // Print stats and check for NaN/Inf
         float sum = 0, sum_sq = 0;
+        int n_nan = 0, n_inf = 0, n_zero = 0;
+        float abs_max = 0;
         for (size_t i = 0; i < transposed.size(); ++i) {
-            sum += transposed[i];
-            sum_sq += transposed[i] * transposed[i];
+            float v = transposed[i];
+            if (std::isnan(v)) { n_nan++; continue; }
+            if (std::isinf(v)) { n_inf++; continue; }
+            if (v == 0.0f) n_zero++;
+            sum += v;
+            sum_sq += v * v;
+            abs_max = std::max(abs_max, std::fabs(v));
         }
-        float mean = sum / transposed.size();
-        float std_dev = sqrtf(sum_sq / transposed.size() - mean * mean);
-        printf("  Layer %2d: mean=%.6f, std=%.6f, first=[%.4f, %.4f], saved to %s\n",
-               il, mean, std_dev, transposed[0], transposed[1], out_path.c_str());
+        size_t valid = transposed.size() - n_nan - n_inf;
+        float mean = valid > 0 ? sum / valid : 0;
+        float std_dev = valid > 0 ? sqrtf(sum_sq / valid - mean * mean) : 0;
+
+        // Print with warning indicators for problematic layers
+        const char * status = "";
+        bool is_problematic = false;
+        if (n_nan > 0 || n_inf > 0) {
+            status = " [!!! NaN/Inf !!!]";
+            is_problematic = true;
+        } else if (std_dev < 0.01f) {
+            status = " [WARNING: near-zero std]";
+            is_problematic = true;
+        } else if (n_zero > (int)(transposed.size() * 0.9)) {
+            status = " [WARNING: >90% zeros]";
+            is_problematic = true;
+        }
+        if (is_problematic) {
+            problematic_layers.push_back(il);
+        }
+        printf("  Layer %2d: mean=%10.6f, std=%10.6f, max=%10.4f, NaN=%d, Inf=%d, zeros=%d%s\n",
+               il, mean, std_dev, abs_max, n_nan, n_inf, n_zero, status);
+
+        if (params.verbose) {
+            printf("           first=[%.4f, %.4f], saved to %s\n",
+                   transposed[0], transposed[1], out_path.c_str());
+        }
+
+        // Check for CUDA errors after each layer extraction
+        CUDA_CHECK_ERROR("after layer extraction");
     }
 
     // Also save final hidden state (after output norm)
@@ -602,7 +663,7 @@ int main(int argc, char ** argv) {
 
     // Extract intermediate tensors for layers around collapse point
     printf("\n=== Intermediate tensors for layers 7-10 (collapse zone) ===\n");
-    const char * intermediate_names[] = {"ffn_inp", "ffn_norm", "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_out", "ffn_shexp", "ffn_moe_shexp_out"};
+    const char * intermediate_names[] = {"ffn_inp", "ffn_norm", "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_out", "ffn_shexp", "ffn_moe_shexp_out", "ffn_residual"};
     for (int il = 7; il <= 10; ++il) {
         printf("Layer %d intermediates:\n", il);
         for (const char * name : intermediate_names) {
@@ -666,8 +727,26 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Print summary
     printf("\n=== Layer extraction complete ===\n");
     printf("Output directory: %s\n", params.output_dir.c_str());
+
+    // Summary of problematic layers
+    if (!problematic_layers.empty()) {
+        printf("\n*** WARNING: Problematic layers detected ***\n");
+        printf("Layers with issues: ");
+        for (size_t i = 0; i < problematic_layers.size(); ++i) {
+            printf("%d%s", problematic_layers[i],
+                   (i < problematic_layers.size() - 1) ? ", " : "\n");
+        }
+        printf("\nThis may indicate a CUDA bug or numerical instability.\n");
+        printf("Try running with --n-gpu-layers 0 to verify CPU produces correct output.\n");
+    } else {
+        printf("\nAll layers produced valid output.\n");
+    }
+
+    // Final CUDA error check
+    CUDA_SYNC_AND_CHECK("end of program");
 
     llama_batch_free(batch);
     llama_free(ctx);

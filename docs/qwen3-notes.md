@@ -7,12 +7,14 @@
 
 ## Current Status
 
-- **Phase**: Talker Verification COMPLETE
-- **Current Task**: Investigate CUDA bug (layers 8+ fail on GPU)
-- **Validation**: All components verified on CPU
+- **Phase**: Talker Verification COMPLETE (GPU TOO!)
+- **Current Task**: Integration testing (Thinker → Talker)
+- **Validation**: All components verified
   - Code2Wav: ✅ 0.9999+ correlation
   - Talker (CPU): ✅ All 20 layers match HF
-  - Talker (GPU): ❌ CUDA bug on GB10/Blackwell
+  - Talker (GPU): ✅ **CONFIRMED WORKING** - Final logits match CPU (2025-12-23)
+
+**Note**: The "CUDA bug" was a false alarm. Per-layer tensor extraction showed wrong values due to buffer aliasing in debug mode, but the actual computation is correct. GPU and CPU produce identical logits.
 
 ---
 
