@@ -4539,19 +4539,18 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
             try:
                 mapped_name = self.map_tensor_name(name)
 
-                # Depthwise convolution weights need permutation for ggml_conv_1d_dw
-                # HuggingFace: [out_channels, 1, kernel_size] = [1024, 1, 7]
-                # GGML expects: [kernel_size, 1, out_channels] = [7, 1, 1024] in memory
-                # This permutation changes both shape declaration AND memory layout
-                if "dwconv" in name and name.endswith(".weight"):
-                    # Permute [C, 1, K] -> [K, 1, C]
+                # Depthwise convolution (dwconv) weights need permutation
+                # PyTorch dwconv: [out_ch, 1, kernel] = [1024, 1, 7]
+                # We need GGUF ne = [1024, 1, 7] (what C++ expects for ggml_conv_1d_dw_ph)
+                # GGUF writer reverses numpy shape, so we need numpy = [7, 1, 1024]
+                # Permute: [1024, 1, 7] -> [7, 1, 1024]
+                if "dwconv" in name and name.endswith(".weight") and len(data_torch.shape) == 3:
                     data_torch = data_torch.permute(2, 1, 0).contiguous()
-                    logger.info(f"Permuted dwconv weight {name}: {data_torch.shape}")
+                    logger.info(f"Permuted dwconv weight {name}: shape now {list(data_torch.shape)}")
 
-                # NOTE: ConvTranspose1d weights do NOT need permutation!
-                # GGUF writer reverses dimensions when writing (for GGML ne[] order).
-                # HuggingFace [Cin, Cout, K] -> GGUF stores -> GGML reads ne[0]=K, ne[1]=Cout, ne[2]=Cin
-                # This is exactly what ggml_conv_transpose_1d expects.
+                # NOTE: ConvTranspose1d weights (upsample conv) DON'T need permutation
+                # PyTorch [in_ch, out_ch, kernel] gets reversed by GGUF writer to ne = [kernel, out_ch, in_ch]
+                # This is exactly what C++ ggml_conv_transpose_1d expects
 
                 return [(mapped_name, data_torch)]
             except ValueError:

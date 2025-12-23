@@ -57,6 +57,7 @@ struct tts_params {
     bool skip_code2wav = false;   // Skip Code2Wav for faster testing
     bool use_mmap = true;         // Use mmap for model loading (disable for UMA systems)
     bool code2wav_only = false;   // Internal: skip Thinker when --load-tokens provided
+    bool c2w_cpu_only = false;    // Force CPU for Code2Wav (workaround for CUDA IM2COL issues)
 };
 
 // Special tokens for Talker (from talker_config in config.json)
@@ -654,14 +655,18 @@ struct code2wav_context {
 };
 
 // Initialize Code2Wav context
-static bool init_code2wav_context(code2wav_context * ctx, const llama_model * model) {
+static bool init_code2wav_context(code2wav_context * ctx, const llama_model * model, bool cpu_only = false) {
     // Get backends from model - the tensors are on GPU, we need that backend
     // Try to get GPU backend first (where model tensors live)
-    ggml_backend_t backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-    if (backend_gpu) {
-        ctx->backends.push_back(backend_gpu);
-        ctx->backend_bufts.push_back(ggml_backend_get_default_buffer_type(backend_gpu));
-        fprintf(stderr, "Code2Wav: using GPU backend (%s)\n", ggml_backend_name(backend_gpu));
+    if (!cpu_only) {
+        ggml_backend_t backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (backend_gpu) {
+            ctx->backends.push_back(backend_gpu);
+            ctx->backend_bufts.push_back(ggml_backend_get_default_buffer_type(backend_gpu));
+            fprintf(stderr, "Code2Wav: using GPU backend (%s)\n", ggml_backend_name(backend_gpu));
+        }
+    } else {
+        fprintf(stderr, "Code2Wav: CPU-only mode (--c2w-cpu)\n");
     }
 
     // Get CPU backend as fallback
@@ -1540,9 +1545,13 @@ static ggml_tensor * build_code2wav_graph(
     return cur;
 }
 
-// Chunked decode constants (matching HuggingFace)
-static const int CODE2WAV_CHUNK_SIZE = 300;       // 300 new frames per chunk
-static const int CODE2WAV_LEFT_CONTEXT = 25;      // 25 context frames
+// Chunked decode constants
+// CUDA IM2COL kernel has grid y-dimension limit of 65535
+// Max safe frames = 65535 / (4 * 480) = 34
+// Must account for context: chunk_size + context <= 34
+// Using 25 new frames + 5 context = 30 total per chunk
+static const int CODE2WAV_CHUNK_SIZE = 25;        // 25 new frames per chunk (CUDA IM2COL limit)
+static const int CODE2WAV_LEFT_CONTEXT = 5;       // 5 context frames
 static const int CODE2WAV_TOTAL_UPSAMPLE = 1920;  // 4 (ConvNeXt) × 480 (HiFi-GAN)
 
 // Run Code2Wav vocoder for a single chunk using ggml graph
@@ -1550,7 +1559,8 @@ static std::vector<float> run_code2wav_chunk(
     const llama_model * model,
     const std::vector<std::vector<int>> & all_codebook_tokens,
     bool verbose,
-    const std::string & dump_tensors_path = "") {
+    const std::string & dump_tensors_path = "",
+    bool cpu_only = false) {
 
     const int c2w_n_embd = 1024;
     const int n_frames = all_codebook_tokens.size();
@@ -1645,7 +1655,7 @@ static std::vector<float> run_code2wav_chunk(
 
     // Initialize context
     code2wav_context c2w_ctx;
-    if (!init_code2wav_context(&c2w_ctx, model)) {
+    if (!init_code2wav_context(&c2w_ctx, model, cpu_only)) {
         fprintf(stderr, "Error: Failed to initialize Code2Wav context\n");
         return std::vector<float>(n_samples, 0.0f);
     }
@@ -1857,13 +1867,14 @@ static std::vector<float> run_code2wav_ggml(
     const llama_model * model,
     const std::vector<std::vector<int>> & all_codebook_tokens,
     bool verbose,
-    const std::string & dump_tensors_path = "") {
+    const std::string & dump_tensors_path = "",
+    bool cpu_only = false) {
 
     const int n_frames = (int)all_codebook_tokens.size();
 
     // For small inputs, process directly
     if (n_frames <= CODE2WAV_CHUNK_SIZE) {
-        return run_code2wav_chunk(model, all_codebook_tokens, verbose, dump_tensors_path);
+        return run_code2wav_chunk(model, all_codebook_tokens, verbose, dump_tensors_path, cpu_only);
     }
 
     // Chunked decode for large inputs
@@ -1892,7 +1903,7 @@ static std::vector<float> run_code2wav_ggml(
         }
 
         // Process chunk
-        std::vector<float> wav_chunk = run_code2wav_chunk(model, chunk, false);
+        std::vector<float> wav_chunk = run_code2wav_chunk(model, chunk, false, "", cpu_only);
 
         // Discard context portion and append
         int discard_samples = context * CODE2WAV_TOTAL_UPSAMPLE;
@@ -2551,6 +2562,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --dump-tokens FILE  Dump codec tokens to file (for HF comparison)\n");
     fprintf(stderr, "  --load-tokens FILE  Load 16-codebook tokens from file (skip Talker)\n");
     fprintf(stderr, "  --dump-tensors DIR  Dump intermediate tensors to directory\n");
+    fprintf(stderr, "  --c2w-cpu           Force CPU for Code2Wav (workaround for CUDA issues)\n");
     fprintf(stderr, "  -v, --verbose       Enable verbose output\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
 }
@@ -2645,6 +2657,8 @@ static bool parse_args(int argc, char ** argv, tts_params & params) {
             params.n_gpu_layers = std::atoi(argv[i]);
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "--c2w-cpu") {
+            params.c2w_cpu_only = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             exit(0);
@@ -2738,7 +2752,7 @@ int main(int argc, char ** argv) {
 
         printf("Code2Wav has %zu pre-transformer layers\n", talker_model->c2w_pre_layers.size());
 
-        std::vector<float> audio_samples = run_code2wav_ggml(talker_model, all_codebook_tokens, params.verbose, params.dump_tensors_path);
+        std::vector<float> audio_samples = run_code2wav_ggml(talker_model, all_codebook_tokens, params.verbose, params.dump_tensors_path, params.c2w_cpu_only);
 
         int n_samples = audio_samples.size();
 
@@ -3988,7 +4002,7 @@ int main(int argc, char ** argv) {
             printf("Code2Wav has %zu pre-transformer layers\n", m->c2w_pre_layers.size());
 
             // Run Code2Wav vocoder using ggml graph execution
-            std::vector<float> audio_samples = run_code2wav_ggml(m, all_codebook_tokens, params.verbose, params.dump_tensors_path);
+            std::vector<float> audio_samples = run_code2wav_ggml(m, all_codebook_tokens, params.verbose, params.dump_tensors_path, params.c2w_cpu_only);
 
             int n_samples = audio_samples.size();
 
