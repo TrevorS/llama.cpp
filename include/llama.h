@@ -940,6 +940,10 @@ extern "C" {
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
 
+    // Set whether to preserve layer outputs for debugging
+    // If true, layer outputs (l_out tensors) will not be reused, allowing extraction after decode
+    LLAMA_API void llama_set_debug_layer_outputs(struct llama_context * ctx, bool debug_layer_outputs);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

@@ -35,6 +35,7 @@ struct llama_cparams {
     bool warmup;
     bool op_offload;
     bool kv_unified;
+    bool debug_layer_outputs; // mark l_out tensors as outputs for debugging
 
     enum llama_pooling_type pooling_type;
 

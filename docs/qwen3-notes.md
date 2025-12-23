@@ -7,9 +7,12 @@
 
 ## Current Status
 
-- **Phase**: GGUF Conversion Tasks COMPLETE
-- **Current Task**: C++ Implementation (Next Phase)
-- **Validation**: Thinker and MMProj GGUF files converted and validated
+- **Phase**: Talker Verification COMPLETE
+- **Current Task**: Investigate CUDA bug (layers 8+ fail on GPU)
+- **Validation**: All components verified on CPU
+  - Code2Wav: ✅ 0.9999+ correlation
+  - Talker (CPU): ✅ All 20 layers match HF
+  - Talker (GPU): ❌ CUDA bug on GB10/Blackwell
 
 ---
 
@@ -749,9 +752,187 @@ Final Conv_out            | corr=0.999994 ratio=1.0001 [PERFECT]
 - MAE: 0.000332
 - Max diff: 0.0154
 
+---
+
+## 2025-12-22 Talker Investigation
+
+### Objective
+Systematically verify Talker codec generation using the same layer-by-layer approach that fixed Code2Wav.
+
+### Key Finding #1: Missing lm_head Bug
+
+**Issue**: The Talker graph builder (`src/models/qwen3omni_talker.cpp`) used `model.output` for the lm_head, but this tensor was NULL because:
+- The GGUF has `talker.codec_head.weight` (loaded as `model.talker_codec_head`)
+- The tensor mapping had `LLM_TENSOR_OUTPUT` → `"output"` which doesn't exist in the file
+
+**Symptom**: Logits had absurdly high values (~380) for speaker tokens (2301-2303)
+
+**Fix**: Changed line 178 from:
+```cpp
+cur = build_lora_mm(model.output, cur);
+```
+to:
+```cpp
+cur = build_lora_mm(model.talker_codec_head, cur);
+```
+
+**Result**: Logits now in reasonable range (~15 max), but still differ from HF.
+
+### Prefill Verification
+
+Created `tools/qwen3omni-tts/debug_hf_talker.py` and `compare_prefill.py` to verify inputs.
+
+**Prefill Embedding Comparison (9 positions):**
+| Position | Correlation |
+|----------|-------------|
+| 0-8      | 0.9999+     |
+
+Prefill construction is **CORRECT** - identical to HuggingFace.
+
+### Logit Comparison (After lm_head Fix)
+
+**C++ Top Tokens:**
+| Rank | Token | C++ Logit | HF Logit |
+|------|-------|-----------|----------|
+| 0    | 2149* | 15.46     | -3.11    |
+| 1    | 1359  | 12.20     | -1.30    |
+| 2    | 386   | 10.21     | -2.55    |
+
+*2149 is `codec_bos`, filtered during sampling
+
+**HF Top Tokens:**
+| Rank | Token | HF Logit | C++ Logit |
+|------|-------|----------|-----------|
+| 0    | 1049  | 21.88    | 5.08      |
+| 1    | 472   | 7.25     | 4.53      |
+| 2    | 108   | 7.03     | 2.94      |
+
+**Audio Token Correlation: 0.06** - The transformer outputs are fundamentally different.
+
+### Remaining Issue: Transformer Divergence
+
+The 20-layer MoE transformer is producing completely different hidden states, despite:
+- Correct input embeddings (0.9999+ correlation)
+- Correct lm_head weights (after fix)
+- Correct model configuration (verified via GGUF metadata)
+
+**Possible Causes:**
+1. Bug in attention computation (GQA with 16 Q heads, 2 KV heads)
+2. Bug in MoE routing (128 experts, 6 active)
+3. Weight loading issue for some layers
+4. Numerical precision differences
+
+### Files Modified
+- `src/models/qwen3omni_talker.cpp` - Fixed lm_head tensor
+- `tools/qwen3omni-tts/main.cpp` - Added temp=0 greedy sampling, logit dumps
+- `tools/qwen3omni-tts/debug_hf_talker.py` - HF tensor extraction
+- `tools/qwen3omni-tts/debug_hf_prefill_logits.py` - HF logit extraction
+- `tools/qwen3omni-tts/compare_prefill.py` - Prefill comparison
+- `tools/qwen3omni-tts/compare_logits.py` - Logit comparison
+
 ### Next Steps
 
-1. **Talker Investigation**: Codec token generation still differs from HF - this is the remaining issue
-2. **End-to-End Testing**: With verified Code2Wav, focus on Talker output quality
+1. Add intermediate tensor dumps (hidden state after layer 0, 10, 19)
+2. Find which layer introduces divergence
+3. Debug attention/MoE computation for that layer
+4. Compare against HF implementation
+
+---
+
+## 2025-12-23 Talker Layer Verification Complete
+
+### Debug Tooling Added
+
+Created comprehensive layer-by-layer debugging infrastructure:
+
+**C++ Tools:**
+- `debug_talker_layers.cpp` - Extracts per-layer hidden states from Talker
+- Uses `debug_layer_outputs` flag to preserve intermediate tensors
+- Outputs: `hidden_layer{0-19}.bin`, `hidden_after_norm.bin`, `prefill_logits.bin`
+
+**Python Tools:**
+- `debug_hf_prefill_layers.py` - Extracts per-layer outputs from HuggingFace
+- Uses forward hooks to capture raw layer outputs (not normalized)
+- Outputs: `hidden_layer{0-19}.npy`, `hidden_after_norm.npy`, `prefill_logits.npy`
+
+**Comparison Scripts:**
+- `compare_all_layers.py` - Side-by-side correlation analysis
+- `compare_weights.py` - GGUF vs safetensors weight comparison
+
+### Verification Results (CPU Backend)
+
+| Layer | Correlation | C++ Std | HF Std | Status |
+|-------|-------------|---------|--------|--------|
+| 0 | 0.999997 | 0.170 | 0.170 | ✅ |
+| 1 | 0.999993 | 0.176 | 0.175 | ✅ |
+| 2 | 0.999998 | 3.17 | 3.17 | ✅ |
+| 3 | 0.999998 | 6.22 | 6.23 | ✅ |
+| 4 | 0.999998 | 6.23 | 6.24 | ✅ |
+| 5 | 0.999998 | 6.24 | 6.24 | ✅ |
+| 6 | 0.999997 | 6.24 | 6.24 | ✅ |
+| 7 | 0.999997 | 6.25 | 6.25 | ✅ |
+| 8 | 0.999996 | 6.35 | 6.34 | ✅ |
+| 9 | 0.999996 | 6.34 | 6.34 | ✅ |
+| 10 | 0.999995 | 6.36 | 6.35 | ✅ |
+| 11 | 0.999994 | 6.36 | 6.35 | ✅ |
+| 12 | 0.999993 | 6.37 | 6.37 | ✅ |
+| 13 | 0.999991 | 6.41 | 6.41 | ✅ |
+| 14 | 0.999988 | 6.59 | 6.59 | ✅ |
+| 15 | 0.999984 | 6.95 | 6.94 | ✅ |
+| 16 | 0.999981 | 8.33 | 8.34 | ✅ |
+| 17 | 0.999980 | 8.42 | 8.42 | ✅ |
+| 18 | 0.999977 | 10.77 | 10.74 | ✅ |
+| 19 | 0.999976 | 11.17 | 11.15 | ✅ |
+
+**All 20 layers match HuggingFace with 0.9999+ correlation on CPU.**
+
+### CUDA Backend Bug Discovered
+
+Running on GPU (GB10/Blackwell, compute capability 12.1) produces incorrect results:
+
+| Layer | GPU Mean | GPU Std | Expected Mean | Expected Std |
+|-------|----------|---------|---------------|--------------|
+| 0-7 | Correct | Correct | - | - |
+| 8 | 0.002745 | 0.377 | 0.024 | 6.34 |
+| 9 | 0.000054 | 0.010 | 0.025 | 6.34 |
+| 10-19 | 0.0 | 0.0 | varies | ~6-11 |
+
+**Symptoms:**
+- Layers 0-7 compute correctly
+- Layer 8 shows dramatic degradation (~24x smaller values)
+- Layers 10-19 produce all zeros
+
+**Root Cause:**
+CUDA backend issue affecting MoE computation in later layers. Possibly related to:
+- Buffer allocation/reuse on GPU
+- MoE kernel for 128 experts
+- GB10/Blackwell-specific issue (compute capability 12.1)
+
+### Workaround
+
+Run Talker on CPU:
+```bash
+./llama-qwen3omni-tts \
+  --talker /models/talker.gguf \
+  --n-gpu-layers 0 \
+  ...
+```
+
+This produces correct output matching HuggingFace reference.
+
+### Current Pipeline Status
+
+| Component | CPU Status | GPU Status |
+|-----------|------------|------------|
+| Code2Wav | ✅ VERIFIED (0.9999) | ✅ Works |
+| Talker Layers 0-7 | ✅ VERIFIED | ✅ Works |
+| Talker Layers 8-19 | ✅ VERIFIED | ❌ Bug |
+| Full TTS Pipeline | ✅ Works on CPU | ❌ CUDA bug |
+
+### Next Steps
+
+1. **Investigate CUDA bug** - Check MoE kernel, buffer allocation
+2. **Test on other GPUs** - Verify if GB10-specific or general CUDA issue
+3. **File upstream issue** - If confirmed as llama.cpp CUDA bug
 
 ---

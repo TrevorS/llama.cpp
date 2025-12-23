@@ -152,6 +152,17 @@ llm_build_qwen3omni_talker::llm_build_qwen3omni_talker(const llama_model & model
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(ffn_shexp, "ffn_shexp", il);
 
+            // Apply sigmoid gating: gate = sigmoid(ffn_gate_inp_shexp @ cur)
+            // Reference: HF Qwen3OmniMoeTalkerTextSparseMoeBlock.forward
+            if (model.layers[il].ffn_gate_inp_shexp) {
+                ggml_tensor * shexp_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+                cb(shexp_gate, "ffn_shexp_gate_inp", il);
+                shexp_gate = ggml_sigmoid(ctx0, shexp_gate);
+                cb(shexp_gate, "ffn_shexp_gate", il);
+                ffn_shexp = ggml_mul(ctx0, ffn_shexp, shexp_gate);
+                cb(ffn_shexp, "ffn_shexp_gated", il);
+            }
+
             moe_out = ggml_add(ctx0, moe_out, ffn_shexp);
             cb(moe_out, "ffn_moe_shexp_out", il);
         }
@@ -175,7 +186,8 @@ llm_build_qwen3omni_talker::llm_build_qwen3omni_talker(const llama_model & model
     res->t_embd = cur;
 
     // lm_head (codec_head)
-    cur = build_lora_mm(model.output, cur);
+    // Note: The Talker uses talker_codec_head, not the standard output tensor
+    cur = build_lora_mm(model.talker_codec_head, cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

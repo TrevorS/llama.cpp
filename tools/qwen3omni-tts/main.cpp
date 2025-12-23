@@ -3535,6 +3535,34 @@ int main(int argc, char ** argv) {
         float * embeddings = llama_get_embeddings(talker_ctx);
         if (embeddings) {
             memcpy(past_hidden.data(), embeddings, n_embd_talker * sizeof(float));
+
+            // Dump hidden state (after output_norm, before lm_head)
+            if (!params.dump_tensors_path.empty()) {
+                std::string hidden_path = params.dump_tensors_path + "/hidden_after_norm.bin";
+                printf("  Dumping hidden state to %s\n", hidden_path.c_str());
+                std::ofstream ofs(hidden_path, std::ios::binary);
+                if (ofs.is_open()) {
+                    uint32_t ndims = 1;
+                    uint32_t dim0 = n_embd_talker;
+                    ofs.write(reinterpret_cast<const char*>(&ndims), sizeof(uint32_t));
+                    ofs.write(reinterpret_cast<const char*>(&dim0), sizeof(uint32_t));
+                    ofs.write(reinterpret_cast<const char*>(embeddings), n_embd_talker * sizeof(float));
+                    ofs.close();
+                }
+
+                // Print stats
+                float sum = 0, sum_sq = 0;
+                for (int i = 0; i < n_embd_talker; ++i) {
+                    sum += embeddings[i];
+                    sum_sq += embeddings[i] * embeddings[i];
+                }
+                float mean = sum / n_embd_talker;
+                float std_dev = sqrtf(sum_sq / n_embd_talker - mean * mean);
+                printf("  Hidden state: mean=%.6f, std=%.6f, first 8: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                       mean, std_dev,
+                       embeddings[0], embeddings[1], embeddings[2], embeddings[3],
+                       embeddings[4], embeddings[5], embeddings[6], embeddings[7]);
+            }
         }
     }
 
@@ -3551,10 +3579,56 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        std::mt19937 rng_prefill(42);
-        std::vector<int> empty_recent;
-        last_token = sample_token(logits, n_vocab, params.temperature, params.top_k,
-                                  rng_prefill, empty_recent, 1.05f, 0.8f);
+        // Dump prefill logits if requested
+        if (!params.dump_tensors_path.empty()) {
+            std::string logits_path = params.dump_tensors_path + "/prefill_logits.bin";
+            printf("  Dumping prefill logits to %s\n", logits_path.c_str());
+            std::ofstream ofs(logits_path, std::ios::binary);
+            if (ofs.is_open()) {
+                // Write dimension header
+                uint32_t ndims = 1;
+                uint32_t dim0 = n_vocab;
+                ofs.write(reinterpret_cast<const char*>(&ndims), sizeof(uint32_t));
+                ofs.write(reinterpret_cast<const char*>(&dim0), sizeof(uint32_t));
+                ofs.write(reinterpret_cast<const char*>(logits), n_vocab * sizeof(float));
+                ofs.close();
+            }
+
+            // Also print top-10 logits
+            std::vector<std::pair<float, int>> top_logits;
+            for (int i = 0; i < n_vocab; ++i) {
+                top_logits.push_back({logits[i], i});
+            }
+            std::sort(top_logits.begin(), top_logits.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            printf("  Top-10 logits before sampling:\n");
+            for (int i = 0; i < 10 && i < (int)top_logits.size(); ++i) {
+                printf("    [%d] token=%d, logit=%.4f\n", i, top_logits[i].second, top_logits[i].first);
+            }
+        }
+
+        // Handle temperature=0 as greedy sampling
+        if (params.temperature <= 0.0f) {
+            // Greedy: find max logit among valid tokens
+            float max_logit = -1e30f;
+            last_token = 0;
+            for (int i = 0; i < n_vocab; ++i) {
+                // Only consider audio tokens (0-2047) and EOS (2150)
+                if (i >= 2048 && i != TALKER_CODEC_EOS_ID) {
+                    continue;
+                }
+                if (logits[i] > max_logit) {
+                    max_logit = logits[i];
+                    last_token = i;
+                }
+            }
+            printf("Greedy sampling (temp=0): token=%d, logit=%.4f\n", last_token, max_logit);
+        } else {
+            std::mt19937 rng_prefill(42);
+            std::vector<int> empty_recent;
+            last_token = sample_token(logits, n_vocab, params.temperature, params.top_k,
+                                      rng_prefill, empty_recent, 1.05f, 0.8f);
+        }
         printf("First token from prefill: %d\n", last_token);
     }
 
