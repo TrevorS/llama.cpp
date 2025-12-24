@@ -3970,25 +3970,8 @@ int main(int argc, char ** argv) {
     fflush(stdout);
 
     // all_codebook_tokens was populated during the Talker generation loop
-    // It contains frames from step 1 onwards (step 0 wasn't stored because Code Predictor wasn't run)
-
-    // Insert frame 0 tokens (Talker first token + Code Predictor expansion)
-    if (codec_tokens.size() > 0 && (all_codebook_tokens.empty() || all_codebook_tokens.size() < codec_tokens.size())) {
-        // Need to generate codebook tokens for frame 0
-        const struct llama_model * m = talker_model;
-        std::vector<int> frame0_tokens(n_codebooks);
-        frame0_tokens[0] = codec_tokens[0];  // First codec token from Talker
-
-        if (!m->talker_cp_layers.empty() && !m->talker_cp_lm_head.empty()) {
-            int prev_token = codec_tokens[0] % 2048;
-            for (int cb = 0; cb < 15; ++cb) {
-                int next_token = run_code_predictor_step(m, prev_token, cb, false);
-                frame0_tokens[cb + 1] = next_token;
-                prev_token = next_token;
-            }
-        }
-        all_codebook_tokens.insert(all_codebook_tokens.begin(), frame0_tokens);
-    }
+    // It contains frames for all steps starting from step 0 (Code Predictor runs at every step)
+    // Note: The last sampled token doesn't have a frame (it's for the NEXT step which never runs)
 
     // Verify we have the right number of frames
     if (all_codebook_tokens.size() != codec_tokens.size()) {
