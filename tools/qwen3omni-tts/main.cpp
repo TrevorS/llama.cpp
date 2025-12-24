@@ -34,8 +34,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-// Internal headers for model tensor access
+// Internal headers for model tensor access and graph extraction
 #include "llama-model.h"
+#include "llama-context.h"
+#include "llama-graph.h"
 
 struct tts_params {
     std::string thinker_path;
@@ -383,6 +385,52 @@ static bool copy_tensor_to_cpu(const ggml_tensor * t, std::vector<float> & out) 
         return true;
     }
     return false;
+}
+
+// Extract pre-norm hidden state from Talker graph
+// HuggingFace uses hidden_states[0][-1] which is BEFORE output_norm, but llama_get_embeddings()
+// returns AFTER output_norm. This function extracts the pre-norm tensor directly from the graph.
+static bool extract_pre_norm_hidden(llama_context * ctx, float * out, int n_embd) {
+    // Get the graph result from the last decode
+    llm_graph_result * res = ctx->get_gf_res_prev();
+    if (!res) {
+        fprintf(stderr, "Warning: No graph result available for pre_norm extraction\n");
+        return false;
+    }
+
+    ggml_cgraph * gf = res->get_gf();
+    if (!gf) {
+        fprintf(stderr, "Warning: No graph available for pre_norm extraction\n");
+        return false;
+    }
+
+    // Find the pre_norm_hidden tensor by name
+    ggml_tensor * pre_norm = ggml_graph_get_tensor(gf, "pre_norm_hidden");
+    if (!pre_norm) {
+        fprintf(stderr, "Warning: pre_norm_hidden tensor not found in graph\n");
+        return false;
+    }
+
+    // Copy the tensor data to CPU
+    std::vector<float> temp;
+    if (!copy_tensor_to_cpu(pre_norm, temp)) {
+        fprintf(stderr, "Warning: Failed to copy pre_norm_hidden tensor to CPU\n");
+        return false;
+    }
+
+    // Get the last token's hidden state (ne[1] is sequence length)
+    int64_t seq_len = pre_norm->ne[1];
+    int64_t hidden_dim = pre_norm->ne[0];
+    if (hidden_dim != n_embd) {
+        fprintf(stderr, "Warning: pre_norm_hidden dim mismatch: %lld vs %d\n",
+                (long long)hidden_dim, n_embd);
+        return false;
+    }
+
+    // Copy the last token's hidden state
+    int64_t last_token_offset = (seq_len - 1) * hidden_dim;
+    memcpy(out, temp.data() + last_token_offset, n_embd * sizeof(float));
+    return true;
 }
 
 // Matrix multiplication: out[m,n] = a[m,k] @ b[k,n]^T (b stored as [n,k])
@@ -2415,10 +2463,12 @@ static bool run_code_predictor_inline(
                 // Key insight: HuggingFace's _can_record_outputs for Code Predictor is:
                 //   {"hidden_states": Qwen3OmniMoeTalkerCodePredictorDecoderLayer}
                 // This means hidden_states[i][0] is layer 0 OUTPUT (not embedding)
-                // So mid_residual_hiddens = [hid[0] for hid in hidden_states[1:]] gives
-                // layer 0 outputs, which is what we capture here.
+                // HuggingFace: mid_residual_hiddens = [hid[0] for hid in hidden_states[1:]]
+                // The [1:] skips PREFILL (index 0), not first gen step. Prefill is done
+                // before this loop at positions 0-1. Loop runs at positions 2-16.
+                // So we collect layer0_output for ALL 15 generation steps (cb=0 to 14).
                 run_transformer_step(token_embd, pos);
-                codec_embeddings.push_back(layer0_output);  // Layer 0 output (matches HuggingFace)
+                codec_embeddings.push_back(layer0_output);  // 15 layer0 outputs total
             }
         }
     }
@@ -2426,6 +2476,7 @@ static bool run_code_predictor_inline(
     // Add last_residual_hidden: embedding of last token from the LAST table (index 14 in 15-table model)
     // Reference: last_residual_hidden = self.code_predictor.get_input_embeddings()[-1](sequences[-1])
     // HuggingFace sums 17 embeddings: last_id_hidden (1) + mid_residual_hiddens (15) + last_residual_hidden (1)
+    // Note: hidden_states[1:] skips PREFILL, not first gen step. We collect 15 layer0 outputs + 1 last_residual.
     // The model has 15 embedding tables (0-14), so [-1] means table 14
     if (!codebook_tokens.empty() && !m->talker_cp_codec_embd.empty()) {
         int last_table_idx = (int)m->talker_cp_codec_embd.size() - 1;  // Table 14 (last table)
@@ -2439,7 +2490,7 @@ static bool run_code_predictor_inline(
                     last_residual_hidden[i] = last_embd_data[last_token * cp_n_embd + i];
                 }
             }
-            codec_embeddings.push_back(last_residual_hidden);  // Now 16 embeddings total
+            codec_embeddings.push_back(last_residual_hidden);  // 16 embeddings (15 layer0 + 1 last_residual)
         }
     }
 
@@ -2826,8 +2877,10 @@ int main(int argc, char ** argv) {
     const int TTS_BOS_TOKEN_ID = 151672;  // tts_bos_token_id
     const int TTS_EOS_TOKEN_ID = 151673;  // tts_eos_token_id - signals end of text to Talker
 
-    // Format as chat: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
-    std::string chat_prompt = "<|im_start|>user\n" + params.prompt + "<|im_end|>\n<|im_start|>assistant\n";
+    // Format as chat with TTS tokens:
+    // HuggingFace expects: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<tts_text_bos>{prompt}<tts_text_eod><|audio_start|>
+    // The assistant segment MUST contain <tts_text_bos>{prompt}<tts_text_eod> for text_projection to work correctly
+    std::string chat_prompt = "<|im_start|>user\n" + params.prompt + "<|im_end|>\n<|im_start|>assistant\n<tts_text_bos>" + params.prompt + "<tts_text_eod><|audio_start|>";
 
     printf("\nFormatted chat prompt:\n%s\n", chat_prompt.c_str());
 
@@ -3272,6 +3325,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Enable debug layer outputs to preserve pre_norm_hidden tensor for Code Predictor
+    // HuggingFace uses hidden_states[0][-1] which is BEFORE output_norm
+    llama_set_debug_layer_outputs(talker_ctx, true);
+
     const llama_vocab * talker_vocab = llama_model_get_vocab(talker_model);
     int n_vocab = llama_vocab_n_tokens(talker_vocab);
     printf("Talker vocab size: %d\n", n_vocab);
@@ -3544,46 +3601,55 @@ int main(int argc, char ** argv) {
     }
 
     // Get initial hidden state from prefill
+    // CRITICAL: Use pre-norm hidden state (BEFORE output_norm) for Code Predictor
+    // HuggingFace uses hidden_states[0][-1] which is the last layer output BEFORE self.norm()
     std::vector<float> past_hidden(n_embd_talker, 0.0f);
     {
-        float * embeddings = llama_get_embeddings(talker_ctx);
-        if (embeddings) {
-            memcpy(past_hidden.data(), embeddings, n_embd_talker * sizeof(float));
-
-            // Dump hidden state (after output_norm, before lm_head)
-            if (!params.dump_tensors_path.empty()) {
-                std::string hidden_path = params.dump_tensors_path + "/hidden_after_norm.bin";
-                printf("  Dumping hidden state to %s\n", hidden_path.c_str());
-                std::ofstream ofs(hidden_path, std::ios::binary);
-                if (ofs.is_open()) {
-                    uint32_t ndims = 1;
-                    uint32_t dim0 = n_embd_talker;
-                    ofs.write(reinterpret_cast<const char*>(&ndims), sizeof(uint32_t));
-                    ofs.write(reinterpret_cast<const char*>(&dim0), sizeof(uint32_t));
-                    ofs.write(reinterpret_cast<const char*>(embeddings), n_embd_talker * sizeof(float));
-                    ofs.close();
-                }
-
-                // Print stats
-                float sum = 0, sum_sq = 0;
-                for (int i = 0; i < n_embd_talker; ++i) {
-                    sum += embeddings[i];
-                    sum_sq += embeddings[i] * embeddings[i];
-                }
-                float mean = sum / n_embd_talker;
-                float std_dev = sqrtf(sum_sq / n_embd_talker - mean * mean);
-                printf("  Hidden state: mean=%.6f, std=%.6f, first 8: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
-                       mean, std_dev,
-                       embeddings[0], embeddings[1], embeddings[2], embeddings[3],
-                       embeddings[4], embeddings[5], embeddings[6], embeddings[7]);
+        bool extracted = extract_pre_norm_hidden(talker_ctx, past_hidden.data(), n_embd_talker);
+        if (!extracted) {
+            // Fallback to post-norm embeddings (less accurate but better than nothing)
+            fprintf(stderr, "Warning: Failed to extract pre_norm_hidden, falling back to post-norm embeddings\n");
+            float * embeddings = llama_get_embeddings(talker_ctx);
+            if (embeddings) {
+                memcpy(past_hidden.data(), embeddings, n_embd_talker * sizeof(float));
             }
+        }
+
+        // Dump hidden state for debugging (now pre-norm instead of post-norm)
+        if (!params.dump_tensors_path.empty()) {
+            std::string hidden_path = params.dump_tensors_path + "/hidden_pre_norm.bin";
+            printf("  Dumping pre-norm hidden state to %s\n", hidden_path.c_str());
+            std::ofstream ofs(hidden_path, std::ios::binary);
+            if (ofs.is_open()) {
+                uint32_t ndims = 1;
+                uint32_t dim0 = n_embd_talker;
+                ofs.write(reinterpret_cast<const char*>(&ndims), sizeof(uint32_t));
+                ofs.write(reinterpret_cast<const char*>(&dim0), sizeof(uint32_t));
+                ofs.write(reinterpret_cast<const char*>(past_hidden.data()), n_embd_talker * sizeof(float));
+                ofs.close();
+            }
+
+            // Print stats
+            float sum = 0, sum_sq = 0;
+            for (int i = 0; i < n_embd_talker; ++i) {
+                sum += past_hidden[i];
+                sum_sq += past_hidden[i] * past_hidden[i];
+            }
+            float mean = sum / n_embd_talker;
+            float std_dev = sqrtf(sum_sq / n_embd_talker - mean * mean);
+            printf("  Pre-norm hidden: mean=%.6f, std=%.6f, first 8: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                   mean, std_dev,
+                   past_hidden[0], past_hidden[1], past_hidden[2], past_hidden[3],
+                   past_hidden[4], past_hidden[5], past_hidden[6], past_hidden[7]);
         }
     }
 
     // Sample first token from prefill logits
+    // CRITICAL: Use llama_get_logits_ith(-1) to get the LAST token's logits
+    // With embeddings=true, llama_get_logits() returns first token which is WRONG
     int last_token;
     {
-        float * logits = llama_get_logits(talker_ctx);
+        float * logits = llama_get_logits_ith(talker_ctx, -1);
         if (!logits) {
             fprintf(stderr, "Error: Failed to get logits from prefill\n");
             llama_free(talker_ctx);
@@ -3675,43 +3741,41 @@ int main(int argc, char ** argv) {
         }
 
         // Sum all embeddings for Talker input
+        // CRITICAL FIX: Run Code Predictor for ALL steps (including step 0)
+        // HuggingFace runs Code Predictor at every step to get the 17-embedding sum
         std::fill(cur_embd.begin(), cur_embd.end(), 0.0f);
 
-        if (step > 0) {
-            // Run Code Predictor inline to get feedback embeddings
-            // Returns 15 hidden states and 15 codebook tokens
-            std::vector<std::vector<float>> cp_hidden_states;
-            std::vector<int> cp_codebook_tokens;
+        // Run Code Predictor inline to get feedback embeddings
+        // Returns 15 hidden states (layer0 outputs) + 1 last_residual_hidden = 16 total
+        // Plus last_id_hidden = 17 embeddings total, matching HuggingFace
+        std::vector<std::vector<float>> cp_hidden_states;
+        std::vector<int> cp_codebook_tokens;
 
-            if (run_code_predictor_inline(talker_model, past_hidden, last_id_hidden,
-                                          cp_hidden_states, cp_codebook_tokens, rng, params.verbose && step < 3)) {
-                // Sum: last_id_hidden + 15 hidden states from Code Predictor
-                // Reference: codec_hiddens = [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
-                // inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+        if (run_code_predictor_inline(talker_model, past_hidden, last_id_hidden,
+                                      cp_hidden_states, cp_codebook_tokens, rng, params.verbose && step < 3)) {
+            // Sum: last_id_hidden + 16 hidden states from Code Predictor (15 layer0 + 1 last_residual)
+            // Reference: codec_hiddens = [last_id_hidden] + mid_residual_hiddens + [last_residual_hidden]
+            // inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+            // Total: 1 + 16 = 17 embeddings, matching HuggingFace
+            for (int i = 0; i < n_embd_talker; ++i) {
+                cur_embd[i] = last_id_hidden[i];
+            }
+            for (const auto & hs : cp_hidden_states) {
                 for (int i = 0; i < n_embd_talker; ++i) {
-                    cur_embd[i] = last_id_hidden[i];
-                }
-                for (const auto & hs : cp_hidden_states) {
-                    for (int i = 0; i < n_embd_talker; ++i) {
-                        cur_embd[i] += hs[i];
-                    }
-                }
-
-                // Store all codebook tokens for this frame
-                std::vector<int> frame_tokens(n_codebooks);
-                frame_tokens[0] = last_token;  // Codebook 0 from Talker
-                for (size_t cb = 0; cb < cp_codebook_tokens.size() && cb + 1 < (size_t)n_codebooks; ++cb) {
-                    frame_tokens[cb + 1] = cp_codebook_tokens[cb];
-                }
-                all_codebook_tokens.push_back(frame_tokens);
-            } else {
-                // Fallback: just use last_id_hidden
-                for (int i = 0; i < n_embd_talker; ++i) {
-                    cur_embd[i] = last_id_hidden[i];
+                    cur_embd[i] += hs[i];
                 }
             }
+
+            // Store all codebook tokens for this frame
+            std::vector<int> frame_tokens(n_codebooks);
+            frame_tokens[0] = last_token;  // Codebook 0 from Talker
+            for (size_t cb = 0; cb < cp_codebook_tokens.size() && cb + 1 < (size_t)n_codebooks; ++cb) {
+                frame_tokens[cb + 1] = cp_codebook_tokens[cb];
+            }
+            all_codebook_tokens.push_back(frame_tokens);
         } else {
-            // First step: just use last_id_hidden (no Code Predictor yet)
+            // Fallback: just use last_id_hidden (should rarely happen)
+            fprintf(stderr, "Warning: Code Predictor failed at step %d, using fallback\n", step);
             for (int i = 0; i < n_embd_talker; ++i) {
                 cur_embd[i] = last_id_hidden[i];
             }
@@ -3771,15 +3835,19 @@ int main(int argc, char ** argv) {
         }
 
         // Get hidden state from this step for next iteration
-        // Reference: past_hidden = hidden_states[0][-1][:, -1:] (last layer, last token)
-        float * embeddings = llama_get_embeddings(talker_ctx);
-        if (embeddings) {
-            // Copy to past_hidden for next step
-            memcpy(past_hidden.data(), embeddings, n_embd_talker * sizeof(float));
+        // CRITICAL: Use pre-norm hidden state (BEFORE output_norm) for Code Predictor
+        // Reference: past_hidden = hidden_states[0][-1][:, -1:] (last layer, last token, pre-norm)
+        if (!extract_pre_norm_hidden(talker_ctx, past_hidden.data(), n_embd_talker)) {
+            // Fallback to post-norm (less accurate but better than nothing)
+            float * embeddings = llama_get_embeddings(talker_ctx);
+            if (embeddings) {
+                memcpy(past_hidden.data(), embeddings, n_embd_talker * sizeof(float));
+            }
         }
 
         // Get logits and sample
-        float * logits = llama_get_logits(talker_ctx);
+        // CRITICAL: Use llama_get_logits_ith(-1) to get the LAST token's logits
+        float * logits = llama_get_logits_ith(talker_ctx, -1);
         if (!logits) {
             fprintf(stderr, "Error: Failed to get logits at step %d\n", step);
             break;

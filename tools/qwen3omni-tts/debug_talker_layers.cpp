@@ -432,6 +432,43 @@ int main(int argc, char ** argv) {
         CUDA_CHECK_ERROR("after layer extraction");
     }
 
+    // Save pre_norm_hidden (layer 19 output, before norm) - this is what Code Predictor uses
+    {
+        ggml_tensor * pre_norm = ggml_graph_get_tensor(gf, "pre_norm_hidden");
+        if (pre_norm) {
+            int64_t ne0 = pre_norm->ne[0];
+            int64_t ne1 = pre_norm->ne[1];
+            size_t n_bytes = ggml_nbytes(pre_norm);
+
+            layer_data.resize(ne0 * ne1);
+            ggml_backend_tensor_get(pre_norm, layer_data.data(), 0, n_bytes);
+
+            // Transpose for HF format
+            std::vector<float> transposed(ne0 * ne1);
+            for (int64_t t = 0; t < ne1; ++t) {
+                for (int64_t e = 0; e < ne0; ++e) {
+                    transposed[t * ne0 + e] = layer_data[e + t * ne0];
+                }
+            }
+
+            std::string out_path = params.output_dir + "/hidden_layer19.bin";
+            std::vector<uint32_t> shape = {(uint32_t)ne1, (uint32_t)ne0};
+            save_tensor(out_path, transposed.data(), shape);
+
+            float sum = 0, sum_sq = 0;
+            for (size_t i = 0; i < transposed.size(); ++i) {
+                sum += transposed[i];
+                sum_sq += transposed[i] * transposed[i];
+            }
+            float mean = sum / transposed.size();
+            float std_dev = sqrtf(sum_sq / transposed.size() - mean * mean);
+            printf("  Layer 19 (pre_norm_hidden): mean=%.6f, std=%.6f, saved to %s\n",
+                   mean, std_dev, out_path.c_str());
+        } else {
+            fprintf(stderr, "Warning: Tensor 'pre_norm_hidden' not found in graph\n");
+        }
+    }
+
     // Also save final hidden state (after output norm)
     {
         ggml_tensor * norm_tensor = ggml_graph_get_tensor(gf, "result_norm");
@@ -707,9 +744,63 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Print logits top-5
+    // Extract result_output tensor from graph and compare with llama_get_logits
     {
-        float * logits = llama_get_logits(ctx);
+        ggml_tensor * result_output = ggml_graph_get_tensor(gf, "result_output");
+        if (result_output) {
+            int64_t ne0 = result_output->ne[0];  // n_vocab
+            int64_t ne1 = result_output->ne[1];  // n_tokens
+            size_t n_bytes = ggml_nbytes(result_output);
+
+            printf("\n=== Graph result_output Tensor ===\n");
+            printf("  Shape: [%lld, %lld] (n_vocab=%lld, n_tokens=%lld)\n",
+                   (long long)ne0, (long long)ne1, (long long)ne0, (long long)ne1);
+
+            std::vector<float> graph_logits(ne0 * ne1);
+            ggml_backend_tensor_get(result_output, graph_logits.data(), 0, n_bytes);
+
+            // Get logits for last token (that's what llama_get_logits returns)
+            std::vector<float> graph_last_logits(ne0);
+            for (int64_t i = 0; i < ne0; ++i) {
+                // GGML layout: [n_vocab, n_tokens], last token is at offset (ne1-1)*ne0
+                graph_last_logits[i] = graph_logits[(ne1 - 1) * ne0 + i];
+            }
+
+            // Find top-5 from graph output
+            std::vector<std::pair<float, int>> graph_logits_idx;
+            for (int64_t i = 0; i < ne0; ++i) {
+                graph_logits_idx.push_back({graph_last_logits[i], (int)i});
+            }
+            std::partial_sort(graph_logits_idx.begin(), graph_logits_idx.begin() + 5, graph_logits_idx.end(),
+                              [](auto a, auto b) { return a.first > b.first; });
+
+            printf("\n  Top-5 from graph result_output (last token):\n");
+            for (int i = 0; i < 5; ++i) {
+                printf("    [%d] token=%d, logit=%.4f\n", i, graph_logits_idx[i].second, graph_logits_idx[i].first);
+            }
+
+            // Save graph logits
+            std::string out_path = params.output_dir + "/graph_logits.bin";
+            std::vector<uint32_t> shape = {(uint32_t)ne1, (uint32_t)ne0};  // [n_tokens, n_vocab] in HF format
+            // Transpose for HF format
+            std::vector<float> transposed(ne0 * ne1);
+            for (int64_t t = 0; t < ne1; ++t) {
+                for (int64_t v = 0; v < ne0; ++v) {
+                    transposed[t * ne0 + v] = graph_logits[v + t * ne0];
+                }
+            }
+            save_tensor(out_path, transposed.data(), shape);
+            printf("  Saved graph logits to %s\n", out_path.c_str());
+        } else {
+            printf("\n=== Graph result_output Tensor ===\n");
+            printf("  WARNING: result_output tensor not found in graph!\n");
+        }
+    }
+
+    // Print logits top-5 from llama_get_logits_ith(-1) (last token)
+    // NOTE: With embeddings=true, llama_get_logits() returns first token, not last!
+    {
+        float * logits = llama_get_logits_ith(ctx, -1);
         const struct llama_vocab * vocab = llama_model_get_vocab(model);
         int n_vocab = llama_vocab_n_tokens(vocab);
         if (logits && n_vocab > 0) {
@@ -720,9 +811,48 @@ int main(int argc, char ** argv) {
             std::partial_sort(logits_with_idx.begin(), logits_with_idx.begin() + 5, logits_with_idx.end(),
                               [](auto a, auto b) { return a.first > b.first; });
 
-            printf("\nTop-5 logits:\n");
+            printf("\nTop-5 from llama_get_logits_ith(-1) [last token]:\n");
             for (int i = 0; i < 5; ++i) {
                 printf("  [%d] token=%d, logit=%.4f\n", i, logits_with_idx[i].second, logits_with_idx[i].first);
+            }
+
+            // Compare with graph output
+            ggml_tensor * result_output = ggml_graph_get_tensor(gf, "result_output");
+            if (result_output) {
+                int64_t ne0 = result_output->ne[0];
+                int64_t ne1 = result_output->ne[1];
+                std::vector<float> graph_logits(ne0 * ne1);
+                ggml_backend_tensor_get(result_output, graph_logits.data(), 0, ggml_nbytes(result_output));
+
+                // Compare last token logits
+                std::vector<float> graph_last(ne0);
+                for (int64_t i = 0; i < ne0; ++i) {
+                    graph_last[i] = graph_logits[(ne1 - 1) * ne0 + i];
+                }
+
+                // Calculate correlation
+                float sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
+                for (int i = 0; i < n_vocab; ++i) {
+                    float x = logits[i];
+                    float y = graph_last[i];
+                    sum_x += x;
+                    sum_y += y;
+                    sum_xy += x * y;
+                    sum_x2 += x * x;
+                    sum_y2 += y * y;
+                }
+                float n = (float)n_vocab;
+                float corr = (n * sum_xy - sum_x * sum_y) /
+                             sqrtf((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
+
+                printf("\n  Correlation between llama_get_logits and graph result_output: %.6f\n", corr);
+                if (corr < 0.999) {
+                    printf("  *** WARNING: Correlation is low! Logits may not match. ***\n");
+                    printf("  First 5 from llama_get_logits: [%.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                           logits[0], logits[1], logits[2], logits[3], logits[4]);
+                    printf("  First 5 from graph output:     [%.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                           graph_last[0], graph_last[1], graph_last[2], graph_last[3], graph_last[4]);
+                }
             }
         }
     }
