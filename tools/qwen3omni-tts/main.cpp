@@ -348,6 +348,45 @@ static void rms_norm(const float * x, const float * weight, float * out, int n, 
     }
 }
 
+// Rotary Position Embedding (RoPE) for Code Predictor
+// Reference: HuggingFace apply_rotary_pos_emb in modeling_qwen3_omni_moe.py
+// Applies rotation to Q or K tensor for a single head
+static void apply_rope_to_head(
+    float * qk,         // [head_dim] - modified in place
+    int head_dim,
+    int pos,
+    float rope_theta) {
+
+    const int half_dim = head_dim / 2;
+
+    for (int i = 0; i < half_dim; ++i) {
+        // Compute frequency for this dimension
+        float freq = 1.0f / powf(rope_theta, 2.0f * i / head_dim);
+        float angle = pos * freq;
+        float cos_val = cosf(angle);
+        float sin_val = sinf(angle);
+
+        // Apply rotation to pairs [i, i + half_dim]
+        float x0 = qk[i];
+        float x1 = qk[i + half_dim];
+        qk[i] = x0 * cos_val - x1 * sin_val;
+        qk[i + half_dim] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+// Apply RoPE to all heads in Q or K tensor
+static void apply_rope(
+    float * qk,         // [n_head, head_dim] - modified in place
+    int n_head,
+    int head_dim,
+    int pos,
+    float rope_theta) {
+
+    for (int h = 0; h < n_head; ++h) {
+        apply_rope_to_head(qk + h * head_dim, head_dim, pos, rope_theta);
+    }
+}
+
 // Copy tensor data to CPU buffer, handling different types and GPU memory
 static bool copy_tensor_to_cpu(const ggml_tensor * t, std::vector<float> & out) {
     if (!t) return false;
@@ -523,10 +562,12 @@ static void simple_self_attention_single_token(
 // Processes a query at position `pos` attending to all KV cache entries 0..pos
 // kv_cache_k: [max_seq, n_kv_head, head_dim] - K values for all past positions
 // kv_cache_v: [max_seq, n_kv_head, head_dim] - V values for all past positions
+// rope_theta: RoPE base frequency (1000000 for Code Predictor)
 static void causal_attention_with_kv_cache(
     const float * x, int n_embd, int n_head, int n_head_kv, int head_dim, int pos,
     const float * wq, const float * wk, const float * wv, const float * wo,
     const float * q_norm_w, const float * k_norm_w,
+    float rope_theta,  // RoPE base frequency
     float * kv_cache_k, float * kv_cache_v,  // KV cache, modified in place
     float * out) {
 
@@ -547,6 +588,12 @@ static void causal_attention_with_kv_cache(
     for (int h = 0; h < n_head_kv; ++h) {
         rms_norm(k.data() + h * head_dim, k_norm_w, k_normed.data() + h * head_dim, head_dim);
     }
+
+    // Apply RoPE (Rotary Position Embedding) to Q and K after normalization
+    // Reference: HuggingFace modeling_qwen3_omni_moe.py:2376
+    // query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    apply_rope(q_normed.data(), n_head, head_dim, pos, rope_theta);
+    apply_rope(k_normed.data(), n_head_kv, head_dim, pos, rope_theta);
 
     // Store K, V in cache at position `pos`
     // Cache layout: [pos, kv_head, head_dim]
@@ -2306,6 +2353,7 @@ static bool run_code_predictor_inline(
     const int cp_vocab = 2048;
     const int n_codebooks = 15; // Codebooks 1-15 (codebook 0 is last_id_hidden)
     const int max_seq_len = 20; // 2 input tokens + up to 18 generated
+    const float cp_rope_theta = 1000000.0f; // RoPE base frequency from model config
 
     codec_embeddings.clear();
     codec_embeddings.reserve(n_codebooks);
@@ -2378,11 +2426,12 @@ static bool run_code_predictor_inline(
             // Attention norm
             rms_norm(cur.data(), lw.attn_norm_w.data(), normed.data(), cp_n_embd);
 
-            // Self-attention with KV cache
+            // Self-attention with KV cache and RoPE
             causal_attention_with_kv_cache(
                 normed.data(), cp_n_embd, cp_n_head, cp_n_head_kv, cp_head_dim, pos,
                 lw.wq.data(), lw.wk.data(), lw.wv.data(), lw.wo.data(),
                 lw.q_norm_w.data(), lw.k_norm_w.data(),
+                cp_rope_theta,  // RoPE with theta=1000000
                 kv_cache_k[il].data(), kv_cache_v[il].data(),
                 attn_out.data());
 
