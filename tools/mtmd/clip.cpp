@@ -821,6 +821,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_whisper_enc>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
+            {
+                builder = std::make_unique<clip_graph_qwen3omni_audio>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_KIMIVL:
             {
                 builder = std::make_unique<clip_graph_kimivl>(ctx, img);
@@ -1176,13 +1180,20 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN2A:
                 case PROJECTOR_TYPE_GLMA:
                 case PROJECTOR_TYPE_VOXTRAL:
+                case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
                     {
                         bool require_stack = model.proj_type == PROJECTOR_TYPE_ULTRAVOX ||
                                              model.proj_type == PROJECTOR_TYPE_VOXTRAL ||
                                              model.proj_type == PROJECTOR_TYPE_GLMA;
                         get_u32(KEY_A_PROJ_STACK_FACTOR, hparams.proj_stack_factor, require_stack);
-                        hparams.ffn_op = FFN_GELU_ERF;
-                        log_ffn_op = "gelu_erf"; // temporary solution for logging
+                        // Qwen3-Omni uses standard GELU, not GELU_ERF
+                        if (model.proj_type == PROJECTOR_TYPE_QWEN3OMNI_AUDIO) {
+                            hparams.ffn_op = FFN_GELU;
+                            log_ffn_op = "gelu";
+                        } else {
+                            hparams.ffn_op = FFN_GELU_ERF;
+                            log_ffn_op = "gelu_erf";
+                        }
 
                         // audio preprocessing params
                         hparams.audio_chunk_len    = 30; // in seconds
@@ -1599,6 +1610,24 @@ struct clip_model_loader {
                     model.mm_norm_pre_b = get_tensor(string_format(TN_MM_NORM_PRE, "bias"));
                     model.mm_boi = get_tensor(string_format(TN_TOK_BOI, "weight"));
                     model.mm_eoi = get_tensor(string_format(TN_TOK_EOI, "weight"));
+                } break;
+            case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
+                {
+                    // Qwen3-Omni audio: 3x conv2d + conv_out + post_ln + 2-layer MLP
+                    // Note: post_ln tensors are loaded generically above
+                    // Conv2d layers (despite name, these are 2D conv kernels)
+                    model.conv1d_1_w = get_tensor(string_format(TN_CONV1D, 1, "weight"));
+                    model.conv1d_1_b = get_tensor(string_format(TN_CONV1D, 1, "bias"));
+                    model.conv1d_2_w = get_tensor(string_format(TN_CONV1D, 2, "weight"));
+                    model.conv1d_2_b = get_tensor(string_format(TN_CONV1D, 2, "bias"));
+                    model.conv1d_3_w = get_tensor(string_format(TN_CONV1D, 3, "weight"));
+                    model.conv1d_3_b = get_tensor(string_format(TN_CONV1D, 3, "bias"));
+                    model.conv_out_w = get_tensor(string_format(TN_CONV1D, 31, "weight"));
+                    // Projection MLP
+                    model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "bias"));
                 } break;
             case PROJECTOR_TYPE_LLAMA4:
                 {
@@ -3059,6 +3088,11 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 // for BOI and EOI token embeddings
                 n_patches += 2;
             } break;
+        case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
+            {
+                // Qwen3-Omni audio encoder: 3x stride-2 conv2d = 8x time reduction
+                n_patches = img->nx / 8;
+            } break;
         case PROJECTOR_TYPE_COGVLM:
             {
                 n_patches += 2; // for BOI and EOI token embeddings
@@ -3405,6 +3439,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_COGVLM:
+        case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
             {
                 // do nothing
             } break;
@@ -3475,6 +3510,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
             print_tensor_shape(t);
             print_tensor_data(t, data.data(), 3);
+            save_tensor_binary(t, data.data());
         }
     }
 
@@ -3537,6 +3573,9 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_KIMIVL:
+            return ctx->model.mm_2_w->ne[1];
+        case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
+            // Qwen3-Omni audio: proj2 outputs to Thinker hidden dim (2048)
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_COGVLM:
             return ctx->model.mm_4h_to_h_w->ne[1];

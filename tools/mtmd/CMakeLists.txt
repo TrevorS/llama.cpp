@@ -25,6 +25,7 @@ add_library(mtmd
             models/pixtral.cpp
             models/qwen2vl.cpp
             models/qwen3vl.cpp
+            models/qwen3omni-audio.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
             )

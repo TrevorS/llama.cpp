@@ -330,6 +330,7 @@ struct mtmd_context {
             case PROJECTOR_TYPE_ULTRAVOX:
             case PROJECTOR_TYPE_VOXTRAL:
             case PROJECTOR_TYPE_GLMA:
+            case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
                 audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
                 break;
             case PROJECTOR_TYPE_LFM2A:
@@ -352,6 +353,12 @@ struct mtmd_context {
             // [BEGIN_AUDIO] ... (embeddings) ...
             aud_beg = "[BEGIN_AUDIO]";
 
+        } else if (proj == PROJECTOR_TYPE_QWEN3OMNI_AUDIO) {
+            // <|audio_start|> ... (embeddings) ... <|audio_end|>
+            aud_beg = "<|audio_start|>";
+            aud_end = "<|audio_end|>";
+            // Qwen3-Omni Thinker uses IMRoPE (interleaved M-RoPE)
+            use_mrope = true;
         }
     }
 

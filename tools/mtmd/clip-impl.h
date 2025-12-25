@@ -7,6 +7,8 @@
 #include <climits>
 #include <cstdarg>
 #include <cinttypes>
+#include <cstdio>
+#include <fstream>
 #include <string>
 #include <map>
 #include <sstream>
@@ -68,7 +70,6 @@
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backwrad compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
-#define TN_NORM_EMBD       "v.norm_embd.%s"
 #define TN_ATTN_QKV        "%s.blk.%d.attn_qkv.%s"
 #define TN_ATTN_K          "%s.blk.%d.attn_k.%s"
 #define TN_ATTN_Q          "%s.blk.%d.attn_q.%s"
@@ -87,10 +88,6 @@
 #define TN_LN_PRE          "%s.pre_ln.%s"
 #define TN_LN_POST         "%s.post_ln.%s"
 #define TN_LLAVA_PROJ      "mm.%d.%s"
-#define TN_MM_UP           "mm.up.%s"
-#define TN_MM_GATE         "mm.gate.%s"
-#define TN_MM_DOWN         "mm.down.%s"
-#define TN_MM_POST_NORM    "mm.post_norm.%s"
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
@@ -100,7 +97,7 @@
 #define TN_MM_INP_PROJ     "mm.input_projection.weight" // gemma3
 #define TN_MM_SOFT_EMB_N   "mm.soft_emb_norm.weight"    // gemma3
 #define TN_MM_PROJECTOR    "mm.model.fc.weight"         // idefics3
-#define TN_MM_PATCH_MERGER "mm.patch_merger.%s"         // mistral small 3.1, glm4v
+#define TN_MM_PATCH_MERGER "mm.patch_merger.weight"     // mistral small 3.1
 #define TN_TOK_IMG_BREAK   "v.token_embd.img_break"     // pixtral
 #define TN_TOK_GLM_BOI     "adapter.boi"                // glm-edge (these embeddings are not in text model)
 #define TN_TOK_GLM_EOI     "adapter.eoi"                // glm-edge (these embeddings are not in text model)
@@ -138,21 +135,6 @@
 #define TN_TOK_BOI         "v.boi"
 #define TN_TOK_EOI         "v.eoi"
 
-// (conformer) lfm2
-#define TN_PRE_ENCODE_OUT  "a.pre_encode.out.%s"
-#define TN_FFN_NORM        "%s.blk.%d.ffn_norm.%s"
-#define TN_FFN_NORM_1      "%s.blk.%d.ffn_norm_1.%s"
-#define TN_FFN_UP_1        "%s.blk.%d.ffn_up_1.%s"
-#define TN_FFN_DOWN_1      "%s.blk.%d.ffn_down_1.%s"
-#define TN_POS_BIAS_U      "%s.blk.%d.pos_bias_u"
-#define TN_POS_BIAS_V      "%s.blk.%d.pos_bias_v"
-#define TN_NORM_CONV       "%s.blk.%d.norm_conv.%s"
-#define TN_LINEAR_POS      "%s.blk.%d.linear_pos.%s"
-#define TN_CONV_DW         "%s.blk.%d.conv_dw.%s"
-#define TN_CONV_NORM       "%s.blk.%d.conv_norm.%s"
-#define TN_CONV_PW1        "%s.blk.%d.conv_pw1.%s"
-#define TN_CONV_PW2        "%s.blk.%d.conv_pw2.%s"
-
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
@@ -180,13 +162,12 @@ enum projector_type {
     PROJECTOR_TYPE_GLMA,
     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
     PROJECTOR_TYPE_VOXTRAL,
+    PROJECTOR_TYPE_QWEN3OMNI_AUDIO,
     PROJECTOR_TYPE_LFM2,
     PROJECTOR_TYPE_KIMIVL,
     PROJECTOR_TYPE_LIGHTONOCR,
     PROJECTOR_TYPE_COGVLM,
     PROJECTOR_TYPE_JANUS_PRO,
-    PROJECTOR_TYPE_LFM2A,
-    PROJECTOR_TYPE_GLM4V,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -209,13 +190,12 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GLMA,      "glma"},
     { PROJECTOR_TYPE_QWEN25O,   "qwen2.5o"},
     { PROJECTOR_TYPE_VOXTRAL,   "voxtral"},
+    { PROJECTOR_TYPE_QWEN3OMNI_AUDIO, "qwen3omni_audio"},
     { PROJECTOR_TYPE_LFM2,      "lfm2"},
     { PROJECTOR_TYPE_KIMIVL,    "kimivl"},
     { PROJECTOR_TYPE_LIGHTONOCR,"lightonocr"},
     { PROJECTOR_TYPE_COGVLM,    "cogvlm"},
     { PROJECTOR_TYPE_JANUS_PRO, "janus_pro"},
-    { PROJECTOR_TYPE_LFM2A,     "lfm2a"},
-    { PROJECTOR_TYPE_GLM4V,     "glm4v"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
@@ -519,7 +499,80 @@ static void print_tensor_data(ggml_tensor * t, uint8_t * data, int64_t n) {
     }
 }
 
-void clip_debug_encode(clip_ctx * ctx, int h, int w, float fill_value);
+// Save tensor to binary file for Python comparison
+// Format: 4 bytes n_dims, then ne[] as int64, then raw float32 data
+static void save_tensor_binary(ggml_tensor * t, uint8_t * data, const char * dir = "/models/debug") {
+    std::string name = t->name;
+    // Replace special characters in name
+    for (char & c : name) {
+        if (c == '/' || c == ' ' || c == ':') c = '_';
+    }
+    std::string path = std::string(dir) + "/cpp_" + name + ".bin";
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        printf("Failed to open %s for writing\n", path.c_str());
+        return;
+    }
+
+    // Write number of dimensions
+    int32_t n_dims = ggml_n_dims(t);
+    f.write(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
+
+    // Write dimensions
+    for (int i = 0; i < 4; i++) {
+        int64_t dim = t->ne[i];
+        f.write(reinterpret_cast<char*>(&dim), sizeof(dim));
+    }
+
+    // Write data type (for verification)
+    int32_t dtype = t->type;
+    f.write(reinterpret_cast<char*>(&dtype), sizeof(dtype));
+
+    // Convert to float32 and write
+    size_t n_elements = ggml_nelements(t);
+    std::vector<float> float_data(n_elements);
+
+    ggml_type type = t->type;
+    int64_t * ne = t->ne;
+    size_t * nb = t->nb;
+
+    size_t idx = 0;
+    for (int64_t i3 = 0; i3 < ne[3]; i3++) {
+        for (int64_t i2 = 0; i2 < ne[2]; i2++) {
+            for (int64_t i1 = 0; i1 < ne[1]; i1++) {
+                for (int64_t i0 = 0; i0 < ne[0]; i0++) {
+                    size_t i = i3 * nb[3] + i2 * nb[2] + i1 * nb[1] + i0 * nb[0];
+                    float v;
+                    if (type == GGML_TYPE_F16) {
+                        v = ggml_fp16_to_fp32(*(ggml_fp16_t *) &data[i]);
+                    } else if (type == GGML_TYPE_F32) {
+                        v = *(float *) &data[i];
+                    } else if (type == GGML_TYPE_I32) {
+                        v = (float) *(int32_t *) &data[i];
+                    } else if (type == GGML_TYPE_I16) {
+                        v = (float) *(int16_t *) &data[i];
+                    } else if (type == GGML_TYPE_I8) {
+                        v = (float) *(int8_t *) &data[i];
+                    } else {
+                        v = 0.0f;  // Unknown type
+                    }
+                    float_data[idx++] = v;
+                }
+            }
+        }
+    }
+
+    f.write(reinterpret_cast<char*>(float_data.data()), n_elements * sizeof(float));
+    f.close();
+
+    printf("Saved tensor %s to %s (shape: [", t->name, path.c_str());
+    for (int i = 0; i < n_dims; i++) {
+        printf("%" PRId64, t->ne[i]);
+        if (i < n_dims - 1) printf(", ");
+    }
+    printf("], %zu elements)\n", n_elements);
+}
 
 //
 // API used internally with mtmd
