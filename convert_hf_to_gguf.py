@@ -4323,6 +4323,8 @@ class Qwen3OmniMmprojModel(MmprojModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         assert self.hparams_audio is not None
+        # Set projector type for Qwen3-Omni audio encoder
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN3OMNI_AUDIO)
         # Qwen3-Omni uses 128 mel bins (vs Whisper's 80)
         self.gguf_writer.add_audio_num_mel_bins(self.hparams_audio["num_mel_bins"])
         self.gguf_writer.add_audio_attention_layernorm_eps(self.hparams_audio.get("layer_norm_eps", 1e-5))

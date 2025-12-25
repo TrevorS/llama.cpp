@@ -3737,6 +3737,7 @@ class VisionProjectorType:
     INTERNVL = "internvl"
     QWEN2A = "qwen2a" # audio
     GLMA = "glma" # audio
+    QWEN3OMNI_AUDIO = "qwen3omni_audio"  # audio
     QWEN25O = "qwen2.5o" # omni
     VOXTRAL = "voxtral"
     LFM2 = "lfm2"
