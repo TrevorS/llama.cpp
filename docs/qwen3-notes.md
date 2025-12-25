@@ -5,16 +5,49 @@
 
 ---
 
-## Current Status
+## Current Status (2025-12-24)
 
-- **Phase**: Talker Verification COMPLETE (GPU TOO!)
-- **Current Task**: Integration testing (Thinker → Talker)
-- **Validation**: All components verified
-  - Code2Wav: ✅ 0.9999+ correlation
-  - Talker (CPU): ✅ All 20 layers match HF
-  - Talker (GPU): ✅ **CONFIRMED WORKING** - Final logits match CPU (2025-12-23)
+🎉 **TEXT→SPEECH WORKING!**
 
-**Note**: The "CUDA bug" was a false alarm. Per-layer tensor extraction showed wrong values due to buffer aliasing in debug mode, but the actual computation is correct. GPU and CPU produce identical logits.
+### I/O Capabilities
+
+|                        | Text Output | Speech Output |
+|------------------------|-------------|---------------|
+| **Text Input**         | ✅ WORKING  | ✅ WORKING    |
+| **Audio Input**        | ❌ Not wired | ❌ Not wired |
+| **Image/Video Input**  | ❌ Not wired | ❌ Not wired |
+
+### Component Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Thinker (48L MoE) | ✅ | Text generation + layer 18 hidden extraction |
+| Text Projection | ✅ | 2048→1024 MLP |
+| Talker (20L MoE) | ✅ | Codec token generation, GPU verified |
+| Code Predictor (5L) | ✅ | Codebooks 2-16, tokens match HF |
+| Code2Wav | ✅ | 0.9999+ correlation with HF |
+| Audio Encoder (32L) | ✅ GGUF | Not wired to Thinker |
+| Vision Encoder (27L) | ✅ GGUF | Not wired to Thinker |
+
+### Critical Fixes That Made It Work
+
+1. **mid_residual_hiddens**: Must collect INPUT EMBEDDINGS (before transformer layer), NOT layer 0 outputs
+   - HuggingFace: `hid[0]` in `hidden_states[1:]` = input embeddings
+   - mlx-vlm: `mid_residual_hiddens.append(cp_input_embeds_out)` = explicit input embeddings
+
+2. **past_hidden**: Must use POST-NORM (after output_norm), NOT PRE-NORM
+   - mlx-vlm line 597: `hidden_states = self.norm(hidden_states)` before returning
+   - L2 norm: PRE-NORM ~12-17, POST-NORM ~107-127 (matches HF ~130)
+
+### Remaining Work
+
+| Category | Priority | Notes |
+|----------|----------|-------|
+| Audio input pipeline | High | Wire 32L encoder → Thinker |
+| Vision input pipeline | High | Wire 27L ViT → Thinker |
+| Server API | Medium | 6 tasks for REST endpoints |
+| CLI polish | Low | Interactive mode, multimodal input |
+| Test suite | Low | Formal metrics (PESQ, STOI) |
 
 ---
 
@@ -936,5 +969,202 @@ This produces correct output matching HuggingFace reference.
 1. **Investigate CUDA bug** - Check MoE kernel, buffer allocation
 2. **Test on other GPUs** - Verify if GB10-specific or general CUDA issue
 3. **File upstream issue** - If confirmed as llama.cpp CUDA bug
+
+---
+
+## 2025-12-24 mlx-vllm Architecture Comparison
+
+### Overview
+
+Compared llama.cpp Code Predictor implementation against mlx-vllm (newly added Qwen3-Omni support).
+
+**mlx-vllm location**: `/home/trevor/Projects/qwen-omni-llama-cpp/mlx-vlm/mlx_vlm/models/qwen3_omni_moe/`
+
+### Static Constants Comparison
+
+| Constant | llama.cpp | mlx-vllm | Status |
+|----------|-----------|----------|--------|
+| hidden_size | 1024 | 1024 | ✅ |
+| num_layers | 5 | 5 | ✅ |
+| num_heads | 16 | 16 | ✅ |
+| num_kv_heads | 8 | 8 | ✅ |
+| intermediate_size | 3072 | 3072 | ✅ |
+| vocab_size | 2048 | 2048 | ✅ |
+| rope_theta | 1,000,000 | 1,000,000 | ✅ |
+| rms_norm_eps | 1e-6 | 1e-6 | ✅ |
+
+### Key Finding: Embedding Count Mismatch
+
+| Implementation | Embeddings Summed | Source |
+|---------------|-------------------|--------|
+| **HuggingFace** | 17 | `[last_id_hidden] + hidden_states[1:] (15) + [last_residual_hidden]` |
+| **llama.cpp** | 17 | `last_id_hidden + 15 layer0_outputs + last_residual_hidden` |
+| **mlx-vllm** | **16** ⚠️ | `[last_id_hidden] + mid_residual (14) + [last_residual_hidden]` |
+
+**llama.cpp matches HuggingFace!** mlx-vllm has a bug - loop `range(1, 15)` gives 14 iterations, should be 15.
+
+### Semantic Difference
+
+| Implementation | What mid_residual_hiddens contains |
+|---------------|-----------------------------------|
+| **HuggingFace** | Layer 0 decoder outputs (`_can_record_outputs: DecoderLayer`) |
+| **llama.cpp** | Layer 0 outputs (line 2520: `codec_embeddings.push_back(layer0_output)`) |
+| **mlx-vllm** | Input embeddings (line 702: `mid_residual_hiddens.append(cp_input_embeds_out)`) |
+
+llama.cpp correctly collects layer 0 transformer outputs, matching HuggingFace semantics.
+
+### RoPE Verification
+
+Both implementations use equivalent formulas:
+- **Frequency**: `1.0 / (theta^(2i/dim))` ✅
+- **Rotation**: `[x0*cos - x1*sin, x0*sin + x1*cos]` ✅
+
+### Index Mapping
+
+| Step | mlx-vllm lm_head | mlx-vllm embedding | llama.cpp lm_head | llama.cpp embedding |
+|------|------------------|-------------------|-------------------|---------------------|
+| Prefill | [0] | (input_embeds) | - | - |
+| Token 0 | - | - | [0] | [0] |
+| Token 1 | [1] | [0] | [1] | [1] |
+| Token 14 | [14] | [13] | [14] | [14] |
+| last_residual | - | [14] | - | [14] |
+
+### Conclusion
+
+**llama.cpp Code Predictor architecture is CORRECT** and matches HuggingFace:
+- ✅ All constants match
+- ✅ Embedding count (17) matches HF
+- ✅ Semantics (layer 0 outputs) matches HF
+- ✅ RoPE implementation matches
+
+**mlx-vllm has bugs:**
+- ⚠️ Missing one embedding (16 instead of 17)
+- ⚠️ Collects input embeddings instead of layer outputs
+
+Token divergence in llama.cpp must be caused by something else (numerical precision, sampling, etc.), not architecture.
+
+---
+
+## 2025-12-24 Token Divergence Investigation
+
+### Test Setup
+- Prompt: "Hello, this is a test."
+- Greedy decoding (temp=0) for deterministic comparison
+
+### Comparison Results (Greedy)
+
+| Frame | llama.cpp CB0 | HuggingFace CB0 |
+|-------|---------------|-----------------|
+| 0 | 1049 | 1049 ✅ |
+| 1 | EOS (2150) | 196 ❌ |
+
+**First token matches, second diverges!**
+
+### Code Predictor Token Comparison (Frame 0)
+
+| Codebook | llama.cpp | HuggingFace |
+|----------|-----------|-------------|
+| CB1 | 484 | 1700 |
+| CB2 | 1958 | 1626 |
+| CB3 | 1778 | 546 |
+| CB4 | 611 | 306 |
+| CB5 | 22 | 1443 |
+
+**Code Predictor tokens are completely different!** This explains the divergence.
+
+### Root Cause Investigation
+
+The Code Predictor at frame 0 takes:
+1. `past_hidden` - Talker's pre-norm hidden state from prefill
+2. `last_id_hidden` - Embedding of token 1049
+
+Since both implementations produce token 1049 from prefill, the embedding lookup should be identical.
+The issue is likely in `past_hidden` extraction.
+
+**Next steps:**
+- Dump past_hidden values from HuggingFace at frame 0
+- Compare with llama.cpp past_hidden values
+- Verify the pre-norm hidden state extraction is correct
+
+---
+
+## 2025-12-24 CRITICAL FIX: mid_residual_hiddens Semantics
+
+### The Bug
+
+**Previous llama.cpp implementation was collecting the WRONG data for `mid_residual_hiddens`!**
+
+| Implementation | What mid_residual_hiddens collects |
+|---------------|-----------------------------------|
+| HuggingFace | **INPUT EMBEDDINGS** (before any layer processing) |
+| llama.cpp (WRONG) | Layer 0 outputs (after first transformer layer) |
+
+### Evidence
+
+HuggingFace line 3248:
+```python
+mid_residual_hiddens = [hid[0].to(last_id_hidden.device) for hid in predictor_result.hidden_states[1:]]
+```
+
+In HuggingFace's `generate()` with `output_hidden_states=True`:
+- `hidden_states` is a tuple of `(num_generated_tokens,)` tuples
+- Each `hid` is a tuple of `(num_layers + 1,)` hidden states
+- **`hid[0]` = INPUT EMBEDDINGS (index 0), NOT layer 0 output (index 1)**
+
+mlx-vllm confirms this at line 702:
+```python
+mid_residual_hiddens.append(cp_input_embeds_out)
+```
+It explicitly collects `cp_input_embeds_out` (input embeddings).
+
+### The Fix
+
+Changed `main.cpp` line 2581-2584:
+```cpp
+// Before (WRONG):
+codec_embeddings.push_back(layer0_output);
+
+// After (CORRECT):
+codec_embeddings.push_back(token_embd);  // INPUT embedding, not layer output
+```
+
+### Magnitude Comparison
+
+| Component | Before Fix | After Fix | HuggingFace |
+|-----------|------------|-----------|-------------|
+| CP hs[0] L2 | 3-6 | 0.73-0.98 | 0.5-0.7 ✅ |
+| CP hs[1] L2 | 3-6 | 0.47-0.81 | 0.5-0.7 ✅ |
+| Total CP sum L2 | 50-70 | 5-9 | ~3-5 ✅ |
+
+**The 10x magnitude difference is now resolved!**
+
+### Note: Previous Analysis Was Wrong
+
+The earlier section "### Conclusion" incorrectly stated:
+> "llama.cpp Code Predictor architecture is CORRECT"
+> "mlx-vllm has bugs: ⚠️ Collects input embeddings instead of layer outputs"
+
+**This was backwards!** mlx-vllm was correct. HuggingFace collects **input embeddings**, and llama.cpp was wrong to collect layer outputs.
+
+### Result After Fix
+
+**Code Predictor tokens at Frame 0 now MATCH HuggingFace exactly:**
+
+| Codebook | Before Fix | After Fix | HuggingFace |
+|----------|-----------|-----------|-------------|
+| CB1 | 484 | **1700** | 1700 ✅ |
+| CB2 | 1958 | **1626** | 1626 ✅ |
+| CB3 | 1778 | **546** | 546 ✅ |
+| CB4 | 611 | **306** | 306 ✅ |
+| CB5 | 22 | **1443** | 1443 ✅ |
+
+**The Code Predictor is now generating correct tokens!**
+
+The Talker is also progressing correctly:
+- Step 0: token 196 (was generating EOS before)
+- Step 1: token 76
+- Step 2: token 1239
+
+The model now generates 100+ tokens and produces ~8 seconds of audio.
 
 ---

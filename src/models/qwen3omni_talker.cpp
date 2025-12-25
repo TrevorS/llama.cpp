@@ -178,6 +178,20 @@ llm_build_qwen3omni_talker::llm_build_qwen3omni_talker(const llama_model & model
 
     cur = inpL;
 
+    // Fix: Expose pre-norm hidden state for Code Predictor
+    // HuggingFace uses hidden_states[0][-1] which is BEFORE output_norm
+    // Mark this tensor as output so it can be extracted
+    cb(cur, "pre_norm_hidden", -1);
+    ggml_set_output(cur);
+
+    // CRITICAL FIX: Filter to only output tokens marked for output
+    // This is required for llama_get_logits to work correctly
+    // Other models (dream, falcon-h1, smallthinker, etc.) all do this
+    if (inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cb(cur, "filtered_output", -1);
+    }
+
     cur = build_norm(cur,
             model.output_norm, NULL,
             LLM_NORM_RMS, -1);
