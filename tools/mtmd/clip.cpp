@@ -799,6 +799,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                 builder = std::make_unique<clip_graph_qwen2vl>(ctx, img);
             } break;
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             {
                 builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
             } break;
@@ -1148,6 +1149,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN2VL:
                 case PROJECTOR_TYPE_QWEN25VL:
                 case PROJECTOR_TYPE_QWEN3VL:
+                case PROJECTOR_TYPE_QWEN3OMNI_VISION:
                     {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
@@ -1498,6 +1500,7 @@ struct clip_model_loader {
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
             case PROJECTOR_TYPE_QWEN3VL:
+            case PROJECTOR_TYPE_QWEN3OMNI_VISION:
                 {
                     model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
@@ -2697,6 +2700,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             {
                 GGML_ASSERT(params.image_min_pixels > 0 && params.image_max_pixels > 0);
                 clip_image_u8 resized;
@@ -2945,6 +2949,7 @@ int clip_n_output_tokens_x(const struct clip_ctx * ctx, struct clip_image_f32 * 
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             return (img->nx / params.patch_size) / 2;
         default:
             break;
@@ -2960,6 +2965,7 @@ int clip_n_output_tokens_y(const struct clip_ctx * ctx, struct clip_image_f32 * 
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             return (img->ny / params.patch_size) / 2;
         default:
             break;
@@ -3020,6 +3026,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             {
                 // dynamic size (2 conv, so double patch size)
                 int x_patch = img->nx / (params.patch_size * 2);
@@ -3277,6 +3284,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_GLM4V:
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
             {
                 const int merge_ratio = hparams.n_merge;
                 const int pw = image_size_width  / patch_size;
@@ -3577,6 +3585,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3OMNI_AUDIO:
             // Qwen3-Omni audio: proj2 outputs to Thinker hidden dim (2048)
             return ctx->model.mm_2_w->ne[1];
+        case PROJECTOR_TYPE_QWEN3OMNI_VISION:
+            // Qwen3-Omni vision: main path (2048) + deepstack paths (2048 * n_deepstack_layers)
+            // Same as QWEN3VL since both use deepstack concatenation
+            return ctx->model.mm_1_b->ne[0] * (1 + ctx->model.n_deepstack_layers);
         case PROJECTOR_TYPE_COGVLM:
             return ctx->model.mm_4h_to_h_w->ne[1];
         case PROJECTOR_TYPE_LFM2A:
@@ -3603,7 +3615,8 @@ bool clip_is_mrope(const struct clip_ctx * ctx) {
     return ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL
         || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL
         || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL
-        || ctx->proj_type() == PROJECTOR_TYPE_GLM4V;
+        || ctx->proj_type() == PROJECTOR_TYPE_GLM4V
+        || ctx->proj_type() == PROJECTOR_TYPE_QWEN3OMNI_VISION;
 }
 
 bool clip_is_llava(const struct clip_ctx * ctx) {

@@ -5,9 +5,9 @@
 
 ---
 
-## Current Status (2025-12-25)
+## Current Status (2025-12-26)
 
-🎉 **TEXT→SPEECH & AUDIO→TEXT WORKING!**
+🎉 **TEXT→SPEECH, AUDIO→TEXT, & IMAGE→TEXT WORKING!**
 
 ### I/O Capabilities
 
@@ -15,7 +15,7 @@
 |------------------------|-------------|---------------|
 | **Text Input**         | ✅ WORKING  | ✅ WORKING    |
 | **Audio Input**        | ✅ WORKING  | 🔧 NOT WIRED  |
-| **Image/Video Input**  | ❌ Not wired | ❌ Not wired |
+| **Image/Video Input**  | ✅ WORKING  | 🔧 NOT WIRED  |
 
 ### Component Status
 
@@ -27,7 +27,7 @@
 | Code Predictor (5L) | ✅ | Codebooks 2-16, tokens match HF |
 | Code2Wav | ✅ | 0.9999+ correlation with HF |
 | Audio Encoder (32L) | ✅ | mtmd integration, M-RoPE, flatten + double-norm fixes |
-| Vision Encoder (27L) | ✅ GGUF | Not wired to Thinker |
+| Vision Encoder (27L) | ✅ | mtmd integration, deepstack, 8192-dim output |
 
 ### Critical Fixes That Made It Work
 
@@ -52,12 +52,31 @@
    - Removed explicit post_ln in qwen3omni-audio.cpp (was applying LayerNorm twice)
    - File: `tools/mtmd/models/qwen3omni-audio.cpp` lines 119-132
 
+6. **Vision Encoder Tensor Names (2025-12-26)**: Converter suffix extraction was wrong
+   - `suffix.split(".", 1)[1]` on "mlp.0.weight" gave "0.weight" not "weight"
+   - Fixed: `suffix.rsplit(".", 1)[-1]` to correctly get final component
+   - Affected: mm.0.weight, mm.2.weight, deepstack fc1/fc2
+
+7. **Vision Encoder conv_out Layer Index (2025-12-26)**: Combined model block_count mismatch
+   - Combined GGUF has block_count=127 (48+32+27+20)
+   - conv_out should use audio layer count (31), not block_count
+   - Fixed: Special handling in converter for conv_out tensor
+
+8. **Vision Encoder Projector Type (2025-12-26)**: Qwen3-Omni vision uses deepstack
+   - Added PROJECTOR_TYPE_QWEN3OMNI_VISION for 8192-dim output (2048 * 4)
+   - Same as QWEN3VL: main merger + 3 deepstack mergers (layers 8, 16, 24)
+   - Allows intentional mismatch with audio (2048 dim) in mtmd validation
+
+9. **Vision/Audio Dimension Validation (2025-12-26)**: Qwen3-Omni has different dims
+   - Vision: 8192 (with deepstack), Audio: 2048 (direct projection)
+   - Modified mtmd.cpp to skip mismatch check for Qwen3-Omni projector types
+
 ### Remaining Work
 
 | Category | Priority | Notes |
 |----------|----------|-------|
 | Audio→Speech pipeline | High | Wire audio input → Talker for speech response |
-| Vision input pipeline | High | Wire 27L ViT → Thinker |
+| Image→Speech pipeline | High | Wire vision output → Talker for speech response |
 | Server API | Medium | 6 tasks for REST endpoints |
 | CLI polish | Low | Interactive mode, multimodal input |
 | Test suite | Low | Formal metrics (PESQ, STOI) |
