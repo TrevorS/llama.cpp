@@ -5,9 +5,9 @@
 
 ---
 
-## Current Status (2025-12-25)
+## Current Status (2025-12-26)
 
-🎉 **TEXT→SPEECH, AUDIO→TEXT, & IMAGE→TEXT ALL WORKING via mtmd-cli!**
+🎉 **ALL I/O COMBINATIONS WORKING!** Text, Audio, Image → Text or Speech
 
 ### I/O Capabilities
 
@@ -15,12 +15,24 @@
 |------------------------|-------------|---------------|
 | **Text Input**         | ✅ WORKING  | ✅ WORKING    |
 | **Audio Input**        | ✅ WORKING  | ✅ WORKING    |
-| **Image/Video Input**  | ✅ WORKING  | 🔧 NOT TESTED |
+| **Image Input**        | ✅ WORKING  | ✅ WORKING    |
+| **Image + Audio**      | ✅ WORKING  | ✅ WORKING    |
 
-### mtmd-cli TTS Usage (2025-12-25)
+### CLI Comparison
+
+| Feature | `llama-cli` | `mtmd-cli` |
+|---------|-------------|------------|
+| Text → Text | ✅ `-st -p "prompt"` | ✅ |
+| Image → Text | ✅ `--mmproj --image` | ✅ |
+| Audio → Text | ✅ `--mmproj --audio` | ✅ |
+| Any → **Speech** | ❌ | ✅ `--tts-model --speak` |
+
+**Key:** Use `-st` (`--single-turn`) with `llama-cli` to avoid interactive mode.
+
+### mtmd-cli TTS Usage (2025-12-26)
 
 ```bash
-# Text-only TTS (no audio/image input)
+# Text-only TTS
 ./llama-mtmd-cli \
   -m thinker.gguf \
   --mmproj mmproj.gguf \
@@ -38,6 +50,56 @@
   -p "What was said?" \
   --speak \
   --tts-output output.wav
+
+# Image input + TTS response
+./llama-mtmd-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --tts-model talker.gguf \
+  --image photo.jpg \
+  -p "Describe this image" \
+  --speak \
+  --tts-output output.wav
+
+# Combined image + audio input + TTS response
+./llama-mtmd-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --tts-model talker.gguf \
+  --image photo.jpg \
+  --audio speech.wav \
+  -p "What do you see and hear?" \
+  --speak \
+  --tts-output output.wav
+```
+
+### llama-cli Usage (Text-only or Multimodal Input, No TTS)
+
+```bash
+# Text-only (single-turn, non-interactive)
+./llama-cli \
+  -m thinker.gguf \
+  -p "What is the capital of France?" \
+  -n 64 \
+  -st
+
+# Audio input (requires mmproj)
+./llama-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --audio input.wav \
+  -p "What did you hear?" \
+  -n 64 \
+  -st
+
+# Image input (requires mmproj)
+./llama-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --image photo.jpg \
+  -p "What is in this image?" \
+  -n 64 \
+  -st
 ```
 
 ### Component Status
@@ -121,11 +183,10 @@
 
 | Category | Priority | Notes |
 |----------|----------|-------|
-| Image→Speech pipeline | High | Test vision input → Talker for speech response |
-| Server API | Medium | 6 tasks for REST endpoints |
-| CLI polish | Low | Interactive mode, multimodal input |
+| Server API | Medium | REST endpoints for TTS |
+| Video input | Medium | Currently untested (image works, video frames TBD) |
 | Test suite | Low | Formal metrics (PESQ, STOI) |
-| Debug filter output | Low | Remove audio encoder debug prints in text-only mode |
+| Performance | Low | Optimize TTS latency |
 
 ---
 
