@@ -17,7 +17,6 @@ class TensorNameMap:
             "embed_tokens",                              # embeddinggemma
             "tok_embeddings",                            # llama-pth
             "embeddings.word_embeddings",                # bert nomic-bert
-            "embeddings.tok_embeddings",                 # modern-bert
             "language_model.embedding.word_embeddings",  # persimmon
             "wte",                                       # gpt2
             "transformer.embd.wte",                      # phi2
@@ -47,7 +46,6 @@ class TensorNameMap:
         MODEL_TENSOR.TOKEN_EMBD_NORM: (
             "word_embeddings_layernorm",  # bloom
             "embeddings.LayerNorm",       # bert
-            "embeddings.norm",            # modern-bert
             "emb_ln",                     # nomic-bert
             "transformer.norm",           # openelm
             "rwkv.blocks.0.pre_ln",       # rwkv
@@ -77,7 +75,6 @@ class TensorNameMap:
             "head.out",                  # wavtokenizer
             "lm_head",                   # llama4
             "model.transformer.ff_out",  # llada
-            "head.decoder",              # modern-bert
         ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
@@ -107,7 +104,6 @@ class TensorNameMap:
             "backbone.final_layer_norm",               # wavtokenizer
             "model.norm",                              # llama4
             "model.transformer.ln_f",                  # llada
-            "final_norm",                              # modern-bert
             "model.norm",                              # cogvlm
         ),
 
@@ -155,7 +151,6 @@ class TensorNameMap:
             "model.layers.{bid}.input_layernorm",                   # llama4
             "layers.{bid}.input_layernorm",                         # embeddinggemma
             "transformer_encoder.{bid}.attention_norm",             # neobert
-            "layers.{bid}.attn_norm",                               # modern-bert
             "model.layers.{bid}.operator_norm",                     # lfm2
             "model.transformer.blocks.{bid}.attn_norm",             # llada
             "layers.{bid}.input_layernorm",                         # qwen3-embedding
@@ -192,7 +187,6 @@ class TensorNameMap:
             "encoder.layers.{bid}.self_attention.query_key_value",                 # chatglm
             "transformer.layers.{bid}.attn.qkv_proj",                              # openelm
             "transformer_encoder.{bid}.qkv",                                       # neobert
-            "layers.{bid}.attn.Wqkv",                                              # modern-bert
             "model.layers.{bid}.self_attn.language_expert_query_key_value",        # cogvlm
         ),
 
@@ -267,7 +261,6 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.linear_attn",                     # deci
             "layers.{bid}.attention.wo",                                    # llama-pth
             "encoder.layer.{bid}.attention.output.dense",                   # bert
-            "layers.{bid}.attn.Wo",                                         # modern-bert
             "transformer.layer.{bid}.attention.out_lin",                    # distillbert
             "transformer.h.{bid}.attn.out_proj",                            # gpt-j
             "language_model.encoder.layers.{bid}.self_attention.dense",     # persimmon
@@ -320,7 +313,6 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_SINKS: (
             "model.layers.{bid}.self_attn.sinks", # openai-moe
-            "model.layers.{bid}.self_attn.attention_sink_bias", # mimov2
         ),
 
         MODEL_TENSOR.ATTN_GATE: (
@@ -352,7 +344,6 @@ class TensorNameMap:
             "layers.{bid}.post_attention_layernorm",                         # qwen3-embedding
             "model.layers.{bid}.feedforward_layernorm",                      # apertus
             "model.layers.{bid}.pre_mlp_layernorm",                          # kormo
-            "layers.{bid}.mlp_norm"                                          # modern-bert
         ),
 
         # Pre feed-forward norm
@@ -388,7 +379,6 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.gate",               # lfm2moe
             "model.layers.{bid}.mlp.router.gate",               # afmoe
             "layers.{bid}.gate",                                # mistral-large
-            "backbone.layers.{bid}.mixer.gate",                 # nemotron-h-moe
         ),
 
         MODEL_TENSOR.FFN_GATE_INP_SHEXP: (
@@ -402,7 +392,6 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.expert_bias",                           # afmoe
             "model.layers.{bid}.feed_forward.expert_bias",                  # lfm2moe
             "model.layers.{bid}.block_sparse_moe.e_score_correction",       # minimax-m2
-            "backbone.layers.{bid}.mixer.gate.e_score_correction"           # nemotron-h-moe
         ),
 
         # Feed-forward up
@@ -416,7 +405,6 @@ class TensorNameMap:
             "layers.{bid}.mlp.up_proj",                               # embeddinggemma
             "layers.{bid}.feed_forward.w3",                           # llama-pth
             "encoder.layer.{bid}.intermediate.dense",                 # bert
-            "layers.{bid}.mlp.Wi",                                    # modern-bert
             "transformer.layer.{bid}.ffn.lin1",                       # distillbert
             "transformer.h.{bid}.mlp.fc_in",                          # gpt-j
             "transformer.h.{bid}.mlp.linear_3",                       # refact
@@ -452,7 +440,7 @@ class TensorNameMap:
             "layers.{bid}.feed_forward.experts.w3",                 # mixtral (merged)
             "transformer.decoder_layer.{bid}.moe.linear_v",         # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.v1",          # dbrx
-            "model.layers.{bid}.mlp.experts.up_proj",               # qwen2moe olmoe (merged) ernie4.5-moe, nemotron-h-moe (merged)
+            "model.layers.{bid}.mlp.experts.up_proj",               # qwen2moe olmoe (merged) ernie4.5-moe
             "model.layers.{bid}.block_sparse_moe.experts.w3",       # phimoe (merged)
             "model.layers.{bid}.feed_forward.experts.up_proj",      # llama4
             "encoder.layers.{bid}.mlp.experts.mlp.w1",              # nomic-bert-moe
@@ -466,7 +454,6 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.down_proj",
             "model.layers.{bid}.mlp.shared_mlp.up_proj",             # hunyuan
             "layers.{bid}.shared_experts.w3",                        # mistral-large
-            "backbone.layers.{bid}.mixer.shared_experts.up_proj",    # nemotron-h-moe
         ),
 
         MODEL_TENSOR.FFN_UP_CHEXP: (
@@ -531,7 +518,6 @@ class TensorNameMap:
             "layers.{bid}.mlp.down_proj",                             # embeddinggemma
             "layers.{bid}.feed_forward.w2",                           # llama-pth
             "encoder.layer.{bid}.output.dense",                       # bert
-            "layers.{bid}.mlp.Wo",                                    # modern-bert
             "transformer.layer.{bid}.ffn.lin2",                       # distillbert
             "transformer.h.{bid}.mlp.fc_out",                         # gpt-j
             "language_model.encoder.layers.{bid}.mlp.dense_4h_to_h",  # persimmon
@@ -562,7 +548,7 @@ class TensorNameMap:
             "layers.{bid}.feed_forward.experts.w2",                 # mixtral (merged)
             "transformer.decoder_layer.{bid}.moe.linear_1",         # Grok (merged)
             "transformer.blocks.{bid}.ffn.experts.mlp.w2",          # dbrx
-            "model.layers.{bid}.mlp.experts.down_proj",             # qwen2moe olmoe (merged) ernie4.5-moe nemotron-h-moe (merged)
+            "model.layers.{bid}.mlp.experts.down_proj",             # qwen2moe olmoe (merged) ernie4.5-moe
             "model.layers.{bid}.block_sparse_moe.output_linear",    # granitemoe
             "model.layers.{bid}.block_sparse_moe.experts.w2",       # phimoe (merged)
             "model.layers.{bid}.feed_forward.experts.down_proj",    # llama4
@@ -577,7 +563,6 @@ class TensorNameMap:
             "model.layers.{bid}.shared_mlp.output_linear",             # granitemoe
             "model.layers.{bid}.mlp.shared_mlp.down_proj",             # hunyuan
             "layers.{bid}.shared_experts.w2",                          # mistral-large
-            "backbone.layers.{bid}.mixer.shared_experts.down_proj",    # nemotron-h-moe
         ),
 
         MODEL_TENSOR.FFN_DOWN_CHEXP: (
@@ -721,7 +706,6 @@ class TensorNameMap:
             "model.layers.{bid}.mamba.dt_proj",         # jamba falcon-h1 granite-hybrid
             "model.layers.layers.{bid}.mixer.dt_proj",  # plamo2
             "model.layers.{bid}.linear_attn.dt_proj",   # qwen3next
-            "backbone.layers.{bid}.mixer.dt",           # nemotron-h-moe
         ),
 
         MODEL_TENSOR.SSM_DT_NORM: (
@@ -1133,7 +1117,6 @@ class TensorNameMap:
             "classifier.dense", # roberta
             "pre_classifier",   # distillbert
             "dense",            # neobert
-            "head.dense",       # modern-bert
         ),
 
         MODEL_TENSOR.CLS_OUT: (
@@ -1224,7 +1207,6 @@ class TensorNameMap:
         MODEL_TENSOR.V_MMPROJ_FC: (
             "model.connector.modality_projection.proj", # SmolVLM
             "model.vision.linear_proj.linear_proj", # cogvlm
-            "visual.merger.proj", # glm4v
         ),
 
         MODEL_TENSOR.V_MMPROJ_MLP: (
@@ -1258,10 +1240,6 @@ class TensorNameMap:
             "model.vision.patch_embedding.proj", # cogvlm
         ),
 
-        MODEL_TENSOR.V_ENC_EMBD_NORM: (
-            "visual.post_conv_layernorm", # glm4v
-        ),
-
         MODEL_TENSOR.V_ENC_EMBD_POS: (
             "vision_tower.vision_model.embeddings.position_embedding",
             "model.vision_tower.embeddings.position_embeddings", # Intern-S1
@@ -1271,7 +1249,6 @@ class TensorNameMap:
             "vision_tower.patch_embed.pos_emb", # kimi-vl
             "visual.pos_embed", # qwen3vl
             "model.vision.patch_embedding.position_embedding", # cogvlm
-            "visual.embeddings.position_embedding", # glm4v
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_QKV: (
@@ -1427,11 +1404,6 @@ class TensorNameMap:
             "vision_model.layernorm_post", # llama4
             "visual.merger.ln_q", # qwen2vl
             "vision_tower.encoder.final_layernorm", # kimi-vl
-            "visual.post_layernorm", # glm4v
-        ),
-
-        MODEL_TENSOR.V_MM_POST_NORM: (
-            "visual.merger.post_projection_norm", # glm4v
         ),
 
         MODEL_TENSOR.V_MM_INP_PROJ: (
@@ -1501,7 +1473,6 @@ class TensorNameMap:
         MODEL_TENSOR.V_MM_PATCH_MERGER: (
             "multi_modal_projector.patch_merger.merging_layer", # mistral small 3.1 - hf
             "patch_merger.merging_layer", # mistral
-            "visual.downsample", # glm4v
         ),
 
         MODEL_TENSOR.V_DS_NORM: (
@@ -1522,17 +1493,14 @@ class TensorNameMap:
 
         MODEL_TENSOR.V_MM_UP: (
             "model.vision.linear_proj.dense_h_to_4h", # cogvlm
-            "visual.merger.up_proj", # glm4v
         ),
 
         MODEL_TENSOR.V_MM_DOWN: (
             "model.vision.linear_proj.dense_4h_to_h", # cogvlm
-            "visual.merger.down_proj", # glm4v
         ),
 
         MODEL_TENSOR.V_MM_GATE: (
             "model.vision.linear_proj.gate_proj", # cogvlm
-            "visual.merger.gate_proj", # glm4v
         ),
 
         MODEL_TENSOR.V_TOK_BOI: (
@@ -1547,20 +1515,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_EMBD_POS: (
             "audio_tower.embed_positions", # ultravox
-            "audio_embedding.embedding", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_EMBD_NORM: (
-            "audio_embedding.embedding_norm", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS: (
-            "audio_embedding.to_logits", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_CONV1D: (
-            "audio_tower.conv{bid}", # ultravox
-            "conformer.pre_encode.conv.{bid}", # lfm2
+            "audio_tower.conv{bid}",    # ultravox
+            "audio_tower.conv2d{bid}",  # qwen3omni - 2D conv layers (conv2d1, conv2d2, conv2d3)
+            "audio_tower.conv_out",     # qwen3omni - linear projection from conv to transformer
         ),
 
         MODEL_TENSOR.A_PRE_NORM: (),
@@ -1572,76 +1532,36 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_ATTN_Q: (
             "audio_tower.layers.{bid}.self_attn.q_proj", # ultravox
-            "conformer.layers.{bid}.self_attn.linear_q", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_K: (
             "audio_tower.layers.{bid}.self_attn.k_proj", # ultravox
-            "conformer.layers.{bid}.self_attn.linear_k", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_ATTN_V: (
             "audio_tower.layers.{bid}.self_attn.v_proj", # ultravox
-            "conformer.layers.{bid}.self_attn.linear_v", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_INPUT_NORM: (
             "audio_tower.layers.{bid}.self_attn_layer_norm", # ultravox
-            "conformer.layers.{bid}.norm_self_att", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_OUTPUT: (
             "audio_tower.layers.{bid}.self_attn.out_proj", # ultravox
-            "conformer.layers.{bid}.self_attn.linear_out", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_OUTPUT_NORM: (
             "audio_tower.layers.{bid}.final_layer_norm", # ultravox
-            "conformer.layers.{bid}.norm_out", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_FFN_NORM: (
-            "conformer.layers.{bid}.norm_feed_forward1", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_FFN_UP: (
             "audio_tower.layers.{bid}.fc1", # ultravox
-            "conformer.layers.{bid}.feed_forward1.linear1", # lfm2
         ),
 
         MODEL_TENSOR.A_ENC_FFN_GATE: (),
 
         MODEL_TENSOR.A_ENC_FFN_DOWN: (
             "audio_tower.layers.{bid}.fc2", # ultravox
-            "conformer.layers.{bid}.feed_forward1.linear2", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_FFN_UP_1: (
-            "conformer.layers.{bid}.feed_forward2.linear1", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_FFN_DOWN_1: (
-            "conformer.layers.{bid}.feed_forward2.linear2", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_FFN_NORM_1: (
-            "conformer.layers.{bid}.norm_feed_forward2", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_LINEAR_POS: (
-            "conformer.layers.{bid}.self_attn.linear_pos", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_POS_BIAS_U: (
-            "conformer.layers.{bid}.self_attn.pos_bias_u", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_POS_BIAS_V: (
-            "conformer.layers.{bid}.self_attn.pos_bias_v", # lfm2
-        ),
-
-        MODEL_TENSOR.A_ENC_OUT: (
-            "conformer.pre_encode.out", # lfm2
         ),
 
         # note: some tensors below has "audio." pseudo-prefix, to prevent conflicts with vision tensors
@@ -1649,12 +1569,12 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_MMPROJ: (
             "audio.multi_modal_projector.linear_{bid}", # ultravox
-            "audio_adapter.model.{bid}" # lfm2
+            "audio_tower.proj{bid}",  # qwen3omni - two-layer MLP projector (proj1, proj2)
         ),
 
         MODEL_TENSOR.A_MMPROJ_FC: (
             "audio.multi_modal_projector.linear", # qwen2audio
-            "audio_tower.proj", # qwen2omni
+            "audio_tower.proj", # qwen2omni (single layer)
         ),
 
         MODEL_TENSOR.A_MM_NORM_PRE: (
@@ -1665,24 +1585,256 @@ class TensorNameMap:
             "audio.multi_modal_projector.ln_mid", # ultravox
         ),
 
-        MODEL_TENSOR.A_ENC_CONV_DW: (
-            "conformer.layers.{bid}.conv.depthwise_conv", # lfm2
+        # Talker (Qwen3-Omni speech synthesis)
+        MODEL_TENSOR.TALKER_TEXT_PROJ_FC1: (
+            "talker.text_projection.linear_fc1",  # qwen3omni - projects thinker hidden to talker dim (MLP fc1)
         ),
 
-        MODEL_TENSOR.A_ENC_CONV_NORM: (
-            "conformer.layers.{bid}.conv.batch_norm", # lfm2
+        MODEL_TENSOR.TALKER_TEXT_PROJ_FC2: (
+            "talker.text_projection.linear_fc2",  # qwen3omni - projects thinker hidden to talker dim (MLP fc2)
         ),
 
-        MODEL_TENSOR.A_ENC_CONV_PW1: (
-            "conformer.layers.{bid}.conv.pointwise_conv1", # lfm2
+        MODEL_TENSOR.TALKER_HIDDEN_PROJ_FC1: (
+            "talker.hidden_projection.linear_fc1",  # qwen3omni - hidden projection MLP fc1
         ),
 
-        MODEL_TENSOR.A_ENC_CONV_PW2: (
-            "conformer.layers.{bid}.conv.pointwise_conv2", # lfm2
+        MODEL_TENSOR.TALKER_HIDDEN_PROJ_FC2: (
+            "talker.hidden_projection.linear_fc2",  # qwen3omni - hidden projection MLP fc2
         ),
 
-        MODEL_TENSOR.A_ENC_NORM_CONV: (
-            "conformer.layers.{bid}.norm_conv", # lfm2
+        MODEL_TENSOR.TALKER_CODEC_HEAD: (
+            "talker.codec_head",  # qwen3omni - predicts first codebook token
+        ),
+
+        MODEL_TENSOR.TALKER_CODEC_EMBD: (
+            "talker.codec_embeddings.{bid}",  # qwen3omni - codec embeddings (16 codebooks)
+        ),
+
+        # Talker code_predictor (5-layer transformer + 15 lm heads)
+        MODEL_TENSOR.TALKER_CP_CODEC_EMBD: (
+            "talker.code_predictor.model.codec_embedding.{bid}",  # qwen3omni - code_predictor codec embeddings
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_Q: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.q_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_K: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.k_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_V: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.v_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_OUT: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.o_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_Q_NORM: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.q_norm",  # qwen3omni - QK norm
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_K_NORM: (
+            "talker.code_predictor.model.layers.{bid}.self_attn.k_norm",  # qwen3omni - QK norm
+        ),
+
+        MODEL_TENSOR.TALKER_CP_ATTN_NORM: (
+            "talker.code_predictor.model.layers.{bid}.input_layernorm",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_FFN_GATE: (
+            "talker.code_predictor.model.layers.{bid}.mlp.gate_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_FFN_UP: (
+            "talker.code_predictor.model.layers.{bid}.mlp.up_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_FFN_DOWN: (
+            "talker.code_predictor.model.layers.{bid}.mlp.down_proj",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_FFN_NORM: (
+            "talker.code_predictor.model.layers.{bid}.post_attention_layernorm",  # qwen3omni
+        ),
+
+        MODEL_TENSOR.TALKER_CP_OUTPUT_NORM: (
+            "talker.code_predictor.model.norm",  # qwen3omni - final output norm
+        ),
+
+        MODEL_TENSOR.TALKER_CP_LM_HEAD: (
+            "talker.code_predictor.lm_head.{bid}",  # qwen3omni - 15 per-codebook lm heads
+        ),
+
+        # Code2Wav (Qwen3-Omni HiFi-GAN vocoder)
+        # Input embedding
+        MODEL_TENSOR.C2W_CODE_EMBD: (
+            "code2wav.code_embedding",  # qwen3omni codec token embedding
+        ),
+
+        # Pre-transformer (8 layers)
+        MODEL_TENSOR.C2W_PRE_ATTN_Q: (
+            "code2wav.pre_transformer.layers.{bid}.self_attn.q_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_ATTN_K: (
+            "code2wav.pre_transformer.layers.{bid}.self_attn.k_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_ATTN_V: (
+            "code2wav.pre_transformer.layers.{bid}.self_attn.v_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_ATTN_OUT: (
+            "code2wav.pre_transformer.layers.{bid}.self_attn.o_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_ATTN_NORM: (
+            "code2wav.pre_transformer.layers.{bid}.input_layernorm",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_FFN_GATE: (
+            "code2wav.pre_transformer.layers.{bid}.mlp.gate_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_FFN_UP: (
+            "code2wav.pre_transformer.layers.{bid}.mlp.up_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_FFN_DOWN: (
+            "code2wav.pre_transformer.layers.{bid}.mlp.down_proj",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_FFN_NORM: (
+            "code2wav.pre_transformer.layers.{bid}.post_attention_layernorm",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_ATTN_SCALE: (
+            "code2wav.pre_transformer.layers.{bid}.self_attn_layer_scale.scale",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_FFN_SCALE: (
+            "code2wav.pre_transformer.layers.{bid}.mlp_layer_scale.scale",
+        ),
+
+        MODEL_TENSOR.C2W_PRE_OUTPUT_NORM: (
+            "code2wav.pre_transformer.norm",  # final output norm
+        ),
+
+        # Upsample blocks (4 ConvNeXt-style blocks)
+        MODEL_TENSOR.C2W_UP_CONV: (
+            "code2wav.upsample.{bid}.0.conv",  # transpose conv
+        ),
+
+        MODEL_TENSOR.C2W_UP_DWCONV: (
+            "code2wav.upsample.{bid}.1.dwconv.conv",  # depthwise conv
+        ),
+
+        MODEL_TENSOR.C2W_UP_NORM: (
+            "code2wav.upsample.{bid}.1.norm",  # layer norm
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV1: (
+            "code2wav.upsample.{bid}.1.pwconv1",  # pointwise conv 1
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV2: (
+            "code2wav.upsample.{bid}.1.pwconv2",  # pointwise conv 2
+        ),
+
+        MODEL_TENSOR.C2W_UP_GAMMA: (
+            "code2wav.upsample.{bid}.1.gamma",  # layer scale
+        ),
+
+        # Upsample biases (ConvNeXt)
+        MODEL_TENSOR.C2W_UP_CONV_B: (
+            "code2wav.upsample.{bid}.0.conv.bias",  # transpose conv bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_DWCONV_B: (
+            "code2wav.upsample.{bid}.1.dwconv.conv.bias",  # depthwise conv bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_NORM_B: (
+            "code2wav.upsample.{bid}.1.norm.bias",  # layer norm bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV1_B: (
+            "code2wav.upsample.{bid}.1.pwconv1.bias",  # pointwise conv 1 bias
+        ),
+
+        MODEL_TENSOR.C2W_UP_PWCONV2_B: (
+            "code2wav.upsample.{bid}.1.pwconv2.bias",  # pointwise conv 2 bias
+        ),
+
+        # HiFi-GAN decoder (Snake activation + residual blocks)
+        # Structure: decoder.0 = conv_in, decoder.1-4 = upsample stages,
+        #            decoder.5 = final snake, decoder.6 = conv_out
+        MODEL_TENSOR.C2W_DEC_CONV_IN: (
+            "code2wav.decoder.0.conv",  # initial conv (1024→1536)
+        ),
+
+        # Outer Snake for each stage (stage 1-4: decoder.{stage}.block.0.alpha/beta)
+        MODEL_TENSOR.C2W_DEC_SNAKE_ALPHA: (
+            "code2wav.decoder.{bid}.block.0.alpha",  # outer Snake alpha (bid = stage 1-4)
+        ),
+
+        MODEL_TENSOR.C2W_DEC_SNAKE_BETA: (
+            "code2wav.decoder.{bid}.block.0.beta",  # outer Snake beta (bid = stage 1-4)
+        ),
+
+        # Upsample conv for each stage (decoder.{stage}.block.1.conv)
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE: (
+            "code2wav.decoder.{bid}.block.1.conv",  # transpose conv for upsampling (bid = stage 1-4)
+        ),
+
+        MODEL_TENSOR.C2W_DEC_UPSAMPLE_B: (
+            "code2wav.decoder.{bid}.block.1.conv.bias",  # transpose conv bias (bid = stage 1-4)
+        ),
+
+        # ResBlock tensors - 3 blocks per stage at decoder.{stage}.block.{2,3,4}
+        # bid is flattened: stage * 10 + (block_idx - 2), so stage 1, block 2 = 10
+        # These are handled manually in converter, mappings are for output tensor names only
+        MODEL_TENSOR.C2W_DEC_BLK_ACT1_A: (
+            "code2wav.dec_blk.{bid}.act1_alpha",  # flattened from decoder.X.block.Y.act1.alpha
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_ACT1_B: (
+            "code2wav.dec_blk.{bid}.act1_beta",  # flattened from decoder.X.block.Y.act1.beta
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV1: (
+            "code2wav.dec_blk.{bid}.conv1",  # flattened from decoder.X.block.Y.conv1.conv
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_ACT2_A: (
+            "code2wav.dec_blk.{bid}.act2_alpha",  # flattened from decoder.X.block.Y.act2.alpha
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_ACT2_B: (
+            "code2wav.dec_blk.{bid}.act2_beta",  # flattened from decoder.X.block.Y.act2.beta
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV2: (
+            "code2wav.dec_blk.{bid}.conv2",  # flattened from decoder.X.block.Y.conv2.conv
+        ),
+
+        # Unused - retained for potential future use
+        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_A: (
+            "code2wav.dec_blk.{bid}.snake_alpha",  # not used by current model
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_SNAKE_B: (
+            "code2wav.dec_blk.{bid}.snake_beta",  # not used by current model
+        ),
+
+        MODEL_TENSOR.C2W_DEC_BLK_CONV: (
+            "code2wav.dec_blk.{bid}.conv",  # not used by current model
+        ),
+
+        MODEL_TENSOR.C2W_DEC_CONV_OUT: (
+            "code2wav.decoder.6.conv",  # final output conv (1536→1)
         ),
 
         # NextN/MTP tensors for GLM4_MOE

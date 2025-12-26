@@ -619,12 +619,11 @@ flowchart TB
 
 ### Test Types
 
-| Type          | Tool               | Location         | Command             |
-| ------------- | ------------------ | ---------------- | ------------------- |
-| **Unit**      | Vitest             | `tests/unit/`    | `npm run test:unit` |
-| **UI/Visual** | Storybook + Vitest | `tests/stories/` | `npm run test:ui`   |
-| **E2E**       | Playwright         | `tests/e2e/`     | `npm run test:e2e`  |
-| **Client**    | Vitest             | `tests/client/`. | `npm run test:unit` |
+| Type          | Tool               | Location                         | Command             |
+| ------------- | ------------------ | -------------------------------- | ------------------- |
+| **E2E**       | Playwright         | `tests/e2e/`                     | `npm run test:e2e`  |
+| **Unit**      | Vitest             | `tests/client/`, `tests/server/` | `npm run test:unit` |
+| **UI/Visual** | Storybook + Vitest | `tests/stories/`                 | `npm run test:ui`   |
 
 ### Running Tests
 

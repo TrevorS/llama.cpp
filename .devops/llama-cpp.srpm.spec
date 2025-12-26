@@ -39,7 +39,6 @@ make -j
 %install
 mkdir -p %{buildroot}%{_bindir}/
 cp -p llama-cli %{buildroot}%{_bindir}/llama-cli
-cp -p llama-completion %{buildroot}%{_bindir}/llama-completion
 cp -p llama-server %{buildroot}%{_bindir}/llama-server
 cp -p llama-simple %{buildroot}%{_bindir}/llama-simple
 
@@ -71,7 +70,6 @@ rm -rf %{_builddir}/*
 
 %files
 %{_bindir}/llama-cli
-%{_bindir}/llama-completion
 %{_bindir}/llama-server
 %{_bindir}/llama-simple
 /usr/lib/systemd/system/llama.service

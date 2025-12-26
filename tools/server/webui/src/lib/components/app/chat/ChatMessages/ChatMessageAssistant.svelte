@@ -244,7 +244,7 @@
 
 	<div class="info my-6 grid gap-4">
 		{#if displayedModel()}
-			<div class="inline-flex flex-wrap items-start gap-2 text-xs text-muted-foreground">
+			<span class="inline-flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
 				{#if isRouter}
 					<ModelsSelector
 						currentModel={displayedModel()}
@@ -258,13 +258,11 @@
 
 				{#if currentConfig.showMessageStats && message.timings && message.timings.predicted_n && message.timings.predicted_ms}
 					<ChatMessageStatistics
-						promptTokens={message.timings.prompt_n}
-						promptMs={message.timings.prompt_ms}
 						predictedTokens={message.timings.predicted_n}
 						predictedMs={message.timings.predicted_ms}
 					/>
 				{/if}
-			</div>
+			</span>
 		{/if}
 
 		{#if config().showToolCalls}

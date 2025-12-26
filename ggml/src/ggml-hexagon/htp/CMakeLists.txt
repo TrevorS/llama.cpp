@@ -31,8 +31,7 @@ add_library(${HTP_LIB} SHARED
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE
-    $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>
-    FP32_QUANTIZE_GROUP_SIZE=${GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE})
+    $<IF:$<BOOL:${HEXAGON_HTP_DEBUG}>,HTP_DEBUG=1,NDEBUG=1>)
 
 build_idl(htp_iface.idl ${HTP_LIB})
 

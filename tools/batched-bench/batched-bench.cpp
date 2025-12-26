@@ -55,7 +55,6 @@ int main(int argc, char ** argv) {
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
-        llama_model_free(model);
         return 1;
     }
 
@@ -109,8 +108,6 @@ int main(int argc, char ** argv) {
 
         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
             LOG_ERR("%s: llama_decode() failed\n", __func__);
-            llama_free(ctx);
-            llama_model_free(model);
             return 1;
         }
     }
@@ -150,8 +147,6 @@ int main(int argc, char ** argv) {
 
                 if (!decode_helper(ctx, batch, ctx_params.n_batch, false)) {
                     LOG_ERR("%s: llama_decode() failed\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(model);
                     return 1;
                 }
 
@@ -170,8 +165,6 @@ int main(int argc, char ** argv) {
                         common_batch_add(batch, get_token_rand(), pp + 0, { 0 }, true);
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
-                            llama_free(ctx);
-                            llama_model_free(model);
                             return 1;
                         }
                         llama_memory_seq_rm(mem, 0, pp, -1);
@@ -191,8 +184,6 @@ int main(int argc, char ** argv) {
 
                             if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                                 LOG_ERR("%s: llama_decode() failed\n", __func__);
-                                llama_free(ctx);
-                                llama_model_free(model);
                                 return 1;
                             }
                         }
@@ -209,8 +200,6 @@ int main(int argc, char ** argv) {
 
                         if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
                             LOG_ERR("%s: llama_decode() failed\n", __func__);
-                            llama_free(ctx);
-                            llama_model_free(model);
                             return 1;
                         }
                     }

@@ -88,10 +88,8 @@ add_library(llama
             models/llama-iswa.cpp
             models/llama.cpp
             models/mamba.cpp
-            models/mimo2-iswa.cpp
             models/minicpm3.cpp
             models/minimax-m2.cpp
-            models/modern-bert.cpp
             models/mpt.cpp
             models/nemotron-h.cpp
             models/nemotron.cpp
@@ -117,6 +115,7 @@ add_library(llama
             models/qwen3vl-moe.cpp
             models/qwen3moe.cpp
             models/qwen3next.cpp
+            models/qwen3omni_talker.cpp
             models/refact.cpp
             models/rnd1.cpp
             models/rwkv6-base.cpp

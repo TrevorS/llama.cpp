@@ -35,7 +35,7 @@
 
 <div class="flex items-center gap-1 {className}">
 	<DropdownMenu.Root>
-		<DropdownMenu.Trigger name="Attach files" {disabled}>
+		<DropdownMenu.Trigger name="Attach files">
 			<Tooltip.Root>
 				<Tooltip.Trigger>
 					<Button

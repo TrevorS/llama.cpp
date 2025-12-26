@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "clip-model.h"
+#include "clip-impl.h"
 
 #include <cstdint>
 #include <vector>
@@ -18,9 +19,10 @@ struct mtmd_audio_mel {
 };
 
 struct mtmd_audio_preprocessor {
+    const clip_ctx * ctx;
     const clip_hparams & hparams;
 
-    mtmd_audio_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)) {}
+    mtmd_audio_preprocessor(const clip_ctx * ctx_): ctx(ctx_), hparams(*clip_get_hparams(ctx_)) {}
 
     virtual ~mtmd_audio_preprocessor() = default;
     virtual void initialize() = 0; // NOT thread-safe
@@ -29,12 +31,6 @@ struct mtmd_audio_preprocessor {
 
 struct mtmd_audio_preprocessor_whisper : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_whisper(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
-    void initialize() override;
-    bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
-};
-
-struct mtmd_audio_preprocessor_conformer : mtmd_audio_preprocessor {
-    mtmd_audio_preprocessor_conformer(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
 };

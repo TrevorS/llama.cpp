@@ -11,8 +11,6 @@ flowchart TB
         C_Screen["ChatScreen"]
         C_Form["ChatForm"]
         C_Messages["ChatMessages"]
-        C_Message["ChatMessage"]
-        C_MessageEditForm["ChatMessageEditForm"]
         C_ModelsSelector["ModelsSelector"]
         C_Settings["ChatSettings"]
     end
@@ -56,9 +54,7 @@ flowchart TB
 
     %% Component hierarchy
     C_Screen --> C_Form & C_Messages & C_Settings
-    C_Messages --> C_Message
-    C_Message --> C_MessageEditForm
-    C_Form & C_MessageEditForm --> C_ModelsSelector
+    C_Form & C_Messages --> C_ModelsSelector
 
     %% Components → Hooks → Stores
     C_Form & C_Messages --> H1 & H2
@@ -97,7 +93,7 @@ flowchart TB
     classDef apiStyle fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
 
     class R1,R2,RL routeStyle
-    class C_Sidebar,C_Screen,C_Form,C_Messages,C_Message,C_MessageEditForm,C_ModelsSelector,C_Settings componentStyle
+    class C_Sidebar,C_Screen,C_Form,C_Messages,C_ModelsSelector,C_Settings componentStyle
     class H1,H2 hookStyle
     class S1,S2,S3,S4,S5 storeStyle
     class SV1,SV2,SV3,SV4,SV5 serviceStyle

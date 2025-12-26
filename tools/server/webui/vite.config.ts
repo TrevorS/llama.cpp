@@ -125,9 +125,9 @@ export default defineConfig({
 			{
 				extends: './vite.config.ts',
 				test: {
-					name: 'unit',
+					name: 'server',
 					environment: 'node',
-					include: ['tests/unit/**/*.{test,spec}.{js,ts}']
+					include: ['tests/server/**/*.{test,spec}.{js,ts}']
 				}
 			},
 			{

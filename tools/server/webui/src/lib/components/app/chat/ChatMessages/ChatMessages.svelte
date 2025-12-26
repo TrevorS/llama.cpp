@@ -66,14 +66,10 @@
 		await conversationsStore.navigateToSibling(siblingId);
 	}
 
-	async function handleEditWithBranching(
-		message: DatabaseMessage,
-		newContent: string,
-		newExtras?: DatabaseMessageExtra[]
-	) {
+	async function handleEditWithBranching(message: DatabaseMessage, newContent: string) {
 		onUserAction?.();
 
-		await chatStore.editMessageWithBranching(message.id, newContent, newExtras);
+		await chatStore.editMessageWithBranching(message.id, newContent);
 
 		refreshAllMessages();
 	}
@@ -108,12 +104,11 @@
 
 	async function handleEditUserMessagePreserveResponses(
 		message: DatabaseMessage,
-		newContent: string,
-		newExtras?: DatabaseMessageExtra[]
+		newContent: string
 	) {
 		onUserAction?.();
 
-		await chatStore.editUserMessagePreserveResponses(message.id, newContent, newExtras);
+		await chatStore.editUserMessagePreserveResponses(message.id, newContent);
 
 		refreshAllMessages();
 	}

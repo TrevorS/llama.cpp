@@ -166,7 +166,7 @@ def main():
     # Load the python model to get configuration information and also to load the tokenizer.
     print("Loading model and tokenizer using AutoTokenizer:", args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(args.model_path)
 
     if unreleased_model_name:
         model_name_lower = unreleased_model_name.lower()
@@ -186,9 +186,9 @@ def main():
             exit(1)
     else:
         if args.causal:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(args.model_path)
         else:
-            model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True)
+            model = AutoModel.from_pretrained(args.model_path)
 
     encoded = tokenizer(prompt, return_tensors="pt")
     tokens = tokenizer.convert_ids_to_tokens(encoded['input_ids'][0])

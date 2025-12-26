@@ -2,14 +2,12 @@
 
 #include "common.h"
 #include "preset.h"
-#include "server-common.h"
 #include "server-http.h"
 
 #include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <memory>
-#include <set>
 
 /**
  * state diagram:
@@ -52,12 +50,14 @@ static std::string server_model_status_to_string(server_model_status status) {
 struct server_model_meta {
     common_preset preset;
     std::string name;
+    std::string path;
+    std::string path_mmproj; // only available if in_cache=false
+    bool in_cache = false; // if true, use -hf; use -m otherwise
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
-    int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
 
     bool is_active() const {
         return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING;
@@ -66,8 +66,19 @@ struct server_model_meta {
     bool is_failed() const {
         return status == SERVER_MODEL_STATUS_UNLOADED && exit_code != 0;
     }
+};
 
-    void update_args(common_preset_context & ctx_presets, std::string bin_path);
+// the server_presets struct holds the presets read from presets.ini
+// as well as base args from the router server
+struct server_presets {
+    common_presets presets;
+    common_params_context ctx_params;
+    std::map<common_arg, std::string> base_args;
+    std::map<std::string, common_arg> control_args; // args reserved for server control
+
+    server_presets(int argc, char ** argv, common_params & base_params, const std::string & models_dir);
+    common_preset get_preset(const std::string & name);
+    void render_args(server_model_meta & meta);
 };
 
 struct subprocess_s;
@@ -85,16 +96,11 @@ private:
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
 
-    // for stopping models
-    std::condition_variable cv_stop;
-    std::set<std::string> stopping_models;
-
-    common_preset_context ctx_preset;
-
     common_params base_params;
-    std::string bin_path;
+    std::vector<std::string> base_args;
     std::vector<std::string> base_env;
-    common_preset base_preset; // base preset from llama-server CLI args
+
+    server_presets presets;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -109,29 +115,27 @@ public:
 
     void load_models();
 
-    // check if a model instance exists (thread-safe)
+    // check if a model instance exists
     bool has_model(const std::string & name);
 
-    // return a copy of model metadata (thread-safe)
+    // return a copy of model metadata
     std::optional<server_model_meta> get_meta(const std::string & name);
 
-    // return a copy of all model metadata (thread-safe)
+    // return a copy of all model metadata
     std::vector<server_model_meta> get_all_meta();
 
-    // load and unload model instances
-    // these functions are thread-safe
     void load(const std::string & name);
     void unload(const std::string & name);
     void unload_all();
 
-    // update the status of a model instance (thread-safe)
-    void update_status(const std::string & name, server_model_status status, int exit_code);
+    // update the status of a model instance
+    void update_status(const std::string & name, server_model_status status);
 
-    // wait until the model instance is fully loaded (thread-safe)
+    // wait until the model instance is fully loaded
     // return when the model is loaded or failed to load
     void wait_until_loaded(const std::string & name);
 
-    // load the model if not loaded, otherwise do nothing (thread-safe)
+    // load the model if not loaded, otherwise do nothing
     // return false if model is already loaded; return true otherwise (meta may need to be refreshed)
     bool ensure_model_loaded(const std::string & name);
 
@@ -140,23 +144,14 @@ public:
 
     // notify the router server that a model instance is ready
     // return the monitoring thread (to be joined by the caller)
-    static std::thread setup_child_server(const std::function<void(int)> & shutdown_handler);
+    static std::thread setup_child_server(const common_params & base_params, int router_port, const std::string & name, std::function<void(int)> & shutdown_handler);
 };
 
 struct server_models_routes {
     common_params params;
-    json webui_settings = json::object();
     server_models models;
     server_models_routes(const common_params & params, int argc, char ** argv, char ** envp)
             : params(params), models(params, argc, argv, envp) {
-        if (!this->params.webui_config_json.empty()) {
-            try {
-                webui_settings = json::parse(this->params.webui_config_json);
-            } catch (const std::exception & e) {
-                LOG_ERR("%s: failed to parse webui config: %s\n", __func__, e.what());
-                throw;
-            }
-        }
         init_routes();
     }
 
@@ -167,6 +162,7 @@ struct server_models_routes {
     server_http_context::handler_t proxy_post;
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
+    server_http_context::handler_t post_router_models_status;
     server_http_context::handler_t post_router_models_unload;
 };
 

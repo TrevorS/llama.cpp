@@ -43,11 +43,13 @@ llama_context::llama_context(
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.embeddings       = params.embeddings;
-    cparams.offload_kqv      = params.offload_kqv;
-    cparams.no_perf          = params.no_perf;
-    cparams.pooling_type     = params.pooling_type;
-    cparams.warmup           = false;
+    cparams.embeddings           = params.embeddings;
+    cparams.offload_kqv          = params.offload_kqv;
+    cparams.no_perf              = params.no_perf;
+    cparams.pooling_type         = params.pooling_type;
+    cparams.n_layer_output       = params.n_layer_output;
+    cparams.warmup               = false;
+    cparams.debug_layer_outputs  = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -459,22 +461,23 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    if (!model.hparams.no_alloc) {
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            ggml_backend_t             backend = backend_ptrs[i];
-            ggml_backend_buffer_type_t buft    = backend_buft[i];
+    // FIXME this currently results in a use-after-free bug if the model is freed before the context
+    // if (!model.hparams.no_alloc) {
+    //     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+    //         ggml_backend_t             backend = backend_ptrs[i];
+    //         ggml_backend_buffer_type_t buft    = backend_buft[i];
 
-            const size_t size_exp = backend_buf_exp_size[i];
-            const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
-                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-            } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
-                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-            }
-        }
-    }
+    //         const size_t size_exp = backend_buf_exp_size[i];
+    //         const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+    //         if (size_exp == size_act) {
+    //             LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+    //                 __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+    //         } else {
+    //             LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
+    //                 __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+    //         }
+    //     }
+    // }
     ggml_opt_free(opt_ctx);
 }
 
@@ -765,6 +768,12 @@ void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.warmup = value;
+}
+
+void llama_context::set_debug_layer_outputs(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.debug_layer_outputs = value;
 }
 
 void llama_context::set_adapter_lora(
@@ -1449,6 +1458,10 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+llm_graph_result * llama_context::get_gf_res_prev() const {
+    return static_cast<llm_graph_result *>(gf_res_prev.get());
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -1559,6 +1572,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // Mark layer outputs for debugging (prevents buffer reuse)
+        if (cparams.debug_layer_outputs) {
+            if (strcmp(name, "l_out") == 0 ||
+                strcmp(name, "ffn_inp") == 0 ||
+                strcmp(name, "ffn_norm") == 0 ||
+                strcmp(name, "ffn_moe_out") == 0 ||
+                strcmp(name, "ffn_shexp") == 0 ||
+                strcmp(name, "ffn_moe_shexp_out") == 0 ||
+                strcmp(name, "ffn_moe_logits") == 0 ||
+                strcmp(name, "ffn_moe_probs") == 0) {
+                ggml_set_output(cur);
+            }
         }
 
         if (!cparams.offload_kqv) {
@@ -2379,6 +2406,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
+        /*.n_layer_output              =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
@@ -2536,6 +2564,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_debug_layer_outputs(llama_context * ctx, bool debug_layer_outputs) {
+    ctx->set_debug_layer_outputs(debug_layer_outputs);
 }
 
 void llama_synchronize(llama_context * ctx) {

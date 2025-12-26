@@ -110,6 +110,7 @@ class SafetensorRemote:
     """
 
     BASE_DOMAIN = "https://huggingface.co"
+    ALIGNMENT = 8 # bytes
 
     @classmethod
     def get_list_tensors_hf_model(cls, model_id: str) -> dict[str, RemoteTensor]:
@@ -203,6 +204,9 @@ class SafetensorRemote:
 
         # Calculate the data start offset
         data_start_offset = 8 + metadata_length
+        alignment = SafetensorRemote.ALIGNMENT
+        if data_start_offset % alignment != 0:
+            data_start_offset += alignment - (data_start_offset % alignment)
 
         # Check if we have enough data to read the metadata
         if len(raw_data) < 8 + metadata_length:
@@ -284,7 +288,7 @@ class LocalTensor:
     data_range: LocalTensorRange
 
     def mmap_bytes(self) -> np.ndarray:
-        return np.memmap(self.data_range.filename, mode='c', offset=self.data_range.offset, shape=self.data_range.size)
+        return np.memmap(self.data_range.filename, offset=self.data_range.offset, shape=self.data_range.size)
 
 
 class SafetensorsLocal:
@@ -294,6 +298,7 @@ class SafetensorsLocal:
         Custom parsing gives a bit more control over the memory usage.
         The official safetensors library doesn't expose file ranges.
     """
+    ALIGNMENT = 8  # bytes
 
     tensors: dict[str, LocalTensor]
 
@@ -311,6 +316,9 @@ class SafetensorsLocal:
                 raise ValueError(f"Failed to parse safetensors metadata as JSON: {e}")
 
             data_start_offset = f.tell()
+            alignment = self.ALIGNMENT
+            if data_start_offset % alignment != 0:
+                data_start_offset += alignment - (data_start_offset % alignment)
 
             tensors: dict[str, LocalTensor] = {}
             for name, meta in metadata.items():

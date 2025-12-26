@@ -124,10 +124,3 @@ declare global {
 		SettingsConfigType
 	};
 }
-
-declare global {
-	interface Window {
-		idxThemeStyle?: number;
-		idxCodeBlock?: number;
-	}
-}

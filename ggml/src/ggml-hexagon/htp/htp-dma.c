@@ -34,12 +34,12 @@ dma_queue * dma_queue_create(size_t capacity) {
     q->desc = (hexagon_udma_descriptor_type1_t *) memalign(64, capacity * sizeof(hexagon_udma_descriptor_type1_t));
     memset(q->desc, 0, capacity * sizeof(hexagon_udma_descriptor_type1_t));
 
-    q->dptr = (dma_ptr *) memalign(4, capacity * sizeof(dma_ptr));
-    memset(q->dptr, 0, capacity * sizeof(dma_ptr));
+    q->dst = (void **) memalign(4, capacity * sizeof(void *));
+    memset(q->dst, 0, capacity * sizeof(void *));
 
     q->tail = &q->desc[capacity - 1];
 
-    if (!q->desc && !q->dptr) {
+    if (!q->desc && !q->dst) {
         FARF(ERROR, "%s: failed to allocate DMA queue items\n", __FUNCTION__);
         return NULL;
     }
@@ -54,10 +54,16 @@ void dma_queue_delete(dma_queue * q) {
         return;
     }
     free(q->desc);
-    free(q->dptr);
+    free(q->dst);
     free(q);
 }
 
 void dma_queue_flush(dma_queue * q) {
-    while (dma_queue_pop(q).dst != NULL) ;
+    while (1) {
+        uint32_t s = dmwait() & 0x3;
+        if (s == HEXAGON_UDMA_DM0_STATUS_IDLE) {
+            break;
+        }
+    }
+    q->tail = NULL;
 }

@@ -209,6 +209,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    ctx_cli.ctx_server.init();
+
     console::spinner::stop();
     console::log("\n");
 
@@ -216,7 +218,7 @@ int main(int argc, char ** argv) {
         ctx_cli.ctx_server.start_loop();
     });
 
-    auto inf = ctx_cli.ctx_server.get_meta();
+    auto inf = ctx_cli.ctx_server.get_info();
     std::string modalities = "text";
     if (inf.has_inp_image) {
         modalities += ", vision";

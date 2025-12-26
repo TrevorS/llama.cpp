@@ -84,6 +84,9 @@ struct llama_hparams {
     uint32_t moe_every_n_layers   = 0;
     uint32_t nextn_predict_layers = 0;
 
+    // Qwen3-Omni Talker: dimension of the Thinker hidden state
+    uint32_t n_thinker_hidden = 0;
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
@@ -123,11 +126,10 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
-    // if swa_layers[il] == 1, then layer il is SWA
-    // if swa_layers[il] == 0, then layer il is dense (i.e. non-SWA)
+    // if swa_layers[il] == true, then layer il is SWA
+    // if swa_layers[il] == false, then layer il is dense (i.e. non-SWA)
     // by default, all layers are dense
-    // note: using uint32_t type for compatibility reason
-    std::array<uint32_t, LLAMA_MAX_LAYERS> swa_layers;
+    std::array<bool, LLAMA_MAX_LAYERS> swa_layers;
 
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
@@ -271,8 +273,6 @@ struct llama_hparams {
     // TODO: think of a better place for this function
     // TODO: pack the SWA params in a struct?
     static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1);
-
-    bool use_mrope() const;
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");

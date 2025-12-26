@@ -8,6 +8,9 @@ add_library(mtmd
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
+            mtmd-tts.cpp
+            mtmd-tts-code2wav.cpp
+            mtmd-tts.h
             clip.cpp
             clip.h
             clip-impl.h
@@ -15,8 +18,6 @@ add_library(mtmd
             clip-graph.h
             models/models.h
             models/cogvlm.cpp
-            models/conformer.cpp
-            models/glm4v.cpp
             models/internvl.cpp
             models/kimivl.cpp
             models/llama4.cpp
@@ -25,6 +26,7 @@ add_library(mtmd
             models/pixtral.cpp
             models/qwen2vl.cpp
             models/qwen3vl.cpp
+            models/qwen3omni-audio.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
             )
@@ -39,6 +41,7 @@ target_link_libraries     (mtmd PUBLIC ggml llama)
 target_link_libraries     (mtmd PRIVATE Threads::Threads)
 target_include_directories(mtmd PUBLIC  .)
 target_include_directories(mtmd PRIVATE ../..)
+target_include_directories(mtmd PRIVATE ../../src)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
@@ -51,6 +54,7 @@ endif()
 set(MTMD_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-tts.h
     )
 
 set_target_properties(mtmd

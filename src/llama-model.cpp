@@ -31,14 +31,12 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_17M:           return "17M";
         case LLM_TYPE_22M:           return "22M";
         case LLM_TYPE_33M:           return "33M";
-        case LLM_TYPE_47M:           return "47M";
         case LLM_TYPE_60M:           return "60M";
         case LLM_TYPE_70M:           return "70M";
         case LLM_TYPE_80M:           return "80M";
         case LLM_TYPE_109M:          return "109M";
         case LLM_TYPE_137M:          return "137M";
         case LLM_TYPE_140M:          return "140M";
-        case LLM_TYPE_149M:          return "149M";
         case LLM_TYPE_160M:          return "160M";
         case LLM_TYPE_190M:          return "190M";
         case LLM_TYPE_220M:          return "220M";
@@ -48,7 +46,6 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_335M:          return "335M";
         case LLM_TYPE_350M:          return "350M";
         case LLM_TYPE_360M:          return "360M";
-        case LLM_TYPE_395M:          return "395M";
         case LLM_TYPE_410M:          return "410M";
         case LLM_TYPE_450M:          return "450M";
         case LLM_TYPE_475M:          return "475M";
@@ -123,14 +120,12 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_16B_A1B:       return "16B.A1B";
         case LLM_TYPE_21B_A3B:       return "21B.A3B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
-        case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
         case LLM_TYPE_80B_A3B:       return "80B.A3B";
         case LLM_TYPE_100B_A6B:      return "100B.A6B";
         case LLM_TYPE_106B_A12B:     return "106B.A12B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
         case LLM_TYPE_235B_A22B:     return "235B.A22B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
-        case LLM_TYPE_310B_A15B:     return "310B.A15B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_E2B:           return "E2B";
         case LLM_TYPE_E4B:           return "E4B";
@@ -607,7 +602,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
         ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot, false);
 
-        if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON || arch == LLM_ARCH_LLAMA_EMBED) {
+        if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON) {
             if (hparams.n_rot != hparams.n_embd_head_k) {
                 throw std::runtime_error(format("invalid n_rot: %u, expected %u", hparams.n_rot, hparams.n_embd_head_k));
             }
@@ -631,7 +626,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     // arch-specific KVs
     switch (arch) {
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_LLAMA_EMBED:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -880,34 +874,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
-        case LLM_ARCH_MODERN_BERT:
-            {
-                const bool found_swa = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
-                if (found_swa && hparams.n_swa > 0) {
-                    uint32_t swa_period = 3;
-                    hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;
-
-                    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa);
-                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false);
-                    hparams.set_swa_pattern(swa_period);
-                } else {
-                    hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-                }
-
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
-                ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn);
-                ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type, false);
-
-                switch (hparams.n_layer) {
-                    case 12:
-                        type = LLM_TYPE_47M; break; // granite-embedding-small
-                    case 22:
-                        type = LLM_TYPE_149M; break; // modern-bert-base
-                    case 28:
-                        type = LLM_TYPE_395M; break; // modern-bert-large
-                    default: type = LLM_TYPE_UNKNOWN;
-                }
-            } break;
         case LLM_ARCH_JINA_BERT_V2:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,    hparams.f_norm_eps);
@@ -1141,6 +1107,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 switch (hparams.n_layer) {
                     case 48: type = LLM_TYPE_30B_A3B; break;
                     case 94: type = LLM_TYPE_235B_A22B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_QWEN3OMNI_TALKER:
+            {
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_TALKER_THINKER_HIDDEN_SIZE, hparams.n_thinker_hidden, false);
+                // Talker is a 20-layer MoE transformer
+                switch (hparams.n_layer) {
+                    case 20: type = LLM_TYPE_UNKNOWN; break; // Talker-specific, no standard size
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_QWEN3OMNIMOE:
+            {
+                // Qwen3-Omni Thinker: Qwen3MOE with M-RoPE and shared experts
+                // Qwen3-Omni uses 3 active M-RoPE sections [24, 20, 20, 0] (4th is padding)
+                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                switch (hparams.n_layer) {
+                    case 48: type = LLM_TYPE_30B_A3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -1722,8 +1713,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_GLM4:
             {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
-                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 switch (hparams.n_layer) {
                     case 40: type = LLM_TYPE_9B; break;
                     case 61: type = LLM_TYPE_32B; break;
@@ -1732,9 +1722,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_GLM4_MOE:
             {
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
-                ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
                 // MoE parameters
                 ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert);
@@ -1833,7 +1822,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 }
             } break;
         case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
             {
                 ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
                 ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
@@ -1849,14 +1837,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp,        false);
-                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp,      false);
-                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
-
                 switch (hparams.n_layer) {
-                    case 52: type = LLM_TYPE_31B_A3_5B; break; // Nemotron-H_MOE 31B
                     case 56: type = LLM_TYPE_9B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
@@ -2340,22 +2321,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
-        case LLM_ARCH_MIMO2:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-
-                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
-                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,   hparams.n_swa);
-                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,         hparams.rope_freq_base_train_swa);
-                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
-
-                switch (hparams.n_layer) {
-                    case 48: type = LLM_TYPE_310B_A15B; break;
-                    default: type = LLM_TYPE_UNKNOWN;
-                }
-            } break;
         default: throw std::runtime_error("unsupported model architecture");
     }
 
@@ -2427,10 +2392,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
-    const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
+    const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, (int)n_layer + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
-        const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
+        const bool is_swa = il < (int) hparams.n_layer && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -2591,7 +2556,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     buft_list = pimpl->dev_output.buft_list;
                     break;
                 case LLM_TENSOR_LAYER_REPEATING:
-                    buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+                    // For vocoder/decoder components that use block IDs outside the main layer range,
+                    // fall back to the input device. This handles Code2Wav decoder blocks (bid=1-4, 10-42)
+                    // which don't correspond to main transformer layer indices.
+                    LLAMA_LOG_DEBUG("%s: REPEATING tensor %s bid=%d dev_layer.size()=%zu\n",
+                                   __func__, tn.str().c_str(), tn.bid, pimpl->dev_layer.size());
+                    if (tn.bid >= 0 && tn.bid < (int)pimpl->dev_layer.size()) {
+                        buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+                    } else {
+                        LLAMA_LOG_DEBUG("%s: bid %d out of range, using input device\n", __func__, tn.bid);
+                        buft_list = pimpl->dev_input.buft_list;
+                    }
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
@@ -2670,7 +2645,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_GRANITE:
             case LLM_ARCH_GRANITE_MOE:
             case LLM_ARCH_MISTRAL3:
-            case LLM_ARCH_LLAMA_EMBED:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -3205,37 +3179,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.layer_out_norm_b = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM, "bias", i),   {n_embd}, 0);
                     }
                 } break;
-            case LLM_ARCH_MODERN_BERT:
-                {
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-                    tok_norm = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM, "weight"), {n_embd}, 0);
-
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-
-                    for(int i = 0; i < n_layer; ++i) {
-                        auto& layer = layers[i];
-
-                        if ( i != 0 ) {
-                            layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-                        } else{
-                            // layer 0 uses identity
-                            layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
-                        }
-
-
-                        layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, 3 * n_embd }, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT,   "weight", i), {n_embd, n_embd}, 0);
-
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, 2 * n_ff}, 0);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-                    }
-
-                    cls       = create_tensor(tn(LLM_TENSOR_CLS,     "weight"), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
-                    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
-                    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   {hparams.n_cls_out},         TENSOR_NOT_REQUIRED);
-
-                } break;
             case LLM_ARCH_NEO_BERT:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
@@ -3620,6 +3563,278 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                    }
+                } break;
+            case LLM_ARCH_QWEN3OMNI_TALKER:
+                {
+                    // Main Talker MoE transformer (20 layers)
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    // Talker projection layers
+                    // These project from Thinker hidden dim (n_thinker_hidden) to Talker n_embd
+                    // fc1: [n_thinker_hidden, n_thinker_hidden], fc2: [n_thinker_hidden, n_embd]
+                    const int64_t n_th = hparams.n_thinker_hidden ? hparams.n_thinker_hidden : n_embd;
+                    talker_text_proj_fc1   = create_tensor(tn(LLM_TENSOR_TALKER_TEXT_PROJ_FC1,   "weight"), {n_th, n_th}, TENSOR_NOT_REQUIRED);
+                    talker_text_proj_fc1_b = create_tensor(tn(LLM_TENSOR_TALKER_TEXT_PROJ_FC1,   "bias"),   {n_th}, TENSOR_NOT_REQUIRED);
+                    talker_text_proj_fc2   = create_tensor(tn(LLM_TENSOR_TALKER_TEXT_PROJ_FC2,   "weight"), {n_th, n_embd}, TENSOR_NOT_REQUIRED);
+                    talker_text_proj_fc2_b = create_tensor(tn(LLM_TENSOR_TALKER_TEXT_PROJ_FC2,   "bias"),   {n_embd}, TENSOR_NOT_REQUIRED);
+                    talker_hidden_proj_fc1 = create_tensor(tn(LLM_TENSOR_TALKER_HIDDEN_PROJ_FC1, "weight"), {n_th, n_th}, TENSOR_NOT_REQUIRED);
+                    talker_hidden_proj_fc1_b = create_tensor(tn(LLM_TENSOR_TALKER_HIDDEN_PROJ_FC1, "bias"), {n_th}, TENSOR_NOT_REQUIRED);
+                    talker_hidden_proj_fc2 = create_tensor(tn(LLM_TENSOR_TALKER_HIDDEN_PROJ_FC2, "weight"), {n_th, n_embd}, TENSOR_NOT_REQUIRED);
+                    talker_hidden_proj_fc2_b = create_tensor(tn(LLM_TENSOR_TALKER_HIDDEN_PROJ_FC2, "bias"), {n_embd}, TENSOR_NOT_REQUIRED);
+                    talker_codec_head      = create_tensor(tn(LLM_TENSOR_TALKER_CODEC_HEAD,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // Talker codec embeddings (16 codebooks)
+                    talker_codec_embd.resize(16);
+                    for (int i = 0; i < 16; ++i) {
+                        talker_codec_embd[i] = create_tensor(tn(LLM_TENSOR_TALKER_CODEC_EMBD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Main MoE layers
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+
+                        const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+                        // Shared expert
+                        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+                        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i), {n_embd, 1}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Code Predictor tensors (5-layer transformer for codebooks 2-16)
+                    // Code Predictor has: n_embd=1024, n_head=16, n_head_kv=8, head_dim=128, n_ff=3072, vocab=2048
+                    const int64_t cp_n_embd = n_embd;  // 1024
+                    const int64_t cp_n_head = 16;
+                    const int64_t cp_n_head_kv = 8;
+                    const int64_t cp_head_dim = 128;
+                    const int64_t cp_n_ff = 3072;
+                    const int64_t cp_vocab = 2048;
+                    const int cp_n_layer = 5;
+
+                    // Codec embeddings (15 for codebooks 1-15, indices 0-14)
+                    // Note: Codebook 0 comes from the Talker's main tok_embd, not Code Predictor
+                    talker_cp_codec_embd.resize(15);
+                    for (int i = 0; i < 15; ++i) {
+                        talker_cp_codec_embd[i] = create_tensor(tn(LLM_TENSOR_TALKER_CP_CODEC_EMBD, "weight", i), {cp_n_embd, cp_vocab}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Output norm
+                    talker_cp_output_norm = create_tensor(tn(LLM_TENSOR_TALKER_CP_OUTPUT_NORM, "weight"), {cp_n_embd}, TENSOR_NOT_REQUIRED);
+
+                    // LM heads (15 for codebooks 2-16, indices 0-14)
+                    talker_cp_lm_head.resize(15);
+                    for (int i = 0; i < 15; ++i) {
+                        talker_cp_lm_head[i] = create_tensor(tn(LLM_TENSOR_TALKER_CP_LM_HEAD, "weight", i), {cp_n_embd, cp_vocab}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Code Predictor layers (5 layers)
+                    talker_cp_layers.resize(cp_n_layer);
+                    for (int i = 0; i < cp_n_layer; ++i) {
+                        auto & layer = talker_cp_layers[i];
+
+                        layer.attn_norm   = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_NORM, "weight", i), {cp_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.wq          = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_Q, "weight", i), {cp_n_embd, cp_n_head * cp_head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.wk          = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_K, "weight", i), {cp_n_embd, cp_n_head_kv * cp_head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.wv          = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_V, "weight", i), {cp_n_embd, cp_n_head_kv * cp_head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.wo          = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_OUT, "weight", i), {cp_n_head * cp_head_dim, cp_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_Q_NORM, "weight", i), {cp_head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_TALKER_CP_ATTN_K_NORM, "weight", i), {cp_head_dim}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_norm    = create_tensor(tn(LLM_TENSOR_TALKER_CP_FFN_NORM, "weight", i), {cp_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_gate    = create_tensor(tn(LLM_TENSOR_TALKER_CP_FFN_GATE, "weight", i), {cp_n_embd, cp_n_ff}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up      = create_tensor(tn(LLM_TENSOR_TALKER_CP_FFN_UP, "weight", i), {cp_n_embd, cp_n_ff}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down    = create_tensor(tn(LLM_TENSOR_TALKER_CP_FFN_DOWN, "weight", i), {cp_n_ff, cp_n_embd}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Code2Wav vocoder tensors (HiFi-GAN style)
+                    const int64_t c2w_n_embd = 1024;
+                    const int64_t c2w_n_ff = 3072;
+                    const int c2w_pre_n_layer = 8;
+                    const int c2w_up_n_block = 2;  // ConvNeXt upsample blocks
+
+                    // Code2Wav code embedding (all 16 codebooks × 2048 vocab concatenated)
+                    c2w_code_embd = create_tensor(tn(LLM_TENSOR_C2W_CODE_EMBD, "weight"), {c2w_n_embd, 32768}, TENSOR_NOT_REQUIRED);
+
+                    // Pre-transformer (8 layers with LayerScale)
+                    c2w_pre_layers.resize(c2w_pre_n_layer);
+                    for (int i = 0; i < c2w_pre_n_layer; ++i) {
+                        auto & layer = c2w_pre_layers[i];
+                        layer.attn_norm  = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_NORM, "weight", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.wq         = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_Q, "weight", i), {c2w_n_embd, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.wk         = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_K, "weight", i), {c2w_n_embd, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.wv         = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_V, "weight", i), {c2w_n_embd, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.wo         = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_OUT, "weight", i), {c2w_n_embd, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.attn_scale = create_tensor(tn(LLM_TENSOR_C2W_PRE_ATTN_SCALE, i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_C2W_PRE_FFN_NORM, "weight", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_gate   = create_tensor(tn(LLM_TENSOR_C2W_PRE_FFN_GATE, "weight", i), {c2w_n_embd, c2w_n_ff}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up     = create_tensor(tn(LLM_TENSOR_C2W_PRE_FFN_UP, "weight", i), {c2w_n_embd, c2w_n_ff}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down   = create_tensor(tn(LLM_TENSOR_C2W_PRE_FFN_DOWN, "weight", i), {c2w_n_ff, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_scale  = create_tensor(tn(LLM_TENSOR_C2W_PRE_FFN_SCALE, i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                    }
+                    c2w_pre_output_norm = create_tensor(tn(LLM_TENSOR_C2W_PRE_OUTPUT_NORM, "weight"), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+
+                    // Upsample blocks (ConvNeXt style) - both blocks have same shapes
+                    const int64_t c2w_up_conv_kernel = 2;  // transpose conv kernel
+                    const int64_t c2w_up_dwconv_kernel = 7;
+                    const int64_t c2w_up_ff = 4096;  // pwconv expansion
+                    c2w_up_blocks.resize(c2w_up_n_block);
+                    for (int i = 0; i < c2w_up_n_block; ++i) {
+                        auto & block = c2w_up_blocks[i];
+                        block.conv         = create_tensor(tn(LLM_TENSOR_C2W_UP_CONV, "weight", i), {c2w_up_conv_kernel, c2w_n_embd, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.conv_bias    = create_tensor(tn(LLM_TENSOR_C2W_UP_CONV, "bias", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        // dwconv weight is permuted in GGUF converter: [C,1,K] -> [K,1,C] in PyTorch, saves as {C,1,K} in GGML
+                        block.dwconv       = create_tensor(tn(LLM_TENSOR_C2W_UP_DWCONV, "weight", i), {c2w_n_embd, 1, c2w_up_dwconv_kernel}, TENSOR_NOT_REQUIRED);
+                        block.dwconv_bias  = create_tensor(tn(LLM_TENSOR_C2W_UP_DWCONV, "bias", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.norm         = create_tensor(tn(LLM_TENSOR_C2W_UP_NORM, "weight", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.norm_bias    = create_tensor(tn(LLM_TENSOR_C2W_UP_NORM, "bias", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.pwconv1      = create_tensor(tn(LLM_TENSOR_C2W_UP_PWCONV1, "weight", i), {c2w_n_embd, c2w_up_ff}, TENSOR_NOT_REQUIRED);
+                        block.pwconv1_bias = create_tensor(tn(LLM_TENSOR_C2W_UP_PWCONV1, "bias", i), {c2w_up_ff}, TENSOR_NOT_REQUIRED);
+                        block.pwconv2      = create_tensor(tn(LLM_TENSOR_C2W_UP_PWCONV2, "weight", i), {c2w_up_ff, c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.pwconv2_bias = create_tensor(tn(LLM_TENSOR_C2W_UP_PWCONV2, "bias", i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                        block.gamma        = create_tensor(tn(LLM_TENSOR_C2W_UP_GAMMA, i), {c2w_n_embd}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // Decoder (HiFi-GAN with Snake activation)
+                    // Dimensions based on Qwen3-Omni vocoder config
+                    const int64_t c2w_dec_dim = 1536;       // decoder hidden dimension
+                    const int64_t c2w_dec_n_stage = 4;      // 4 upsample stages with rates [8, 5, 4, 3]
+                    const int64_t c2w_dec_n_resblk = 3;     // 3 residual blocks per stage
+
+                    // Initial conv: 1024 -> 1536
+                    c2w_dec_conv_in   = create_tensor(tn(LLM_TENSOR_C2W_DEC_CONV_IN, "weight"), {7, c2w_n_embd, c2w_dec_dim}, TENSOR_NOT_REQUIRED);
+                    c2w_dec_conv_in_b = create_tensor(tn(LLM_TENSOR_C2W_DEC_CONV_IN_B), {c2w_dec_dim}, TENSOR_NOT_REQUIRED);
+
+                    // Final Snake activation (decoder.5)
+                    c2w_dec_final_snake_a = create_tensor(tn(LLM_TENSOR_C2W_DEC_FINAL_SNAKE_A), {96}, TENSOR_NOT_REQUIRED);
+                    c2w_dec_final_snake_b = create_tensor(tn(LLM_TENSOR_C2W_DEC_FINAL_SNAKE_B), {96}, TENSOR_NOT_REQUIRED);
+
+                    // Final conv: last_stage_dim -> 1 (mono audio)
+                    c2w_dec_conv_out   = create_tensor(tn(LLM_TENSOR_C2W_DEC_CONV_OUT, "weight"), {7, 96, 1}, TENSOR_NOT_REQUIRED);
+                    c2w_dec_conv_out_b = create_tensor(tn(LLM_TENSOR_C2W_DEC_CONV_OUT, "bias"), {1}, TENSOR_NOT_REQUIRED);
+
+                    // 4 decoder stages (outer Snake activations + upsample conv)
+                    // Note: bid starts at 1 (decoder.1 through decoder.4)
+                    // Dimensions: stage 1=1536, 2=768, 3=384, 4=192 (halving each stage)
+                    // Upsample rates: [8, 5, 4, 3], kernel = rate * 2
+                    const int64_t dec_dims[4] = {1536, 768, 384, 192};
+                    const int64_t dec_out_dims[4] = {768, 384, 192, 96};
+                    const int64_t upsample_kernels[4] = {16, 10, 8, 6};  // rate * 2
+
+                    c2w_dec_blocks.resize(c2w_dec_n_stage);
+                    for (int i = 0; i < c2w_dec_n_stage; ++i) {
+                        auto & block = c2w_dec_blocks[i];
+                        const int64_t dim_in = dec_dims[i];
+                        const int64_t dim_out = dec_out_dims[i];
+                        const int64_t kernel = upsample_kernels[i];
+
+                        // Snake alpha/beta for stage (bid = i+1 since decoder.0 is conv_in)
+                        block.snake_alpha = create_tensor(tn(LLM_TENSOR_C2W_DEC_SNAKE_ALPHA, i + 1), {dim_in}, TENSOR_NOT_REQUIRED);
+                        block.snake_beta  = create_tensor(tn(LLM_TENSOR_C2W_DEC_SNAKE_BETA, i + 1), {dim_in}, TENSOR_NOT_REQUIRED);
+                        // Transpose conv for upsampling: [kernel, out_dim, in_dim]
+                        block.upsample      = create_tensor(tn(LLM_TENSOR_C2W_DEC_UPSAMPLE, "weight", i + 1), {kernel, dim_out, dim_in}, TENSOR_NOT_REQUIRED);
+                        block.upsample_bias = create_tensor(tn(LLM_TENSOR_C2W_DEC_UPSAMPLE_B, i + 1), {dim_out}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    // 12 residual blocks (3 per stage × 4 stages)
+                    // Flattened indexing: bid = stage * 10 + block_idx
+                    // Dimensions per stage: {768, 384, 192, 96} (after upsample)
+                    c2w_dec_res_blks.resize(c2w_dec_n_stage * c2w_dec_n_resblk);
+                    for (int stage = 0; stage < c2w_dec_n_stage; ++stage) {
+                        const int64_t dim = dec_out_dims[stage];  // ResBlocks use output dim of stage
+                        for (int rb = 0; rb < c2w_dec_n_resblk; ++rb) {
+                            int flat_idx = stage * c2w_dec_n_resblk + rb;
+                            int bid = (stage + 1) * 10 + rb;  // decoder.{stage+1}.block.{rb}
+                            auto & blk = c2w_dec_res_blks[flat_idx];
+
+                            // Conv weights: [kernel, out_dim, in_dim] - here in=out=dim
+                            blk.conv1       = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_CONV1, "weight", bid), {7, dim, dim}, TENSOR_NOT_REQUIRED);
+                            blk.conv1_bias  = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_CONV1, "bias", bid), {dim}, TENSOR_NOT_REQUIRED);
+                            blk.conv2       = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_CONV2, "weight", bid), {1, dim, dim}, TENSOR_NOT_REQUIRED);
+                            blk.conv2_bias  = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_CONV2, "bias", bid), {dim}, TENSOR_NOT_REQUIRED);
+                            // Snake activations: [dim]
+                            blk.act1_alpha  = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_ACT1_A, bid), {dim}, TENSOR_NOT_REQUIRED);
+                            blk.act1_beta   = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_ACT1_B, bid), {dim}, TENSOR_NOT_REQUIRED);
+                            blk.act2_alpha  = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_ACT2_A, bid), {dim}, TENSOR_NOT_REQUIRED);
+                            blk.act2_beta   = create_tensor(tn(LLM_TENSOR_C2W_DEC_BLK_ACT2_B, bid), {dim}, TENSOR_NOT_REQUIRED);
+                        }
+                    }
+                } break;
+            case LLM_ARCH_QWEN3OMNIMOE:
+                {
+                    // Qwen3-Omni Thinker: Qwen3MOE with M-RoPE and shared experts
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    // output
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    // if output is NULL, init from the input tok embed
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        // Qwen3-style Q/K normalization
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+
+                        if (n_expert == 0) {
+                            throw std::runtime_error("n_expert must be > 0 for QWEN3OMNIMOE");
+                        }
+                        if (n_expert_used == 0) {
+                            throw std::runtime_error("n_expert_used must be > 0 for QWEN3OMNIMOE");
+                        }
+
+                        // MoE experts
+                        const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
+
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+                        // Shared expert (optional, based on model config)
+                        const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff_exp;
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, TENSOR_NOT_REQUIRED);
                     }
                 } break;
             case LLM_ARCH_PHI2:
@@ -5251,7 +5466,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     }
                 } break;
             case LLM_ARCH_NEMOTRON_H:
-            case LLM_ARCH_NEMOTRON_H_MOE:
                 {
                     // mamba2 Mixer SSM params
                     // NOTE: int64_t for tensor dimensions
@@ -5311,29 +5525,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias",   i), {n_embd_k_gqa_i}, TENSOR_NOT_REQUIRED);
                             layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias",   i), {n_embd_v_gqa_i}, TENSOR_NOT_REQUIRED);
                             layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias",   i), {n_embd},         TENSOR_NOT_REQUIRED);
-                        }  else {
-                            if (n_expert != 0) {
-                                const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
-                                const int64_t n_ff_shexp = hparams.n_ff_shexp;
-
-                                layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert}, 0);
-                                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert         }, 0);
-
-                                // MoE branch
-                                layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-                                layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-
-                                // Shared expert branch
-                                layer.ffn_down_shexp  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
-                                layer.ffn_up_shexp    = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
-
-                            } else {
-                                // mlp layers
-                                layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  hparams.n_ff(i), n_embd}, 0);
-                                layer.ffn_up     = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   hparams.n_ff(i)}, 0);
-                                layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias",   i), {n_embd}, TENSOR_NOT_REQUIRED);
-                                layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias",   i), {hparams.n_ff(i)}, TENSOR_NOT_REQUIRED);
-                            }
+                        } else {
+                            // mlp layers
+                            layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  hparams.n_ff(i), n_embd}, 0);
+                            layer.ffn_up     = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   hparams.n_ff(i)}, 0);
+                            layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias",   i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias",   i), {hparams.n_ff(i)}, TENSOR_NOT_REQUIRED);
                         }
                     }
                 } break;
@@ -6317,8 +6514,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM_LFM2, "weight"), {n_embd}, 0);
-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,           "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
 
                     if (output == NULL) {
                         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
@@ -6665,44 +6862,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { hparams.n_ff_shexp, n_embd }, 0);
                     }
                 } break;
-            case LLM_ARCH_MIMO2:
-                {
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-
-                    // output
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        auto & layer = layers[i];
-                        uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i);
-                        uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i);
-                        uint32_t n_head = hparams.n_head(i);
-
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), { n_embd, n_embd_k_gqa }, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), { n_embd, n_embd_v_gqa }, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head, n_embd }, 0);
-
-                        layer.attn_norm  = create_tensor(tn(LLM_TENSOR_ATTN_NORM,  "weight", i), {n_embd}, 0);
-                        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, TENSOR_NOT_REQUIRED);
-
-                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-
-                        // non-MoE branch
-                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
-
-                        // MoE branch
-                        int64_t n_ff_exp = hparams.n_ff_exp;
-                        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
-                    }
-                } break;
             default:
                 throw std::runtime_error("unknown architecture");
         }
@@ -6812,12 +6971,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_gpu);
+        if (n_gpu_layers > (int) hparams.n_layer) {
             LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
         }
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
         const int max_backend_supported_layers = hparams.n_layer + 1;
         const int max_offloadable_layers       = hparams.n_layer + 1;
@@ -7000,8 +7157,7 @@ void llama_model::print_info() const {
         arch == LLM_ARCH_PLAMO2 ||
         arch == LLM_ARCH_GRANITE_HYBRID ||
         arch == LLM_ARCH_QWEN3NEXT ||
-        arch == LLM_ARCH_NEMOTRON_H ||
-        arch == LLM_ARCH_NEMOTRON_H_MOE) {
+        arch == LLM_ARCH_NEMOTRON_H) {
         LLAMA_LOG_INFO("%s: ssm_d_conv       = %u\n",     __func__, hparams.ssm_d_conv);
         LLAMA_LOG_INFO("%s: ssm_d_inner      = %u\n",     __func__, hparams.ssm_d_inner);
         LLAMA_LOG_INFO("%s: ssm_d_state      = %u\n",     __func__, hparams.ssm_d_state);
@@ -7049,15 +7205,18 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_ff_shexp       = %d\n",     __func__, hparams.n_ff_shexp);
     }
 
-    if (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_OPENAI_MOE || arch == LLM_ARCH_QWEN3VLMOE || arch == LLM_ARCH_RND1) {
+    if (arch == LLM_ARCH_QWEN3MOE || arch == LLM_ARCH_OPENAI_MOE || arch == LLM_ARCH_QWEN3VLMOE || arch == LLM_ARCH_RND1 || arch == LLM_ARCH_QWEN3OMNI_TALKER || arch == LLM_ARCH_QWEN3OMNIMOE) {
         LLAMA_LOG_INFO("%s: n_ff_exp         = %d\n",     __func__, hparams.n_ff_exp);
+    }
+
+    if (arch == LLM_ARCH_QWEN3OMNI_TALKER || arch == LLM_ARCH_QWEN3OMNIMOE) {
+        LLAMA_LOG_INFO("%s: n_ff_shexp       = %d\n",     __func__, hparams.n_ff_shexp);
     }
 
     if (arch == LLM_ARCH_MINICPM ||
         arch == LLM_ARCH_GRANITE ||
         arch == LLM_ARCH_GRANITE_MOE ||
-        arch == LLM_ARCH_GRANITE_HYBRID ||
-        arch == LLM_ARCH_NEMOTRON_H_MOE) {
+        arch == LLM_ARCH_GRANITE_HYBRID) {
         LLAMA_LOG_INFO("%s: f_embedding_scale = %f\n", __func__, hparams.f_embedding_scale);
         LLAMA_LOG_INFO("%s: f_residual_scale  = %f\n", __func__, hparams.f_residual_scale);
         LLAMA_LOG_INFO("%s: f_attention_scale = %f\n", __func__, hparams.f_attention_scale);
@@ -7208,7 +7367,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_NOMIC_BERT_MOE:
         case LLM_ARCH_NEO_BERT:
         case LLM_ARCH_WAVTOKENIZER_DEC:
-        case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
         case LLM_ARCH_LLADA:
@@ -7239,7 +7397,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (arch == LLM_ARCH_FALCON_H1) {
                         filter_attn = [&](int32_t) { return true; };
                         filter_recr = [&](int32_t) { return true; };
-                    } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+                    } else if (arch == LLM_ARCH_NEMOTRON_H) {
                         filter_attn = [&](int32_t il) {
                             return !hparams.is_recurrent(il) && hparams.n_ff(il) == 0;
                         };
@@ -7326,19 +7484,15 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     switch (arch) {
         case LLM_ARCH_LLAMA:
             {
-                llm = std::make_unique<llm_build_llama<false>>(*this, params);
+                llm = std::make_unique<llm_build_llama>(*this, params);
             } break;
         case LLM_ARCH_LLAMA4:
             {
                 if (hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
-                    llm = std::make_unique<llm_build_llama<false>>(*this, params);
+                    llm = std::make_unique<llm_build_llama>(*this, params);
                 } else {
                     llm = std::make_unique<llm_build_llama_iswa>(*this, params);
                 }
-            } break;
-        case LLM_ARCH_LLAMA_EMBED:
-            {
-                llm = std::make_unique<llm_build_llama<true>>(*this, params);
             } break;
         case LLM_ARCH_DECI:
             {
@@ -7371,10 +7525,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_NOMIC_BERT_MOE:
             {
                 llm = std::make_unique<llm_build_bert>(*this, params);
-            } break;
-        case LLM_ARCH_MODERN_BERT:
-            {
-                llm = std::make_unique<llm_build_modern_bert<true>>(*this, params);
             } break;
         case LLM_ARCH_NEO_BERT:
             {
@@ -7442,6 +7592,15 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_QWEN3VLMOE:
             {
+                llm = std::make_unique<llm_build_qwen3vlmoe>(*this, params);
+            } break;
+        case LLM_ARCH_QWEN3OMNI_TALKER:
+            {
+                llm = std::make_unique<llm_build_qwen3omni_talker>(*this, params);
+            } break;
+        case LLM_ARCH_QWEN3OMNIMOE:
+            {
+                // Use Qwen3VLMOE builder which supports M-RoPE via ggml_rope_multi()
                 llm = std::make_unique<llm_build_qwen3vlmoe>(*this, params);
             } break;
         case LLM_ARCH_PHI2:
@@ -7618,7 +7777,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                 llm = std::make_unique<llm_build_nemotron>(*this, params);
             } break;
         case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
             {
                 llm = std::make_unique<llm_build_nemotron_h>(*this, params);
             } break;
@@ -7765,10 +7923,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_mistral3>(*this, params);
             } break;
-        case LLM_ARCH_MIMO2:
-            {
-                llm = std::make_unique<llm_build_mimo2_iswa>(*this, params);
-            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -7907,7 +8061,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ARWKV7:
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_NEMOTRON_H:
-        case LLM_ARCH_NEMOTRON_H_MOE:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -7928,6 +8081,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
+        case LLM_ARCH_GLM4:
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_GRANITE_HYBRID:
@@ -7939,7 +8093,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5:
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
-        case LLM_ARCH_LLAMA_EMBED:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2
@@ -7949,7 +8102,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DBRX:
         case LLM_ARCH_BERT:
         case LLM_ARCH_JINA_BERT_V3:
-        case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
         case LLM_ARCH_STABLELM:
@@ -7960,6 +8112,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_QWEN3OMNI_TALKER:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
         case LLM_ARCH_OLMO2:
@@ -7991,6 +8144,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
+        case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_APERTUS:
@@ -7999,19 +8153,14 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_PANGU_EMBED:
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_QWEN3NEXT:
-        case LLM_ARCH_MIMO2:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
             return LLAMA_ROPE_TYPE_MROPE;
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
+        case LLM_ARCH_QWEN3OMNIMOE:
             return LLAMA_ROPE_TYPE_IMROPE;
-
-        case LLM_ARCH_GLM4:
-            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
-        case LLM_ARCH_GLM4_MOE:
-            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NEOX;
 
         // all model arches should be listed explicitly here
         case LLM_ARCH_UNKNOWN:

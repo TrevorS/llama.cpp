@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { config } from '$lib/stores/settings.svelte';
-	import { copyToClipboard, isIMEComposing, formatMessageForClipboard } from '$lib/utils';
+	import { copyToClipboard, isIMEComposing } from '$lib/utils';
 	import ChatMessageAssistant from './ChatMessageAssistant.svelte';
 	import ChatMessageUser from './ChatMessageUser.svelte';
 	import ChatMessageSystem from './ChatMessageSystem.svelte';
@@ -12,21 +11,13 @@
 		onCopy?: (message: DatabaseMessage) => void;
 		onContinueAssistantMessage?: (message: DatabaseMessage) => void;
 		onDelete?: (message: DatabaseMessage) => void;
-		onEditWithBranching?: (
-			message: DatabaseMessage,
-			newContent: string,
-			newExtras?: DatabaseMessageExtra[]
-		) => void;
+		onEditWithBranching?: (message: DatabaseMessage, newContent: string) => void;
 		onEditWithReplacement?: (
 			message: DatabaseMessage,
 			newContent: string,
 			shouldBranch: boolean
 		) => void;
-		onEditUserMessagePreserveResponses?: (
-			message: DatabaseMessage,
-			newContent: string,
-			newExtras?: DatabaseMessageExtra[]
-		) => void;
+		onEditUserMessagePreserveResponses?: (message: DatabaseMessage, newContent: string) => void;
 		onNavigateToSibling?: (siblingId: string) => void;
 		onRegenerateWithBranching?: (message: DatabaseMessage, modelOverride?: string) => void;
 		siblingInfo?: ChatMessageSiblingInfo | null;
@@ -53,8 +44,6 @@
 		messageTypes: string[];
 	} | null>(null);
 	let editedContent = $state(message.content);
-	let editedExtras = $state<DatabaseMessageExtra[]>(message.extra ? [...message.extra] : []);
-	let editedUploadedFiles = $state<ChatUploadedFile[]>([]);
 	let isEditing = $state(false);
 	let showDeleteDialog = $state(false);
 	let shouldBranchAfterEdit = $state(false);
@@ -95,22 +84,10 @@
 	function handleCancelEdit() {
 		isEditing = false;
 		editedContent = message.content;
-		editedExtras = message.extra ? [...message.extra] : [];
-		editedUploadedFiles = [];
-	}
-
-	function handleEditedExtrasChange(extras: DatabaseMessageExtra[]) {
-		editedExtras = extras;
-	}
-
-	function handleEditedUploadedFilesChange(files: ChatUploadedFile[]) {
-		editedUploadedFiles = files;
 	}
 
 	async function handleCopy() {
-		const asPlainText = Boolean(config().copyTextAttachmentsAsPlainText);
-		const clipboardContent = formatMessageForClipboard(message.content, message.extra, asPlainText);
-		await copyToClipboard(clipboardContent, 'Message copied to clipboard');
+		await copyToClipboard(message.content, 'Message copied to clipboard');
 		onCopy?.(message);
 	}
 
@@ -127,8 +104,6 @@
 	function handleEdit() {
 		isEditing = true;
 		editedContent = message.content;
-		editedExtras = message.extra ? [...message.extra] : [];
-		editedUploadedFiles = [];
 
 		setTimeout(() => {
 			if (textareaElement) {
@@ -165,10 +140,9 @@
 		onContinueAssistantMessage?.(message);
 	}
 
-	async function handleSaveEdit() {
+	function handleSaveEdit() {
 		if (message.role === 'user' || message.role === 'system') {
-			const finalExtras = await getMergedExtras();
-			onEditWithBranching?.(message, editedContent.trim(), finalExtras);
+			onEditWithBranching?.(message, editedContent.trim());
 		} else {
 			// For assistant messages, preserve exact content including trailing whitespace
 			// This is important for the Continue feature to work properly
@@ -177,30 +151,15 @@
 
 		isEditing = false;
 		shouldBranchAfterEdit = false;
-		editedUploadedFiles = [];
 	}
 
-	async function handleSaveEditOnly() {
+	function handleSaveEditOnly() {
 		if (message.role === 'user') {
 			// For user messages, trim to avoid accidental whitespace
-			const finalExtras = await getMergedExtras();
-			onEditUserMessagePreserveResponses?.(message, editedContent.trim(), finalExtras);
+			onEditUserMessagePreserveResponses?.(message, editedContent.trim());
 		}
 
 		isEditing = false;
-		editedUploadedFiles = [];
-	}
-
-	async function getMergedExtras(): Promise<DatabaseMessageExtra[]> {
-		if (editedUploadedFiles.length === 0) {
-			return editedExtras;
-		}
-
-		const { parseFilesToMessageExtras } = await import('$lib/utils/browser-only');
-		const result = await parseFilesToMessageExtras(editedUploadedFiles);
-		const newExtras = result?.extras || [];
-
-		return [...editedExtras, ...newExtras];
 	}
 
 	function handleShowDeleteDialogChange(show: boolean) {
@@ -235,8 +194,6 @@
 		class={className}
 		{deletionInfo}
 		{editedContent}
-		{editedExtras}
-		{editedUploadedFiles}
 		{isEditing}
 		{message}
 		onCancelEdit={handleCancelEdit}
@@ -246,8 +203,6 @@
 		onEdit={handleEdit}
 		onEditKeydown={handleEditKeydown}
 		onEditedContentChange={handleEditedContentChange}
-		onEditedExtrasChange={handleEditedExtrasChange}
-		onEditedUploadedFilesChange={handleEditedUploadedFilesChange}
 		{onNavigateToSibling}
 		onSaveEdit={handleSaveEdit}
 		onSaveEditOnly={handleSaveEditOnly}

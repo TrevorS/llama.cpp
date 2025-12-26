@@ -107,7 +107,7 @@ ENTRYPOINT ["/app/tools.sh"]
 # ENTRYPOINT ["/app/llama-server"]
 
 ### Target: light
-# Lightweight image containing only llama-cli and llama-completion
+# Lightweight image containing only llama-cli
 # ==============================================================================
 FROM base AS light
 

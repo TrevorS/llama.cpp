@@ -1878,8 +1878,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     tokenizer_pre == "jina-v2-es" ||
                     tokenizer_pre == "jina-v2-de" ||
                     tokenizer_pre == "a.x-4.0" ||
-                    tokenizer_pre == "mellum"  ||
-                    tokenizer_pre == "modern-bert" ) {
+                    tokenizer_pre == "mellum") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_GPT2;
             } else if (
                     tokenizer_pre == "jina-v1-en" ||
@@ -2528,13 +2527,6 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             }
             for (const auto * token : {"<unk>", "<s>", "<|endoftext|>"}) {
                 _set_token_attr(token, LLAMA_TOKEN_ATTR_RSTRIP, false);
-            }
-        } else if (_contains_any(model_name, {"modern-bert"})) {
-            if (token_to_id.count("[MASK]") == 0 ) {
-                LLAMA_LOG_WARN("%s: Mask token missing in vocab!\n", __func__);
-            }
-            else {
-                _set_token_attr("[MASK]", LLAMA_TOKEN_ATTR_LSTRIP, true);
             }
         }
     }

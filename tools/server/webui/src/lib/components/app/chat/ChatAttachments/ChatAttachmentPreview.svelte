@@ -241,7 +241,7 @@
 				</div>
 			{/if}
 		{:else if (isText || (isPdf && pdfViewMode === 'text')) && displayTextContent}
-			<SyntaxHighlightedCode code={displayTextContent} {language} maxWidth="calc(69rem - 2rem)" />
+			<SyntaxHighlightedCode code={displayTextContent} {language} maxWidth="69rem" />
 		{:else if isAudio}
 			<div class="flex items-center justify-center p-8">
 				<div class="w-full max-w-md text-center">

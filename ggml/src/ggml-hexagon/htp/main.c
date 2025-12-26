@@ -299,8 +299,7 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32 sess_id, uint64 dsp_que
 
     ctx->n_threads = n_hvx;
     for (int i = 0; i < ctx->n_threads; i++) {
-        // see discussion https://github.com/ggml-org/llama.cpp/pull/18151#discussion_r2632388541
-        ctx->dma[i] = dma_queue_create(64);
+        ctx->dma[i] = dma_queue_create(HTP_SPAD_SRC0_NROWS * 2);
     }
 
     // init worker pool
@@ -799,7 +798,6 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                 break;
 
             case HTP_OP_UNARY_SILU:
-            case HTP_OP_UNARY_GELU:
                 if (n_bufs != 2) {
                     FARF(ERROR, "Bad act-req buffer list");
                     continue;
@@ -808,7 +806,6 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                 break;
 
             case HTP_OP_GLU_SWIGLU:
-            case HTP_OP_GLU_SWIGLU_OAI:
             case HTP_OP_SOFTMAX:
                 if ((n_bufs != 2) && (n_bufs != 3)) {
                     FARF(ERROR, "Bad act-req buffer list");

@@ -66,8 +66,7 @@ class SettingsStore {
 	 */
 	private getServerDefaults(): Record<string, string | number | boolean> {
 		const serverParams = serverStore.defaultParams;
-		const webuiSettings = serverStore.webuiSettings;
-		return ParameterSyncService.extractServerDefaults(serverParams, webuiSettings);
+		return serverParams ? ParameterSyncService.extractServerDefaults(serverParams) : {};
 	}
 
 	constructor() {
@@ -294,13 +293,14 @@ class SettingsStore {
 	 * This sets up the default values from /props endpoint
 	 */
 	syncWithServerDefaults(): void {
-		const propsDefaults = this.getServerDefaults();
-
-		if (Object.keys(propsDefaults).length === 0) {
-			console.warn('No server defaults available for initialization');
+		const serverParams = serverStore.defaultParams;
+		if (!serverParams) {
+			console.warn('No server parameters available for initialization');
 
 			return;
 		}
+
+		const propsDefaults = this.getServerDefaults();
 
 		for (const [key, propsValue] of Object.entries(propsDefaults)) {
 			const currentValue = getConfigValue(this.config, key);

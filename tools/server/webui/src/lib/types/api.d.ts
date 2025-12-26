@@ -176,7 +176,6 @@ export interface ApiLlamaCppServerProps {
 	bos_token: string;
 	eos_token: string;
 	build_info: string;
-	webui_settings?: Record<string, string | number | boolean>;
 }
 
 export interface ApiChatCompletionRequest {
@@ -342,7 +341,6 @@ export interface ApiProcessingState {
 	// Progress information from prompt_progress
 	progressPercent?: number;
 	promptTokens?: number;
-	promptMs?: number;
 	cacheTokens?: number;
 }
 
