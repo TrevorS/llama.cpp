@@ -10,6 +10,8 @@ add_library(mtmd
             mtmd-helper.h
             mtmd-tts.cpp
             mtmd-tts-code2wav.cpp
+            mtmd-tts-gpu.cpp
+            mtmd-tts-gpu.h
             mtmd-tts.h
             clip.cpp
             clip.h
@@ -55,6 +57,7 @@ set(MTMD_PUBLIC_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd.h
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-tts.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/mtmd-tts-gpu.h
     )
 
 set_target_properties(mtmd
