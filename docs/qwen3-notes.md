@@ -5,17 +5,40 @@
 
 ---
 
-## Current Status (2025-12-26)
+## Current Status (2025-12-25)
 
-🎉 **TEXT→SPEECH, AUDIO→TEXT, & IMAGE→TEXT WORKING!**
+🎉 **TEXT→SPEECH, AUDIO→TEXT, & IMAGE→TEXT ALL WORKING via mtmd-cli!**
 
 ### I/O Capabilities
 
 |                        | Text Output | Speech Output |
 |------------------------|-------------|---------------|
 | **Text Input**         | ✅ WORKING  | ✅ WORKING    |
-| **Audio Input**        | ✅ WORKING  | 🔧 NOT WIRED  |
-| **Image/Video Input**  | ✅ WORKING  | 🔧 NOT WIRED  |
+| **Audio Input**        | ✅ WORKING  | ✅ WORKING    |
+| **Image/Video Input**  | ✅ WORKING  | 🔧 NOT TESTED |
+
+### mtmd-cli TTS Usage (2025-12-25)
+
+```bash
+# Text-only TTS (no audio/image input)
+./llama-mtmd-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --tts-model talker.gguf \
+  -p "Hello world!" \
+  --speak \
+  --tts-output output.wav
+
+# Audio input + TTS response
+./llama-mtmd-cli \
+  -m thinker.gguf \
+  --mmproj mmproj.gguf \
+  --tts-model talker.gguf \
+  --audio input.wav \
+  -p "What was said?" \
+  --speak \
+  --tts-output output.wav
+```
 
 ### Component Status
 
@@ -71,15 +94,38 @@
    - Vision: 8192 (with deepstack), Audio: 2048 (direct projection)
    - Modified mtmd.cpp to skip mismatch check for Qwen3-Omni projector types
 
+10. **mtmd-cli TTS Single-Turn Mode (2025-12-25)**: Text-only TTS wasn't working
+    - Original: `is_single_turn = !prompt.empty() && !image.empty()` required media
+    - Fixed: `is_single_turn = !prompt.empty() && (!image.empty() || auto_speak)`
+    - Now text-only TTS works with `--speak` flag even without image/audio input
+    - File: `tools/mtmd/mtmd-cli.cpp` line 419-421
+
+11. **mtmd-tts Assistant Role Prefix (2025-12-25)**: TTS audio was unintelligible
+    - `mtmd_tts_generate_from_text()` was tokenizing just the response text
+    - Talker expects `<|im_start|>assistant\n{text}` format (matches HuggingFace)
+    - The first 3 tokens of the text go into prefill positions 0-2
+    - Without the role prefix, the prefill structure was wrong
+    - Fixed: Prepend `<|im_start|>assistant\n` before tokenizing response text
+    - File: `tools/mtmd/mtmd-tts.cpp` line 1096-1098
+
+12. **mtmd-tts Tokenization parse_special Flag (2025-12-25)**: Still garbled after fix #11
+    - `llama_tokenize(..., false, false)` was using parse_special=false
+    - With parse_special=false, `<|im_start|>` is NOT recognized as a special token
+    - It was tokenized as regular text characters, producing garbage tokens
+    - Standalone TTS uses parse_special=true
+    - Fixed: Changed to `llama_tokenize(..., false, true)` for proper special token handling
+    - Also added: `llama_set_debug_layer_outputs(talker_ctx, true)` to match standalone
+    - File: `tools/mtmd/mtmd-tts.cpp` lines 1104-1106 and 680-682
+
 ### Remaining Work
 
 | Category | Priority | Notes |
 |----------|----------|-------|
-| Audio→Speech pipeline | High | Wire audio input → Talker for speech response |
-| Image→Speech pipeline | High | Wire vision output → Talker for speech response |
+| Image→Speech pipeline | High | Test vision input → Talker for speech response |
 | Server API | Medium | 6 tasks for REST endpoints |
 | CLI polish | Low | Interactive mode, multimodal input |
 | Test suite | Low | Formal metrics (PESQ, STOI) |
+| Debug filter output | Low | Remove audio encoder debug prints in text-only mode |
 
 ---
 

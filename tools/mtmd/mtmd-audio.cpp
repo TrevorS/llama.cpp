@@ -11,7 +11,7 @@
 
 // most of the code here is copied from whisper.cpp
 
-constexpr bool DEBUG = true;
+constexpr bool DEBUG = false;
 
 struct mtmd_audio_mel_filters {
     int32_t n_mel;
