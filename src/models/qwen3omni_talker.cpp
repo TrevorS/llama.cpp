@@ -346,7 +346,7 @@ llm_build_qwen3omni_code_predictor::llm_build_qwen3omni_code_predictor(
 //   1. Code embedding: sum of 16 codebook embeddings
 //   2. Pre-transformer: 8 layers with sliding window attention (window=72) + LayerScale
 //   3. Upsample: 2 ConvNeXt blocks (upsampling factor per block)
-//   4. Decoder: HiFi-GAN with Snake activations (TODO - not loaded yet)
+//   4. Decoder: HiFi-GAN with Snake activations
 llm_build_qwen3omni_code2wav::llm_build_qwen3omni_code2wav(
         const llama_model & model,
         const llm_graph_params & params)

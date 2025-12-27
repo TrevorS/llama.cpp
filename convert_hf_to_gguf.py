@@ -4642,7 +4642,6 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
             return super().modify_tensors(data_torch, name, bid)
 
         # Other talker.* tensors (code_predictor, projections, etc.)
-        # TODO: Add complete Talker component mappings (code_predictor, hidden_projection, etc.)
         if name.startswith("talker."):
             try:
                 mapped_name = self.map_tensor_name(name)
