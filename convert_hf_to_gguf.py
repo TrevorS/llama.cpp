@@ -4315,6 +4315,7 @@ class Qwen3OmniMmprojModel(MmprojModel):
         # because Qwen3-Omni has nested config at thinker_config.text_config
         import json
         dir_model = args[0] if args else kwargs.get("dir_model")
+        assert dir_model is not None, "dir_model is required"
         config_path = dir_model / "config.json"
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -5006,6 +5007,7 @@ class Qwen3OmniVisionMmprojModel(Qwen3VLVisionModel):
         # Need to set up the config properly before calling super().__init__
         import json
         dir_model = args[0] if args else kwargs.get("dir_model")
+        assert dir_model is not None, "dir_model is required"
         config_path = dir_model / "config.json"
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
