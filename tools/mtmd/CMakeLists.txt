@@ -10,6 +10,8 @@ add_library(mtmd
             mtmd-helper.h
             mtmd-tts.cpp
             mtmd-tts-code2wav.cpp
+            mtmd-tts-gpu.cpp
+            mtmd-tts-gpu.h
             mtmd-tts.h
             clip.cpp
             clip.h

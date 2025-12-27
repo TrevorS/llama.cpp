@@ -4269,6 +4269,19 @@ class Qwen3OmniThinkerModel(Qwen3MoeModel):
         # Padded to 4 elements as expected by llama.cpp
         self.gguf_writer.add_rope_dimension_sections([24, 20, 20, 0])
 
+    def set_vocab(self):
+        super().set_vocab()
+        # Fix EOS/BOS/PAD tokens - Qwen3-Omni's tokenizer_config.json has null for bos,
+        # causing llama.cpp to use gpt2 defaults (token 11 = comma) which breaks generation.
+        # Token IDs from HF tokenizer:
+        #   <|im_end|> = 151645 (EOS for chat)
+        #   <|endoftext|> = 151643 (BOS, PAD)
+        self.gguf_writer.add_eos_token_id(151645)  # <|im_end|>
+        self.gguf_writer.add_bos_token_id(151643)  # <|endoftext|>
+        self.gguf_writer.add_pad_token_id(151643)  # <|endoftext|> (same as HF)
+        self.gguf_writer.add_add_bos_token(False)  # Qwen doesn't add BOS automatically
+        logger.info("Qwen3-Omni: Set EOS=151645, BOS=151643, PAD=151643")
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Strip thinker prefix if present
         if name.startswith("thinker."):

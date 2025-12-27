@@ -13,6 +13,7 @@
  */
 
 #include "mtmd-tts.h"
+#include "mtmd-tts-gpu.h"
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -47,16 +48,9 @@ static const int TTS_PAD_TOKEN_ID = 151671;  // tts_pad_token_id
 static const int TTS_BOS_TOKEN_ID = 151672;  // tts_bos_token_id
 static const int TTS_EOS_TOKEN_ID = 151673;  // tts_eos_token_id
 
-// Code Predictor dimensions
-static const int CP_N_EMBD = 1024;
-static const int CP_N_HEAD = 16;
-static const int CP_N_HEAD_KV = 8;
-static const int CP_HEAD_DIM = 128;
-static const int CP_N_FF = 3072;
-static const int CP_N_LAYER = 5;
-static const int CP_VOCAB = 2048;
-static const int CP_N_CODEBOOKS = 15;  // Codebooks 1-15 (codebook 0 from Talker)
-static const float CP_ROPE_THETA = 1000000.0f;
+// Code Predictor dimensions - defined in mtmd-tts-gpu.h as macros:
+// CP_N_EMBD, CP_N_HEAD, CP_N_HEAD_KV, CP_HEAD_DIM, CP_N_FF,
+// CP_N_LAYER, CP_VOCAB, CP_N_CODEBOOKS, CP_ROPE_THETA
 
 // =============================================================================
 // Forward declarations (from mtmd-tts-code2wav.cpp)
@@ -90,6 +84,9 @@ struct mtmd_tts_context {
     int n_embd_thinker;
     int n_embd_talker;
 
+    // GPU-accelerated Code Predictor context (optional, can be nullptr)
+    mtmd_cp_gpu_context * cp_gpu_ctx;
+
     mtmd_tts_context()
         : thinker_model(nullptr)
         , talker_model(nullptr)
@@ -97,7 +94,8 @@ struct mtmd_tts_context {
         , tok_embd_dim(0)
         , tok_embd_vocab(0)
         , n_embd_thinker(0)
-        , n_embd_talker(0) {}
+        , n_embd_talker(0)
+        , cp_gpu_ctx(nullptr) {}
 };
 
 // =============================================================================
@@ -517,6 +515,28 @@ static bool run_code_predictor_inline(
         }
     }
 
+    // Pre-cache LM heads and codec embeddings to eliminate GPU→CPU transfers in hot loop
+    std::vector<std::vector<float>> lm_head_cache(CP_N_CODEBOOKS);
+    std::vector<std::vector<float>> codec_embd_cache(CP_N_CODEBOOKS);
+
+    for (int cb = 0; cb < CP_N_CODEBOOKS; ++cb) {
+        if (cb < (int)model->talker_cp_lm_head.size()) {
+            if (!copy_tensor_to_cpu(model->talker_cp_lm_head[cb], lm_head_cache[cb])) {
+                fprintf(stderr, "Error: Failed to cache LM head %d\n", cb);
+                return false;
+            }
+        }
+        if (cb < (int)model->talker_cp_codec_embd.size()) {
+            if (!copy_tensor_to_cpu(model->talker_cp_codec_embd[cb], codec_embd_cache[cb])) {
+                fprintf(stderr, "Error: Failed to cache codec embedding %d\n", cb);
+                return false;
+            }
+        }
+    }
+
+    // Pre-allocate logits buffer (moved out of loop)
+    std::vector<float> logits(CP_VOCAB);
+
     // Transformer step lambda
     auto run_transformer_step = [&](const std::vector<float>& input, int pos) {
         cur = input;
@@ -562,53 +582,43 @@ static bool run_code_predictor_inline(
         // Apply output norm and LM head
         rms_norm(cur.data(), output_norm_w.data(), normed.data(), CP_N_EMBD);
 
-        if (cb >= (int)model->talker_cp_lm_head.size()) {
-            fprintf(stderr, "Error: LM head %d out of range\n", cb);
+        if (cb >= (int)lm_head_cache.size() || lm_head_cache[cb].empty()) {
+            fprintf(stderr, "Error: LM head %d not cached\n", cb);
             return false;
         }
 
-        std::vector<float> lm_head_w;
-        if (!copy_tensor_to_cpu(model->talker_cp_lm_head[cb], lm_head_w)) {
-            fprintf(stderr, "Error: Failed to copy LM head %d\n", cb);
-            return false;
-        }
-
-        std::vector<float> logits(CP_VOCAB);
-        matmul(normed.data(), lm_head_w.data(), logits.data(), 1, CP_N_EMBD, CP_VOCAB);
+        // Use pre-cached LM head (no GPU→CPU copy here)
+        matmul(normed.data(), lm_head_cache[cb].data(), logits.data(), 1, CP_N_EMBD, CP_VOCAB);
 
         // Sample
         float cp_temp = (temperature <= 0.0f) ? 0.0f : 0.9f;
         int best_token = sample_token(logits.data(), CP_VOCAB, cp_temp, 50, rng, {}, 1.0f, 0.8f);
         codebook_tokens.push_back(best_token);
 
-        // Get embedding for this token
-        if (cb < (int)model->talker_cp_codec_embd.size()) {
-            const ggml_tensor * embd_tensor = model->talker_cp_codec_embd[cb];
-            std::vector<float> embd_data;
-            if (copy_tensor_to_cpu(embd_tensor, embd_data)) {
-                std::vector<float> token_embd(CP_N_EMBD);
-                if (best_token >= 0 && best_token < CP_VOCAB) {
-                    for (int i = 0; i < CP_N_EMBD; ++i) {
-                        token_embd[i] = embd_data[best_token * CP_N_EMBD + i];
-                    }
+        // Get embedding for this token (use pre-cached codec embeddings)
+        if (cb < (int)codec_embd_cache.size() && !codec_embd_cache[cb].empty()) {
+            std::vector<float> token_embd(CP_N_EMBD);
+            if (best_token >= 0 && best_token < CP_VOCAB) {
+                const float * embd_row = codec_embd_cache[cb].data() + best_token * CP_N_EMBD;
+                for (int i = 0; i < CP_N_EMBD; ++i) {
+                    token_embd[i] = embd_row[i];
                 }
-                codec_embeddings.push_back(token_embd);
-                run_transformer_step(token_embd, pos);
             }
+            codec_embeddings.push_back(token_embd);
+            run_transformer_step(token_embd, pos);
         }
     }
 
-    // Add last_residual_hidden from final embedding table
-    if (!codebook_tokens.empty() && !model->talker_cp_codec_embd.empty()) {
-        int last_table_idx = (int)model->talker_cp_codec_embd.size() - 1;
-        const ggml_tensor * last_embd_table = model->talker_cp_codec_embd[last_table_idx];
-        std::vector<float> last_embd_data;
-        if (copy_tensor_to_cpu(last_embd_table, last_embd_data)) {
+    // Add last_residual_hidden from final embedding table (use cached)
+    if (!codebook_tokens.empty() && !codec_embd_cache.empty()) {
+        int last_table_idx = (int)codec_embd_cache.size() - 1;
+        if (!codec_embd_cache[last_table_idx].empty()) {
             int last_token = codebook_tokens.back();
             std::vector<float> last_residual_hidden(CP_N_EMBD);
             if (last_token >= 0 && last_token < CP_VOCAB) {
+                const float * embd_row = codec_embd_cache[last_table_idx].data() + last_token * CP_N_EMBD;
                 for (int i = 0; i < CP_N_EMBD; ++i) {
-                    last_residual_hidden[i] = last_embd_data[last_token * CP_N_EMBD + i];
+                    last_residual_hidden[i] = embd_row[i];
                 }
             }
             codec_embeddings.push_back(last_residual_hidden);
@@ -705,11 +715,21 @@ mtmd_tts_context * mtmd_tts_init(
                 ctx->n_embd_thinker, ctx->n_embd_talker, (long long)ctx->tok_embd_vocab);
     }
 
+    // Initialize GPU Code Predictor context (with pre-cached weights)
+    // This is optional - if it fails, we fall back to the inline CPU implementation
+    ctx->cp_gpu_ctx = mtmd_cp_gpu_init(talker_model, 4);
+    if (ctx->cp_gpu_ctx && params.verbose) {
+        fprintf(stderr, "TTS: GPU Code Predictor context initialized\n");
+    }
+
     return ctx;
 }
 
 void mtmd_tts_free(mtmd_tts_context * ctx) {
     if (ctx) {
+        if (ctx->cp_gpu_ctx) {
+            mtmd_cp_gpu_free(ctx->cp_gpu_ctx);
+        }
         if (ctx->talker_ctx) {
             llama_free(ctx->talker_ctx);
         }
