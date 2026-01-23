@@ -1,0 +1,132 @@
+{
+  "name": "Qwen3-VL 30B-A3B Profiling Suite",
+  "version": "1.0.0",
+  "target_system": "DGX Spark GB10",
+
+  "models": {
+    "main": {
+      "path": "${MODEL_PATH:-models/qwen3vl-30b-a3b-q8.gguf}",
+      "mmproj": "${MMPROJ_PATH:-models/qwen3vl-mmproj.gguf}"
+    }
+  },
+
+  "test_images": {
+    "small": "test_images/512x512.jpg",
+    "medium": "test_images/1024x1024.jpg",
+    "large": "test_images/2048x2048.jpg"
+  },
+
+  "scenarios": [
+    {
+      "id": "text_only_short",
+      "type": "text",
+      "description": "Text-only baseline, short prompt",
+      "prompt_tokens": 128,
+      "gen_tokens": 64
+    },
+    {
+      "id": "text_only_medium",
+      "type": "text",
+      "description": "Text-only baseline, medium prompt",
+      "prompt_tokens": 512,
+      "gen_tokens": 128
+    },
+    {
+      "id": "text_only_long",
+      "type": "text",
+      "description": "Text-only baseline, long prompt",
+      "prompt_tokens": 2048,
+      "gen_tokens": 128
+    },
+    {
+      "id": "vl_small_image",
+      "type": "vision",
+      "description": "Vision-language with small image",
+      "image": "small",
+      "prompt": "Describe this image.",
+      "gen_tokens": 128
+    },
+    {
+      "id": "vl_medium_image",
+      "type": "vision",
+      "description": "Vision-language with medium image",
+      "image": "medium",
+      "prompt": "Describe this image in detail.",
+      "gen_tokens": 256
+    },
+    {
+      "id": "vl_large_image",
+      "type": "vision",
+      "description": "Vision-language with large/high-res image",
+      "image": "large",
+      "prompt": "Analyze this image thoroughly.",
+      "gen_tokens": 256
+    },
+    {
+      "id": "vl_detailed_analysis",
+      "type": "vision",
+      "description": "Vision-language detailed analysis task",
+      "image": "medium",
+      "prompt": "Provide a comprehensive analysis of this image including objects, colors, composition, and any text visible.",
+      "gen_tokens": 512
+    }
+  ],
+
+  "configurations": [
+    {
+      "id": "baseline",
+      "description": "Default configuration",
+      "flags": "-ngl 99"
+    },
+    {
+      "id": "flash_attn",
+      "description": "With Flash Attention enabled",
+      "flags": "-ngl 99 -fa 1"
+    },
+    {
+      "id": "moe_cpu",
+      "description": "MoE experts on CPU",
+      "flags": "-ngl 99 -fa 1 -cmoe"
+    },
+    {
+      "id": "kv_q8",
+      "description": "Quantized KV cache",
+      "flags": "-ngl 99 -fa 1 -ctk q8_0 -ctv q8_0"
+    },
+    {
+      "id": "moe_cpu_kv_q8",
+      "description": "MoE on CPU + quantized KV cache",
+      "flags": "-ngl 99 -fa 1 -cmoe -ctk q8_0 -ctv q8_0"
+    },
+    {
+      "id": "unified_memory",
+      "description": "With unified memory enabled",
+      "env": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1",
+      "flags": "-ngl 99 -fa 1"
+    },
+    {
+      "id": "unified_moe_cpu",
+      "description": "Unified memory + MoE on CPU",
+      "env": "GGML_CUDA_ENABLE_UNIFIED_MEMORY=1",
+      "flags": "-ngl 99 -fa 1 -cmoe"
+    }
+  ],
+
+  "profiling": {
+    "nsys": {
+      "enabled": true,
+      "trace": ["cuda", "nvtx", "osrt"],
+      "cuda_memory_usage": true
+    },
+    "ncu": {
+      "enabled": false,
+      "kernel_patterns": [".*mul_mat.*", ".*moe.*", ".*flash.*", ".*conv2d.*"],
+      "metrics": ["sm__throughput.avg.pct_of_peak_sustained_elapsed",
+                  "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+                  "l2_cache_hit_rate.pct"]
+    }
+  },
+
+  "repetitions": 3,
+  "warmup_runs": 1
+}
