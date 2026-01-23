@@ -23,7 +23,25 @@ Run with: `/vl-bench <command> [args]`
 | `gpu` | Real-time GPU utilization monitoring |
 | `help` | Show available commands |
 
-## Quick Start
+## Quick Start (Docker - Recommended)
+
+```bash
+# Build the benchmark image
+docker build -t vl-bench -f tools/vl-bench/Dockerfile .
+
+# Run with docker-compose (easiest)
+MODEL_DIR=/path/to/models MODEL_NAME=qwen3vl.gguf \
+  docker compose -f tools/vl-bench/docker-compose.yml run --rm bench status
+
+# Or run directly
+docker run --gpus all \
+  -v /path/to/models:/models \
+  -e MODEL_PATH=/models/qwen3vl.gguf \
+  -e MMPROJ_PATH=/models/mmproj.gguf \
+  vl-bench bench_quick
+```
+
+## Quick Start (Host)
 
 ```bash
 # 1. Check system readiness
@@ -41,10 +59,15 @@ Run with: `/vl-bench <command> [args]`
 
 ## Environment Variables
 
-Set before running:
+For host execution, set before running:
 ```bash
 export MODEL_PATH=/path/to/qwen3vl-30b-a3b-q8.gguf
 export MMPROJ_PATH=/path/to/qwen3vl-mmproj.gguf
+```
+
+For Docker, use `-e` flags or docker-compose environment variables:
+```bash
+MODEL_DIR=/models MODEL_NAME=model.gguf MMPROJ_NAME=mmproj.gguf
 ```
 
 ## Available Configurations
@@ -96,3 +119,43 @@ This skill uses `tools/vl-bench/claude-driver.sh` which is optimized for Claude 
 | Prefill (pp) t/s | >1000 | <500 |
 | Decode (tg) t/s | >20 for 30B | <10 |
 | GPU Utilization | >70% | <30% |
+
+## Docker Reference
+
+### Services
+
+| Service | Use Case |
+|---------|----------|
+| `bench` | Standard benchmarking |
+| `profile` | Nsight profiling (privileged) |
+| `shell` | Interactive debugging |
+
+### docker-compose Commands
+
+```bash
+# Status check
+docker compose -f tools/vl-bench/docker-compose.yml run --rm bench status
+
+# Quick benchmark
+docker compose -f tools/vl-bench/docker-compose.yml run --rm bench bench_quick
+
+# Full sweep
+docker compose -f tools/vl-bench/docker-compose.yml run --rm bench bench_sweep
+
+# Profiling (requires privileged)
+docker compose -f tools/vl-bench/docker-compose.yml run --rm profile profile
+
+# Interactive shell
+docker compose -f tools/vl-bench/docker-compose.yml run --rm shell
+```
+
+### NGC Base Images
+
+For DGX Spark with Blackwell:
+```dockerfile
+# Default (CUDA 12.8)
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+# Or PyTorch NGC
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:24.12-py3
+```

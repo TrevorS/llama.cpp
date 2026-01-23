@@ -16,9 +16,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_DIR="${SCRIPT_DIR}/../.."
-BUILD_DIR="${LLAMA_DIR}/build"
-STATE_FILE="${SCRIPT_DIR}/.bench_state.json"
-RESULTS_DIR="${SCRIPT_DIR}/results"
+
+# Docker detection and path configuration
+IN_DOCKER="false"
+if [[ -f /.dockerenv ]] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+    IN_DOCKER="true"
+fi
+
+# Paths adjust based on Docker vs host execution
+if [[ "$IN_DOCKER" == "true" ]]; then
+    BUILD_DIR="${BUILD_DIR:-/llama.cpp/build}"
+    RESULTS_DIR="${RESULTS_DIR:-/results}"
+    STATE_FILE="${RESULTS_DIR}/.bench_state.json"
+else
+    BUILD_DIR="${LLAMA_DIR}/build"
+    RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
+    STATE_FILE="${SCRIPT_DIR}/.bench_state.json"
+fi
+
+# Ensure results directory exists
+mkdir -p "$RESULTS_DIR" 2>/dev/null || true
 
 # Dual output: human summary + structured JSON
 emit_result() {
@@ -181,8 +198,14 @@ $(printf '  - %s\n' "${issues[@]}")"
     fi
 
     # Build summary
-    local summary="System Status: $([ "$ready" == "true" ] && echo "READY" || echo "NOT READY")
+    local docker_status=""
+    if [[ "$IN_DOCKER" == "true" ]]; then
+        docker_status="Environment: Docker container
+"
+    fi
 
+    local summary="System Status: $([ "$ready" == "true" ] && echo "READY" || echo "NOT READY")
+${docker_status}
 Model: ${MODEL_PATH:-not set} ($model_size, $model_type)
 GPU: $gpu_name ($gpu_memory)
 Driver: $gpu_driver
@@ -196,6 +219,7 @@ Components:
     local json="{
   \"success\": true,
   \"ready\": $ready,
+  \"in_docker\": $IN_DOCKER,
   \"model\": {
     \"path\": \"${MODEL_PATH:-}\",
     \"size\": \"$model_size\",
@@ -576,6 +600,23 @@ cmd_gpu() {
 }
 
 cmd_help() {
+    local docker_info=""
+    if [[ "$IN_DOCKER" == "true" ]]; then
+        docker_info="
+Running in: Docker container"
+    else
+        docker_info="
+Docker Usage:
+  # Build image
+  docker build -t vl-bench -f tools/vl-bench/Dockerfile .
+
+  # Run with docker-compose
+  MODEL_DIR=/path/to/models docker compose -f tools/vl-bench/docker-compose.yml run --rm bench status
+
+  # Or run directly
+  docker run --gpus all -v /path/to/models:/models -e MODEL_PATH=/models/model.gguf vl-bench status"
+    fi
+
     local summary="VL-Bench: Vision-Language Benchmark Suite for llama.cpp
 
 Commands:
@@ -587,17 +628,20 @@ Commands:
   gpu         - Show GPU status
   help        - Show this help
 
-Quick Start:
+Quick Start (Host):
   1. export MODEL_PATH=/path/to/model.gguf
   2. ./claude-driver.sh status
   3. ./claude-driver.sh bench_sweep
+$docker_info
 
 Environment:
   MODEL_PATH  - Path to GGUF model (required)
-  MMPROJ_PATH - Path to vision projector (for VL models)"
+  MMPROJ_PATH - Path to vision projector (for VL models)
+  RESULTS_DIR - Output directory (default: ./results)"
 
     local json="{
   \"success\": true,
+  \"in_docker\": $IN_DOCKER,
   \"commands\": [\"status\", \"bench_quick\", \"bench_sweep\", \"profile\", \"compare\", \"gpu\", \"help\"]
 }"
 
