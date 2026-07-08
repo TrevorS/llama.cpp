@@ -240,6 +240,11 @@ def copy_kvs(writer, kv, src_prefix, dst_arch, overrides):
             newk = dst_arch + "." + k[len(src_prefix) + 1:]
             if newk in overrides:
                 continue  # handled below with correct type
+            # per-layer arrays (e.g. swiglu_clamp_exp[43]) must match the draft's
+            # block_count; values are uniform in the source, so slice
+            n_blk = overrides.get(dst_arch + ".block_count", (None,) * 3)[0]
+            if n_blk and isinstance(val, list) and len(val) > n_blk and "clamp" in k:
+                val = val[:n_blk]
             put(newk, val, vtype, sub)
         elif k == "general.name":
             put(k, val, vtype, sub)
@@ -294,13 +299,29 @@ def core_block_map(b):
 EXPERT_STACKS = [("w1", "ffn_gate_exps"), ("w2", "ffn_down_exps"), ("w3", "ffn_up_exps")]
 N_EXPERTS = 256
 
+# The C++ loader resolves tensor names via tn(id[, suffix, layer]); a suffix is
+# appended with a '.'. We store the registered base name (no suffix) in the maps
+# and apply the exact suffix the create_tensor call uses here:
+#   * FFN_EXP_PROBS_B is created with "bias"  (deepseek4.cpp:172 / dspark.cpp:132)
+#   * DSPARK_MARKOV_W1/W2 and CONF_PROJ use tn(id) with NO suffix (dspark.cpp:146-148)
+#   * every other module tensor uses "weight"
+_NO_SUFFIX = {"dspark.markov_w1", "dspark.markov_w2", "dspark.confidence_proj"}
+
+
+def final_name(base):
+    if base.endswith(".exp_probs_b"):
+        return base + ".bias"
+    if base in _NO_SUFFIX:
+        return base
+    return base + ".weight"
+
 
 def emit_scalar(writer, dst, arr, policy):
     arr = np.ascontiguousarray(arr)
     if policy == "f32":
-        writer.add_tensor(dst, arr.astype(np.float32))
+        writer.add_tensor(final_name(dst), arr.astype(np.float32))
     elif policy == "f16":
-        writer.add_tensor(dst, arr.astype(np.float16))
+        writer.add_tensor(final_name(dst), arr.astype(np.float16))
     else:
         raise ValueError(policy)
 
@@ -314,7 +335,7 @@ def emit_experts(writer, st, src_block_prefix, dst_name):
             arr = st.decode(f"{src_block_prefix}.ffn.experts.{i}.{w_suffix}")  # (out, in) f32
             q_rows.append(gq.quantize(np.ascontiguousarray(arr), GGMLQuantizationType.Q8_0))
         q = np.stack(q_rows, axis=0)   # (256, out, qbytes) uint8
-        writer.add_tensor(f"{dst_name}.{dname}", q, raw_dtype=GGMLQuantizationType.Q8_0)
+        writer.add_tensor(final_name(f"{dst_name}.{dname}"), q, raw_dtype=GGMLQuantizationType.Q8_0)
 
 
 # ----------------------------------------------------------------------------
@@ -338,7 +359,10 @@ def convert(mode, module_dir, main_gguf, out_path):
         if need not in raw:
             raise RuntimeError(f"{need} not found in main GGUF shards {main_shards}")
 
-    writer = gguf.GGUFWriter(out_path, arch)
+    # use_temp_file spools tensor data to a temp file instead of buffering the
+    # whole (up to ~22 GB) output in RAM -- required so the conversion survives
+    # when the main model is resident (runtime testing) and free RAM is tight.
+    writer = gguf.GGUFWriter(out_path, arch, use_temp_file=True)
 
     # -------- KVs --------
     U32 = GGUFValueType.UINT32
@@ -425,11 +449,21 @@ def validate(mode, out_path):
     n_blocks = 1 if mode == "mtp" else 3
     assert bc == n_blocks, f"block_count {bc} != {n_blocks}"
 
+    # suffix contract: every tensor must be .weight/.bias, except the 3 dspark heads
+    bad_suffix = [n for n in tensors
+                  if not (n.endswith(".weight") or n.endswith(".bias") or n in _NO_SUFFIX)]
+    assert not bad_suffix, f"tensors with wrong/missing suffix: {bad_suffix}"
+    # exp_probs_b must carry .bias (not .weight)
+    for b in range(n_blocks):
+        assert f"blk.{b}.exp_probs_b.bias" in tensors, f"blk.{b}.exp_probs_b.bias missing"
+        assert f"blk.{b}.exp_probs_b.weight" not in tensors, f"blk.{b}.exp_probs_b wrongly .weight"
+    print("suffixes               : .weight/.bias contract OK (exp_probs_b=.bias, dspark heads suffix-less)")
+
     # expert stacks
     exp_bad = []
     for b in range(n_blocks):
         for dname in ("ffn_gate_exps", "ffn_down_exps", "ffn_up_exps"):
-            t = tensors[f"blk.{b}.{dname}"]
+            t = tensors[final_name(f"blk.{b}.{dname}")]
             sh = [int(x) for x in t.shape]
             if sh[-1] != N_EXPERTS:
                 exp_bad.append((t.name, sh))
@@ -440,14 +474,14 @@ def validate(mode, out_path):
     # dspark heads
     if mode == "dspark":
         for hn in ("dspark.markov_w1", "dspark.markov_w2", "dspark.confidence_proj"):
-            t = tensors[hn]
+            t = tensors[hn]   # suffix-less by contract
             sh = [int(x) for x in t.shape]
             print(f"  {hn:24s}: {sh} {t.tensor_type.name}")
         m1 = [int(x) for x in tensors["dspark.markov_w1"].shape]
         assert 129280 in m1 and 256 in m1, f"markov_w1 shape family {m1} not (129280,256)"
         m2 = [int(x) for x in tensors["dspark.markov_w2"].shape]
         assert 129280 in m2 and 256 in m2, f"markov_w2 shape family {m2} not (129280,256)"
-        assert "fc" in tensors and "enc.output_norm" in tensors, "fc / enc.output_norm missing"
+        assert "fc.weight" in tensors and "enc.output_norm.weight" in tensors, "fc.weight / enc.output_norm.weight missing"
 
     # raw copies
     for rn in ("token_embd.weight", "output.weight"):

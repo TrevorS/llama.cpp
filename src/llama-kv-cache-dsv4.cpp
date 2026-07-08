@@ -1168,6 +1168,22 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return kv_raw->seq_rm(seq_id, p0, p1);
         }
 
+        // Deeper rollback is allowed iff nothing COMPRESSED exists at or beyond
+        // p0: compression advances only at ratio-block boundaries, so the range
+        // [p0, inf) then lives raw-only and the running compressor state is
+        // unaffected by trimming it. This is exactly the post-checkpoint-restore
+        // situation (speculative verify rollback: restore comp state via
+        // llama_state_seq_set_data PARTIAL, then trim the raw tail).
+        if (seq_id >= 0) {
+            const llama_pos comp_max = std::max(std::max(
+                    kv_csa->seq_pos_max(seq_id),
+                    kv_hca->seq_pos_max(seq_id)),
+                    kv_lid->seq_pos_max(seq_id));
+            if (p0 > comp_max) {
+                return kv_raw->seq_rm(seq_id, p0, p1);
+            }
+        }
+
         return false;
     }
 

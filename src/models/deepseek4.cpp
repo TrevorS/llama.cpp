@@ -48,7 +48,10 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
 
         hparams.dsv4_compress_ratios.fill(0); // raw attention only
         hparams.dsv4_hash_layer_count = 0;
-        hparams.n_layer_nextn         = 1;
+        // NOTE: n_layer_nextn stays 0 — n_layer() is n_layer_all - n_layer_nextn
+        // and the standalone draft's single block must be visible as layer 0 to
+        // the tensor loop and graph (the draft-mtp driver clamps n_mtp_layers
+        // to >= 1 on its own).
 
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         hparams.set_swa_pattern(0);
@@ -1169,8 +1172,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL;
 
-    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        // Standalone MTP draft head. Input hc state = broadcast e-path plus
+    if (model.arch == LLM_ARCH_DEEPSEEK4_MTP) {
+        // Standalone MTP draft head (any gtype — this arch has no other graph;
+        // reserve-time default graphs must also take this path since the
+        // normal input block can't consume the 16384-wide n_embd_inp rows).
+        // Input hc state = broadcast e-path plus
         // per-stream h-path (ds4.c eval_mtp_draft_from_hc):
         //   e    = e_proj(rms(embed(token), enorm)),  repeated across hc
         //   h_hc = h_proj(rms_per_stream(prev_hc, hnorm))

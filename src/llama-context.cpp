@@ -3534,7 +3534,10 @@ llama_context * llama_init_from_model(
     }
 
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.n_layer_nextn == 0) {
+        model->hparams.n_layer_nextn == 0 &&
+        model->arch != LLM_ARCH_DEEPSEEK4_MTP) {
+        // standalone draft-head arches are ALL MTP with zero trunk layers, so
+        // they keep n_layer_nextn == 0 to preserve n_layer() accounting
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }
