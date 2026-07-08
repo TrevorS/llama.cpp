@@ -202,9 +202,10 @@ earlyoom (04:00, killed cicc+claude during build-with-model-resident) and
 SSH-drop user-slice teardown (07:54, non-tmux). Claude now runs in tmux.
 
 Recommended config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
-In flight: KL gate (base vs HC_FUSED, ctx512, docs corpus ~20k tok; original
-kl_corpus.txt was crash-truncated to 748B which is why the first KL pass
-silently produced nothing).
+KL gate (base vs HC_FUSED, ctx512, 50-chunk docs corpus; original kl_corpus.txt
+was crash-truncated to 748B which is why the first KL pass silently produced
+nothing): PASS — median KLD 0.000000, max |Δp| 0.006%, same top token 100.000%.
+Base PPL 3.9265 +/- 0.089. Iteration 8 CLOSED.
 Next candidates: (a) deep-decode gap 12.58->13.0 (decode-side LID chain or
 FA/KV traffic at depth — profile tg64@d32768); (b) re-measure short tg with
 HC_FUSED (expect >16); (c) long-ctx validation at 512k (task #6, alloc
