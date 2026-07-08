@@ -29,6 +29,38 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
     }
 
+    if (arch == LLM_ARCH_DEEPSEEK4_MTP) {
+        // Standalone MTP draft head (see eval_mtp_draft_from_hc in ds4.c): a
+        // single raw-attention DS4 layer — no indexer, no compressors, no
+        // hash routing. Everything below the early return is main-model-only.
+        ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+        ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+        ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+        ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+        ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+
+        ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
+        if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+            throw std::runtime_error("DeepSeek-V4 MTP loader currently expects sqrtsoftplus MoE scoring");
+        }
+
+        GGML_ASSERT(hparams.n_layer() == 1 && "deepseek4mtp expects exactly one MTP block");
+
+        hparams.dsv4_compress_ratios.fill(0); // raw attention only
+        hparams.dsv4_hash_layer_count = 0;
+        hparams.n_layer_nextn         = 1;
+
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        hparams.set_swa_pattern(0);
+
+        // draft input rows = the target's flattened hc-stream state
+        hparams.n_embd_inp_impl   = hparams.n_embd * hparams.dsv4_hc_mult;
+        hparams.n_embd_nextn_impl = hparams.n_embd * hparams.dsv4_hc_mult;
+
+        type = LLM_TYPE_UNKNOWN;
+        return;
+    }
+
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
@@ -148,6 +180,16 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+
+        // standalone MTP draft block: the e/h input combiner
+        // (see ds4.c eval_mtp_draft_from_hc; e is broadcast across hc streams,
+        //  h is the target's previous hc state, per-stream normed + projected)
+        if (arch == LLM_ARCH_DEEPSEEK4_MTP) {
+            layer.nextn.e_proj = create_tensor(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", i), {n_embd, n_embd}, 0);
+            layer.nextn.h_proj = create_tensor(tn(LLM_TENSOR_NEXTN_H_PROJ, "weight", i), {n_embd, n_embd}, 0);
+            layer.nextn.enorm  = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,  "weight", i), {n_embd}, 0);
+            layer.nextn.hnorm  = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,  "weight", i), {n_embd}, 0);
+        }
     }
 }
 
@@ -1118,7 +1160,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_context(params) {
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
@@ -1126,9 +1167,55 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
     const int64_t hc = hparams.dsv4_hc_mult;
-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
-    cb(inpL, "hc_init", -1);
+    ggml_tensor * inpL;
+
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        // Standalone MTP draft head. Input hc state = broadcast e-path plus
+        // per-stream h-path (ds4.c eval_mtp_draft_from_hc):
+        //   e    = e_proj(rms(embed(token), enorm)),  repeated across hc
+        //   h_hc = h_proj(rms_per_stream(prev_hc, hnorm))
+        // where prev_hc arrives as the ubatch embd row (the target's — or the
+        // previous draft step's — flattened h_nextn export, n_embd*hc wide).
+        const auto & layer0 = model.layers[0];
+        GGML_ASSERT(layer0.nextn.e_proj && layer0.nextn.h_proj && layer0.nextn.enorm && layer0.nextn.hnorm);
+
+        const int64_t n_embd_h = hparams.n_embd_nextn();
+
+        auto inp_eh = std::make_unique<llm_graph_input_embd_h>(n_embd_h);
+
+        inp_eh->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp_eh->tokens);
+
+        inp_eh->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
+        ggml_set_input(inp_eh->embd);
+
+        inp_eh->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
+        ggml_set_input(inp_eh->h);
+        ggml_set_name(inp_eh->h, "mtp_h_input");
+
+        ggml_tensor * e = ggml_get_rows(ctx0, model.tok_embd, inp_eh->tokens);
+        e = build_norm(e, layer0.nextn.enorm, nullptr, LLM_NORM_RMS, 0);
+        e = build_lora_mm(layer0.nextn.e_proj, e);
+        cb(e, "mtp_e_proj", 0);
+
+        ggml_tensor * e_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+
+        ggml_tensor * h = ggml_reshape_3d(ctx0, inp_eh->h, n_embd, hc, n_tokens);
+        h = build_norm(h, layer0.nextn.hnorm, nullptr, LLM_NORM_RMS, 0);
+        h = build_lora_mm(layer0.nextn.h_proj, h);
+        cb(h, "mtp_h_proj", 0);
+
+        inpL = ggml_add(ctx0, e_hc, h);
+        cb(inpL, "mtp_hc_init", -1);
+
+        res->add_input(std::move(inp_eh));
+    } else {
+        ggml_tensor * inp = build_inp_embd(model.tok_embd);
+        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+        cb(inpL, "hc_init", -1);
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * residual = inpL;

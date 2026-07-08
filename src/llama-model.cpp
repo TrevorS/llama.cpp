@@ -297,6 +297,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
+        case LLM_ARCH_DSPARK:
+            return new llama_model_dspark(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -2179,7 +2181,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (arch == LLM_ARCH_DEEPSEEK4) {
+                    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_MTP) {
+                        // DEEPSEEK4_MTP: all layers have compress_ratio 0, so the
+                        // composite cache degenerates to kv_raw only (the draft
+                        // block is plain sliding-window MLA — ds4.c raw_window).
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                         res = new llama_kv_cache_dsv4(
@@ -2677,7 +2682,8 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_DSPARK:    return true;
         default:                 return false;
     }
 }
