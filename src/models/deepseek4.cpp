@@ -555,7 +555,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const char * e = getenv("LLAMA_DSV4_FUSED_LID");
         return e && e[0] == '1';
     }();
-    if (dsv4_fused_lid) {
+    // Decode (nt==1): the unfused chain's working set is tiny even at 1M ctx and
+    // its top-k is faster at batch 1, so fuse only prefill-sized batches.
+    if (dsv4_fused_lid && nt > 1) {
         ggml_tensor * fq = ggml_cont(ctx0, indexer_q);       // [d_idx, n_head, nt]
         ggml_tensor * fw = ggml_cont(ctx0, indexer_weights); // [n_head, nt]
         const uint32_t n_top_k = n_lid < (int64_t) hparams.indexer_top_k ? (uint32_t) n_lid : hparams.indexer_top_k;
