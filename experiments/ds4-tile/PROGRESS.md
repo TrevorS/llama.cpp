@@ -102,3 +102,16 @@ Suspect CUDA pool state carryover between tests; recheck if it recurs.
 -> Iteration 6 (moe-tile agent): port experiments/ds4-tile expert-tile kernels into
 mul_mat_id dispatch, env-gated LLAMA_DSV4_MOE_TILE=1 (mul_mat_q 28.9% = #1 consumer).
 HC storm fusion queued behind it.
+
+## Iteration 6b — MoE tile port BLOCKED on quant types (moe-tile agent)
+
+Type-check gate failed before any code: lifted tile kernels (ds4_tile_kernels.cuh) are
+Q4_K-only; model experts are ffn_gate/up_exps IQ2_XXS (42L, IQ2_S x1) and ffn_down_exps
+IQ3_XXS (41L, MXFP4 x2). Profile enums confirm: 16=IQ2_XXS (gate/up), 18=IQ3_XXS (down).
+ds4.c has an IQ2_XXS gate/up kernel (not lifted) but ZERO IQ3 support — the fused
+gate_up->mid->down pipeline cannot close on-device for this quant. Coverage: 0/3.
+Decision: Option A (stand down port). Gate/up-only IQ2_XXS bridge filed as future
+option (payoff capped at ~14.8% slice, routing bridge hard, numerics unvalidated).
+-> moe-tile agent REDIRECTED to HC storm fusion (LLAMA_DSV4_HC_BATCH=1, graph-level
+op batching preferred over new CUDA; targets the 17.7% elementwise slice).
+Fresh nsys re-rank on wmma build in flight (wmma_depth.nsys-rep).
