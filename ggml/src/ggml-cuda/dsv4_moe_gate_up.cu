@@ -166,10 +166,19 @@ __global__ static void dsv4_q8_K_quantize_kernel(dsv4_block_q8_K *out, const flo
 
 // ---- routing bridge: build ds4 sorted-pair tiles from the ggml ids tensor ----
 // (ds4_cuda.cu:11228-11300; "selected" == ggml ids [n_expert_used, n_tokens] I32)
-__global__ static void dsv4_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected, uint32_t pair_count) {
+// ids is typically an ggml_argsort_top_k VIEW: row stride = n_expert, not
+// n_expert_used — so reads go through ids_stride (in int32 units), never flat.
+__device__ __forceinline__ static int32_t dsv4_read_selected(
+        const int32_t *selected, uint32_t pair, uint32_t n_expert_used, uint32_t ids_stride) {
+    const uint32_t tok  = pair / n_expert_used;
+    const uint32_t slot = pair - tok * n_expert_used;
+    return selected[(uint64_t)tok * ids_stride + slot];
+}
+
+__global__ static void dsv4_count_sorted_pairs_kernel(uint32_t *counts, const int32_t *selected, uint32_t pair_count, uint32_t n_expert_used, uint32_t ids_stride) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
-    int32_t e = selected[pair];
+    int32_t e = dsv4_read_selected(selected, pair, n_expert_used, ids_stride);
     if (e < 0) e = 0;
     atomicAdd(counts + (uint32_t)e, 1u);
 }
@@ -186,10 +195,10 @@ __global__ static void dsv4_prefix_sorted_pairs_kernel(uint32_t *offsets, uint32
     }
 }
 
-__global__ static void dsv4_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors, const int32_t *selected, uint32_t pair_count) {
+__global__ static void dsv4_scatter_sorted_pairs_kernel(uint32_t *sorted_pairs, uint32_t *cursors, const int32_t *selected, uint32_t pair_count, uint32_t n_expert_used, uint32_t ids_stride) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
-    int32_t e = selected[pair];
+    int32_t e = dsv4_read_selected(selected, pair, n_expert_used, ids_stride);
     if (e < 0) e = 0;
     uint32_t pos = atomicAdd(cursors + (uint32_t)e, 1u);
     sorted_pairs[pos] = pair;
@@ -320,8 +329,9 @@ void ggml_cuda_op_dsv4_moe_gate_up(ggml_backend_cuda_context & ctx, ggml_tensor 
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(cur));
-    GGML_ASSERT(ggml_is_contiguous(ids));
     GGML_ASSERT(ggml_is_contiguous(dst));
+    // ids may be an argsort_top_k view: contiguous columns, strided rows
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
 
     const uint32_t n_embd        = (uint32_t) gate->ne[0];
     const uint32_t n_ff          = (uint32_t) gate->ne[1];
@@ -366,7 +376,8 @@ void ggml_cuda_op_dsv4_moe_gate_up(ggml_backend_cuda_context & ctx, ggml_tensor 
     uint32_t * tile_experts     = tile_experts_alloc.get();
     uint32_t * tile_starts      = tile_starts_alloc.get();
 
-    const int32_t * selected = (const int32_t *) ids->data;
+    const int32_t * selected   = (const int32_t *) ids->data;
+    const uint32_t  ids_stride = (uint32_t) (ids->nb[1] / sizeof(int32_t));
 
     // 1. quantize activations to q8_K
     dim3 xq_grid(xq_blocks, n_tokens, 1);
@@ -374,9 +385,9 @@ void ggml_cuda_op_dsv4_moe_gate_up(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     // 2. sorted (token,slot) pairs by expert
     CUDA_CHECK(cudaMemsetAsync(counts, 0, n_expert * sizeof(uint32_t), stream));
-    dsv4_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, stream>>>(counts, selected, pair_count);
+    dsv4_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, stream>>>(counts, selected, pair_count, n_expert_used, ids_stride);
     dsv4_prefix_sorted_pairs_kernel<<<1, 1, 0, stream>>>(offsets, cursors, counts, n_expert);
-    dsv4_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, stream>>>(sorted_pairs, cursors, selected, pair_count);
+    dsv4_scatter_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256, 0, stream>>>(sorted_pairs, cursors, selected, pair_count, n_expert_used, ids_stride);
 
     // 3. expert tiles (block_m = 8)
     dsv4_build_tile_offsets_kernel<<<1, 1, 0, stream>>>(tile_offsets, tile_total, counts, n_expert, 8u);

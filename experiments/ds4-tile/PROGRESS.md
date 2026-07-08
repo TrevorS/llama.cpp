@@ -167,3 +167,45 @@ Code state (written pre-crash by moe-iq2 + main, wired end-to-end):
 - In flight: 4-leg bench matrix (base/+HC/+MOE/+both at pp512@d8192, pp2048,
   pp2048@d32768, tg64@d32768) + KL divergence (base vs both) for the MoE bridge's
   numerics gate.
+
+## Iteration 8 results — HC fused BIG WIN; MoE tile bridge NEGATIVE RESULT
+
+Matrix (ub2048, r=3, build 38f8cc0; +fix for MOE legs):
+
+| leg | pp512@d8192 | pp2048 | pp2048@d32768 | tg64@d32768 |
+| --- | --- | --- | --- | --- |
+| base (fused LID) | 308.8 | 392.8 | 294.8 | 12.11 |
+| +HC_FUSED | 357.8 (+16%) | 527.4 (+34%) | 364.3 (+24%) | 12.58 (+4%) |
+| +MOE_TILE | 304.3 (flat) | 342.5 (-13%) | 253.4 (-14%) | n/a |
+| +both | 350.3 | — | 301.6 | n/a |
+
+HC_FUSED clears BOTH remaining ds4.c parity targets: pp2048 527.4 vs 419
+(1.26x FASTER than reference) and pp2048@d32768 364.3 vs 347.7. Greedy A/B
+token-identical (scalar-order accumulation worked as designed). tg64@d32768
+12.58 vs target 13.0 is the only remaining red metric.
+
+MOE_TILE post-mortem: first matrix run crashed every leg — ids from
+ggml_argsort_top_k is a VIEW (row stride n_expert, non-contiguous for
+k < n_expert); the CUDA op asserted contiguity. Test had fed a contiguous
+tensor (gate-1 blind spot). Fixed: count/scatter kernels read ids via
+ids_stride; 2 new backend-ops cases route ids through the real
+argsort_top_k view (one at real n_expert=256). 6/6 PASS. But perf is a
+loss everywhere (above): mul_mat_q IQ2_XXS is already near the bandwidth
+ceiling; the ds4 tile8 kernel only paid off inside ds4.c's fused
+gate_up->mid->down pipeline, which IQ3_XXS down blocks (6b). Op kept in
+tree (correct, env-gated off, tested) as a negative result. Do NOT re-fund
+without a fused-down story; improving mul_mat_q scheduling is the better
+attack on the 27.5% gate/up slice.
+
+Session-crash forensics recorded in memory (gb10-session-crash-causes):
+earlyoom (04:00, killed cicc+claude during build-with-model-resident) and
+SSH-drop user-slice teardown (07:54, non-tmux). Claude now runs in tmux.
+
+Recommended config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
+In flight: KL gate (base vs HC_FUSED, ctx512, docs corpus ~20k tok; original
+kl_corpus.txt was crash-truncated to 748B which is why the first KL pass
+silently produced nothing).
+Next candidates: (a) deep-decode gap 12.58->13.0 (decode-side LID chain or
+FA/KV traffic at depth — profile tg64@d32768); (b) re-measure short tg with
+HC_FUSED (expect >16); (c) long-ctx validation at 512k (task #6, alloc
+already proven).

@@ -4319,9 +4319,12 @@ struct test_dsv4_moe_gate_up : public test_case {
     const int n_used;
     const int64_t n_tokens;
     const float clamp;
+    // route ids through ggml_argsort_top_k like build_moe_ffn does: the result
+    // is a VIEW with row stride n_expert (non-contiguous for n_used < n_expert)
+    const bool noncont_ids;
 
     std::string vars() override {
-        return VARS_TO_STR7(type_w, n_embd, n_ff, n_expert, n_used, n_tokens, clamp);
+        return VARS_TO_STR8(type_w, n_embd, n_ff, n_expert, n_used, n_tokens, clamp, noncont_ids);
     }
 
     // activations quantize to q8_K on both paths but with slightly different
@@ -4337,9 +4340,9 @@ struct test_dsv4_moe_gate_up : public test_case {
 
     test_dsv4_moe_gate_up(ggml_type type_w = GGML_TYPE_IQ2_XXS,
             int64_t n_embd = 256, int64_t n_ff = 256, int n_expert = 8, int n_used = 2,
-            int64_t n_tokens = 5, float clamp = 0.0f)
+            int64_t n_tokens = 5, float clamp = 0.0f, bool noncont_ids = false)
         : type_w(type_w), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used),
-          n_tokens(n_tokens), clamp(clamp) {
+          n_tokens(n_tokens), clamp(clamp), noncont_ids(noncont_ids) {
             GGML_ASSERT(n_used <= n_expert);
         }
 
@@ -4352,8 +4355,15 @@ struct test_dsv4_moe_gate_up : public test_case {
         ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(cur, "cur");
 
-        // contiguous [n_used, n_tokens] ids (matches ggml_argsort_top_k output)
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * ids;
+        if (noncont_ids) {
+            // production layout: argsort_top_k view, row stride n_expert
+            ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+            ggml_set_name(probs, "probs");
+            ids = ggml_argsort_top_k(ctx, probs, n_used);
+        } else {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        }
         ggml_set_name(ids, "ids");
 
         ggml_tensor * out = ggml_dsv4_moe_gate_up(ctx, gate, up, cur, ids, clamp);
@@ -8927,6 +8937,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  0.0f));
     test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  7.0f)); // clamp path
     test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 4096, 512,  32, 6, 64,  0.0f)); // near-real dims
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  0.0f, true)); // argsort_top_k view ids
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 4096, 512,  256, 6, 64, 7.0f, true)); // real n_expert + view ids + clamp
 
     // DeepSeek-V4 fused hyper-connection mixing (both modes; hc=8 is GGML_DSV4_HC_MAX)
     test_cases.emplace_back(new test_dsv4_hc_weighted_sum(256,  4, 5));
