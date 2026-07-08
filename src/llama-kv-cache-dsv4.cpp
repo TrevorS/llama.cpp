@@ -1292,19 +1292,29 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    // Mirror state_write.
+    // Mirror state_write. A failure mid-way (e.g. comp state_size mismatch when
+    // the source context had a different n_ctx) must not leave the cache
+    // half-restored: kv_raw succeeds first and would keep the restored cells,
+    // making every subsequent decode fail to find a KV slot. Roll back the
+    // sequence before rethrowing so callers can fall back to a re-decode.
     const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    kv_raw->state_read(io, seq_id, raw_flags);
+    try {
+        kv_raw->state_read(io, seq_id, raw_flags);
 
-    dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-    dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-    dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
+        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
-
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (seq_id < 0 || !seq_rm(seq_id, -1, -1)) {
+            clear(true);
+        }
+        throw;
+    }
 }
 
 llama_kv_cache_iswa * llama_kv_cache_dsv4::get_raw() const {
