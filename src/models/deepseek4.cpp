@@ -55,6 +55,11 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
 
+    // nextn/MTP export width: the DS4 MTP head consumes the flattened
+    // hc-stream state, not the collapsed hidden state (see graph tail).
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    hparams.n_embd_nextn_impl = hparams.n_embd * hparams.dsv4_hc_mult;
+
     switch (hparams.n_layer()) {
         case 43: type = LLM_TYPE_UNKNOWN; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -1198,10 +1203,28 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(inpL, "l_out", il);
     }
 
-    if (inp_out_ids) {
+    // Flattened post-final-layer HC state [n_embd*hc, nt]. This is what the
+    // DS4 MTP head consumes (prev_hc in ds4.c terms), so it doubles as the
+    // nextn embedding export; row selection order mirrors qwen35 (masked:
+    // output rows only; unmasked: every token row, MTP needs them all).
+    {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
-        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
-        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
+
+        if (inp_out_ids && cparams.embeddings_nextn_masked) {
+            flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        }
+
+        if (cparams.embeddings_nextn) {
+            cb(flat, "h_nextn", -1);
+            res->t_h_nextn = flat;
+        }
+
+        if (inp_out_ids && !cparams.embeddings_nextn_masked) {
+            flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        }
+
+        const int64_t nt_out = inp_out_ids ? n_outputs : n_tokens;
+        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, nt_out);
     }
 
     cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);

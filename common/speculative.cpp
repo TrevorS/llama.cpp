@@ -1242,8 +1242,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
-        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
+        // h_nextn row width: n_embd for most targets, but arch-overridable
+        // (deepseek4 exports the flattened hc-stream state, wider than n_embd)
+        n_embd = llama_model_n_embd_nextn(llama_get_model(ctx_tgt));
+        GGML_ASSERT(n_embd == llama_model_n_embd_inp(llama_get_model(ctx_dft)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 

@@ -568,6 +568,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    // row width of the nextn/MTP hidden-state export (== n_embd_out unless the
+    // arch overrides it, e.g. deepseek4 exports the flattened hc-stream state)
+    LLAMA_API int32_t llama_model_n_embd_nextn (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
