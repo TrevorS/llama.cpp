@@ -210,3 +210,36 @@ Next candidates: (a) deep-decode gap 12.58->13.0 (decode-side LID chain or
 FA/KV traffic at depth — profile tg64@d32768); (b) re-measure short tg with
 HC_FUSED (expect >16); (c) long-ctx validation at 512k (task #6, alloc
 already proven).
+
+## Iteration 9 — deep-decode gap CLOSED; ALL ds4.c parity targets MET
+
+Free datapoint: short tg64 with HC_FUSED = 16.66 +-0.63 (new best; was 15.99).
+
+nsys tg64@d32768 decode-phase attribution (tg_depth capture; note CUPTI
+dropped events after ~2 decode tokens — enough for attribution; window
+anchored on hc_weighted_sum=86/eval): deep decode is LAUNCH-BOUND, not
+kernel-bound. Per token: ~7,644 k_bin_bcast (grid 1x1x1!, 1.6us) + ~3,420
+reduce_rows (4x1x1, 1.4us) + ~620 mul_mat_vec_q = ~11k launches/token,
+GPU ~45% busy. Attribution: the UNFUSED decode-side LID chain
+(relu->mul->sum_rows->add over ~80 ctx chunks/layer at d32768) — the
+iteration-2 decision to keep decode unfused inverts at depth because the
+chain's launch count scales linearly with ctx.
+
+Fix: fuse decode-side LID when n_lid >= threshold (default 4096; env
+LLAMA_DSV4_FUSED_LID_TG_DEPTH, 0=always, huge=never). ~10 LOC in
+deepseek4.cpp, no kernel changes.
+
+Gates (build w/ fix):
+- backend-ops DSV4_LID_TOPK: PASS (no kernel change)
+- greedy A/B at 9k-token depth, 64 gen: TOKEN-IDENTICAL (old vs new)
+- tg64@d32768: 12.57 -> 13.47 +-0.37 (+7%) — BEATS ds4.c 13.0
+- tg64 short: 16.57 (unchanged; d<4096 keeps unfused chain, as designed)
+
+SCOREBOARD — all four original targets now met (ds4.c reference in parens):
+  pp2048 short    527.4  (419)    1.26x FASTER
+  tg64 short       16.6  (14.36)  1.16x
+  pp2048@d32768   364.3  (347.7)  1.05x
+  tg64@d32768      13.47 (13.0)   1.04x
+Config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
+Remaining open item: long-ctx validation at 512k (target #2 / task #6 —
+allocation proven in iteration 2, needs a real run + tg@512k gate).

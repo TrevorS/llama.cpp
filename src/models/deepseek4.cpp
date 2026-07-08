@@ -583,9 +583,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const char * e = getenv("LLAMA_DSV4_FUSED_LID");
         return e && e[0] == '1';
     }();
-    // Decode (nt==1): the unfused chain's working set is tiny even at 1M ctx and
-    // its top-k is faster at batch 1, so fuse only prefill-sized batches.
-    if (dsv4_fused_lid && nt > 1) {
+    // Decode (nt==1): at shallow depth the unfused chain's top-k is faster at
+    // batch 1, so it stays unfused. But its launch count scales with context
+    // (~11k single-block launches/token at d32768 — launch-bound, GPU ~45%
+    // idle; see PROGRESS.md iteration 9), so past a depth threshold the fused
+    // op wins. Threshold override: LLAMA_DSV4_FUSED_LID_TG_DEPTH (tokens;
+    // 0 = always fuse decode, very large = never, i.e. pre-iteration-9).
+    static const int64_t dsv4_lid_tg_depth = []() {
+        const char * e = getenv("LLAMA_DSV4_FUSED_LID_TG_DEPTH");
+        return e ? atoll(e) : (long long) 4096;
+    }();
+    if (dsv4_fused_lid && (nt > 1 || n_lid >= dsv4_lid_tg_depth)) {
         ggml_tensor * fq = ggml_cont(ctx0, indexer_q);       // [d_idx, n_head, nt]
         ggml_tensor * fw = ggml_cont(ctx0, indexer_weights); // [n_head, nt]
         const uint32_t n_top_k = n_lid < (int64_t) hparams.indexer_top_k ? (uint32_t) n_lid : hparams.indexer_top_k;
