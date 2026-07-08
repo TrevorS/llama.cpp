@@ -548,6 +548,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
     cb(indexer_k, "lid_k", il);
 
+    // Fused lightning-indexer score+top-k (env-gated). Replaces the 8-op chain
+    // below with a single op whose working set is O(chunk x n_tokens) instead of
+    // O(n_ctx x n_tokens x n_head), so long contexts stay allocatable.
+    static const bool dsv4_fused_lid = []() {
+        const char * e = getenv("LLAMA_DSV4_FUSED_LID");
+        return e && e[0] == '1';
+    }();
+    if (dsv4_fused_lid) {
+        ggml_tensor * fq = ggml_cont(ctx0, indexer_q);       // [d_idx, n_head, nt]
+        ggml_tensor * fw = ggml_cont(ctx0, indexer_weights); // [n_head, nt]
+        const uint32_t n_top_k = n_lid < (int64_t) hparams.indexer_top_k ? (uint32_t) n_lid : hparams.indexer_top_k;
+        ggml_tensor * top_k = ggml_dsv4_lid_topk(ctx0, fq, indexer_k, fw, inp_lid.kq_mask, n_top_k);
+        cb(top_k, "lid_top_k", il);
+        return top_k;
+    }
+
     const int64_t n_stream = indexer_k->ne[3];
     indexer_q = ggml_view_4d(ctx0, indexer_q,
             indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream,

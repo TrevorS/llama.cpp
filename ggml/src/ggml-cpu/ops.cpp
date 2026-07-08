@@ -8334,6 +8334,82 @@ void ggml_compute_forward_argsort(
     }
 }
 
+// ggml_compute_forward_dsv4_lid_topk
+
+void ggml_compute_forward_dsv4_lid_topk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0]; // [d_idx, n_head, nt]
+    const ggml_tensor * k       = dst->src[1]; // [d_idx, 1, n_lid, n_stream]
+    const ggml_tensor * weights = dst->src[2]; // [n_head, nt]
+    const ggml_tensor * mask    = dst->src[3]; // [n_lid, nt/n_stream, 1, n_stream]
+
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t d_idx    = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_lid    = k->ne[2];
+    const int64_t nt_s     = mask->ne[1];
+    const int64_t n_top_k  = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nrows = n_stream * nt_s;
+
+    std::vector<float>   scores(n_lid);
+    std::vector<int32_t> order(n_lid);
+
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const int64_t s       = r / nt_s;
+        const int64_t t_local = r % nt_s;
+        const int64_t t       = s * nt_s + t_local; // global token (contiguous stream fold)
+
+        const char * q_t = (const char *) q->data       + t*q->nb[2];
+        const char * w_t = (const char *) weights->data + t*weights->nb[1];
+        const char * m_r = (const char *) mask->data     + s*mask->nb[3] + t_local*mask->nb[1];
+
+        for (int64_t j = 0; j < n_lid; j++) {
+            const char * k_j = (const char *) k->data + s*k->nb[3] + j*k->nb[2];
+            float acc = 0.0f;
+            for (int64_t h = 0; h < n_head; h++) {
+                const float * qh = (const float *)(q_t + h*q->nb[1]);
+                float dot = 0.0f;
+                if (k->type == GGML_TYPE_F32) {
+                    const float * kh = (const float *) k_j;
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
+                } else {
+                    const ggml_fp16_t * kh = (const ggml_fp16_t *) k_j;
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * GGML_FP16_TO_FP32(kh[d]);
+                }
+                const float wh = ((const float *) w_t)[h];
+                acc += (dot > 0.0f ? dot : 0.0f) * wh;
+            }
+            const float mv = ((const float *) m_r)[j];
+            scores[j] = acc + mv;
+            order[j]  = (int32_t) j;
+        }
+
+        // descending by score, lower index on ties (matches CUDA bitonic tie-break)
+        const float * sc = scores.data();
+        std::partial_sort(order.begin(), order.begin() + n_top_k, order.end(),
+            [sc](int32_t a, int32_t b) {
+                const float sa = sc[a], sb = sc[b];
+                return sa > sb || (sa == sb && a < b);
+            });
+
+        int32_t * dst_row = (int32_t *)((char *) dst->data + t_local*dst->nb[1] + s*dst->nb[3]);
+        for (int64_t kk = 0; kk < n_top_k; kk++) {
+            dst_row[kk] = order[kk];
+        }
+    }
+}
+
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {

@@ -1094,9 +1094,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "DSV4_LID_TOPK",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,9 +1207,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dsv4_lid_topk(q,k,w,mask)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5351,6 +5355,50 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_dsv4_lid_topk
+
+struct ggml_tensor * ggml_dsv4_lid_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        int                   n_top_k) {
+    GGML_ASSERT(q);
+    GGML_ASSERT(k);
+    GGML_ASSERT(weights);
+    GGML_ASSERT(mask);
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F32);
+
+    const int64_t d_idx    = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_lid    = k->ne[2];
+    const int64_t nt_s     = mask->ne[1];
+
+    GGML_ASSERT(k->ne[0]       == d_idx);
+    GGML_ASSERT(k->ne[1]       == 1);
+    GGML_ASSERT(weights->ne[0] == n_head);
+    GGML_ASSERT(mask->ne[0]    == n_lid);
+    GGML_ASSERT(n_top_k > 0 && n_top_k <= n_lid);
+    GGML_ASSERT(q->ne[2]       == nt_s * n_stream);
+
+    // output mirrors the ggml_top_k(indexer_score) shape: [n_top_k, nt/n_stream, 1, n_stream]
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nt_s, 1, n_stream);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_top_k);
+
+    result->op     = GGML_OP_DSV4_LID_TOPK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+    result->src[3] = mask;
 
     return result;
 }

@@ -5654,6 +5654,62 @@ struct test_argsort : public test_case {
     }
 };
 
+// GGML_OP_DSV4_LID_TOPK
+struct test_dsv4_lid_topk : public test_case {
+    const ggml_type k_type;
+    const int64_t d_idx;
+    const int64_t n_head;
+    const int64_t n_lid;
+    const int64_t nt_s;
+    const int64_t n_stream;
+    const int top_k;
+
+    std::string vars() override {
+        return std::string("k_type=") + ggml_type_name(k_type) +
+               ",d_idx=" + std::to_string(d_idx) + ",n_head=" + std::to_string(n_head) +
+               ",n_lid=" + std::to_string(n_lid) + ",nt_s=" + std::to_string(nt_s) +
+               ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k);
+    }
+
+    test_dsv4_lid_topk(ggml_type k_type = GGML_TYPE_F32,
+            int64_t d_idx = 128, int64_t n_head = 64, int64_t n_lid = 2048,
+            int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512)
+        : k_type(k_type), d_idx(d_idx), n_head(n_head), n_lid(n_lid),
+          nt_s(nt_s), n_stream(n_stream), top_k(top_k) {}
+
+    // Output is index sets per row; compare order-independently (top-k selection
+    // is a set — the downstream mask does not care about intra-row order).
+    double max_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t rows = n / (size_t) top_k;
+        size_t mism = 0;
+        for (size_t r = 0; r < rows; r++) {
+            std::set<int> sa, sb;
+            for (int i = 0; i < top_k; i++) {
+                sa.insert((int) a[r*top_k + i]);
+                sb.insert((int) b[r*top_k + i]);
+            }
+            for (int x : sa) { if (!sb.count(x)) { mism++; } }
+        }
+        return n ? (double) mism / (double) n : 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nt = nt_s * n_stream;
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_idx, n_head, nt);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, d_idx, 1, n_lid, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, nt);
+        ggml_set_name(w, "w");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_lid, nt_s, 1, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_dsv4_lid_topk(ctx, q, k, w, mask, top_k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9045,6 +9101,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
+
+    // GGML_OP_DSV4_LID_TOPK (DeepSeek-V4 fused lightning-indexer score + top-k)
+    //                                       k_type,          d_idx, n_head, n_lid, nt_s, n_stream, top_k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,   300,    1, 1,  64));  // decode (nt=1), single chunk, n_lid % chunk != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    8, 1, 256));  // small
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,    4, 1, 512));  // realistic dims, F16 k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8,  5000,    2, 1, 128));  // multi-chunk (>4096), not divisible, F16
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  4097,    2, 1, 100));  // just over one chunk boundary
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
