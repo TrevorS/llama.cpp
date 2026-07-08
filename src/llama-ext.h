@@ -9,6 +9,12 @@
 #include <cstdint>
 #include <map>
 
+// DSpark: compute the low-rank Markov head bias B[prev] = W2 @ W1[prev] for the
+// draft head, writing a length-n_vocab additive bias into `out` (caller-allocated).
+// No-op (leaves `out` untouched) if `model` is not a DSpark draft model. Used by
+// the draft-dspark speculative driver to make the parallel block semi-autoregressive.
+LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * out);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
