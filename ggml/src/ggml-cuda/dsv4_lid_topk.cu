@@ -1,6 +1,7 @@
 #include "dsv4_lid_topk.cuh"
 
 #include <cstdint>
+#include <mma.h>
 
 // DSV4_TOPK_SORT_N is defined in dsv4_lid_topk.cuh (shared with supports_op).
 
@@ -81,6 +82,115 @@ static __global__ void dsv4_score_kernel(
             scores[(int64_t)t*n_lid + j] = acc + mv;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// tensor-core score kernel (head_dim == 128, one CUDA stream-group per launch)
+//
+// Ported from ds4_cuda.cu indexer_scores_wmma128_kernel. Computes, for a 16-token
+// x 128-comp tile, score(t,j) = sum_h relu(q_th . k_j) * weights[h,t] + mask[j],
+// using 16x16x16 fp16 wmma fragments (8 warps, each owning one 16-comp sub-tile).
+// q is rounded to fp16 for the matmul; the running-topk stage re-reads these
+// scores, so selection matches the CPU reference to within fp16 boundary noise.
+//
+// One CUDA-stream-group (s) per launch: pointers are pre-offset so the kernel
+// addresses tokens/comps/mask locally. This keeps a 16-token tile within a single
+// stream even when nt_s is not a multiple of 16.
+// ---------------------------------------------------------------------------
+
+template <typename KT>
+static __global__ void dsv4_score_wmma128_kernel(
+        float       * __restrict__ scores,   // [nt_s, n_lid] for this stream
+        const float * __restrict__ q,        // [(t*n_head + h)*128 + d] for this stream
+        const float * __restrict__ weights,  // [t*n_head + h] for this stream
+        const KT    * __restrict__ k,        // [j*nbk2 + d] for this stream
+        const float * __restrict__ mask,     // [t*nbm1 + j] for this stream
+        int64_t nbk2, int64_t nbm1,
+        int n_tokens, int n_lid, int n_head) {
+#if __CUDA_ARCH__ >= 700
+    namespace wmma = nvcuda::wmma;
+    const uint32_t tile_c = blockIdx.x * 128u;
+    const uint32_t tile_t = blockIdx.y * 16u;
+    const uint32_t tid    = threadIdx.x;
+    const uint32_t warp   = tid >> 5u;
+
+    __shared__ __half a_sh[16 * 128];
+    __shared__ __half b_sh[128 * 128];
+    __shared__ float  c_sh[8 * 16 * 16];
+
+    float acc[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
+
+    // load this comp-tile's k rows into b_sh (b_sh[d + c*128], col-major for wmma)
+    for (uint32_t i = tid; i < 128u * 128u; i += 256u) {
+        const uint32_t c = i >> 7u;      // comp within tile
+        const uint32_t d = i & 127u;
+        const uint32_t comp = tile_c + c;
+        float v = 0.0f;
+        if (comp < (uint32_t) n_lid) v = dsv4_ldk(k + (int64_t) comp * nbk2 + d);
+        b_sh[d + c * 128u] = __float2half(v);
+    }
+    __syncthreads();
+
+    for (int h = 0; h < n_head; h++) {
+        for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
+            const uint32_t r = i >> 7u;
+            const uint32_t d = i & 127u;
+            const uint32_t token = tile_t + r;
+            float v = 0.0f;
+            if (token < (uint32_t) n_tokens) {
+                v = q[((int64_t) token * n_head + h) * 128 + d];
+            }
+            a_sh[i] = __float2half(v);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+        wmma::fill_fragment(c_frag, 0.0f);
+        const uint32_t col0 = warp * 16u;
+        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
+            wmma::load_matrix_sync(a_frag, a_sh + k0, 128);
+            wmma::load_matrix_sync(b_frag, b_sh + col0 * 128u + k0, 128);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        wmma::store_matrix_sync(c_sh + warp * 16u * 16u, c_frag, 16, wmma::mem_row_major);
+        __syncthreads();
+
+        const uint32_t local0 = tid & 255u;
+        const uint32_t token0 = tile_t + (local0 >> 4u);
+        const float w0 = token0 < (uint32_t) n_tokens ? weights[(int64_t) token0 * n_head + h] : 0.0f;
+        uint32_t slot = 0;
+        for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
+            const uint32_t wtile = i >> 8u;
+            const uint32_t local = i & 255u;
+            const uint32_t r = local >> 4u;
+            const uint32_t c = local & 15u;
+            const uint32_t token = tile_t + r;
+            const uint32_t comp  = tile_c + wtile * 16u + c;
+            if (token < (uint32_t) n_tokens && comp < (uint32_t) n_lid) {
+                acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
+            }
+        }
+        __syncthreads();
+    }
+
+    uint32_t slot = 0;
+    for (uint32_t i = tid; i < 8u * 16u * 16u; i += 256u, slot++) {
+        const uint32_t wtile = i >> 8u;
+        const uint32_t local = i & 255u;
+        const uint32_t r = local >> 4u;
+        const uint32_t c = local & 15u;
+        const uint32_t token = tile_t + r;
+        const uint32_t comp  = tile_c + wtile * 16u + c;
+        if (token < (uint32_t) n_tokens && comp < (uint32_t) n_lid) {
+            const float mv = mask[(int64_t) token * nbm1 + comp];
+            scores[(int64_t) token * n_lid + comp] = acc[slot] + mv;
+        }
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -290,23 +400,46 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int64_t nbm1 = mask->nb[1] / sizeof(float);
     const int64_t nbm3 = mask->nb[3] / sizeof(float);
 
-    const int j_tile      = 512;
-    const int block       = 256;
-    const size_t smem     = ((size_t) d_idx*n_head + n_head) * sizeof(float);
-    dim3 grid_score(nt, (n_lid + j_tile - 1) / j_tile, 1);
-
     const float * q_d = (const float *) q->data;
     const float * w_d = (const float *) weights->data;
     const float * m_d = (const float *) mask->data;
 
-    if (k->type == GGML_TYPE_F16) {
-        dsv4_score_kernel<half><<<grid_score, block, smem, stream>>>(
-                scores, q_d, w_d, (const half *) k->data, m_d,
-                nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+    // Tensor-core path: requires head_dim == 128 (the wmma 16x16x16 k-tiling).
+    // One launch per CUDA stream-group so a 16-token tile never straddles a
+    // stream boundary; falls back to the scalar dot-product kernel otherwise.
+    if (d_idx == 128) {
+        const dim3 block(256);
+        const dim3 grid((n_lid + 127) / 128, (nt_s + 15) / 16, 1);
+        for (int s = 0; s < n_stream; s++) {
+            const int64_t t0    = (int64_t) s * nt_s;
+            float       * sc_s  = scores + t0 * n_lid;
+            const float * q_s   = q_d + t0 * n_head * d_idx;
+            const float * w_s   = w_d + t0 * n_head;
+            const float * m_s   = m_d + (int64_t) s * nbm3;
+            if (k->type == GGML_TYPE_F16) {
+                const half * k_s = (const half *) k->data + (int64_t) s * nbk3;
+                dsv4_score_wmma128_kernel<half><<<grid, block, 0, stream>>>(
+                        sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
+            } else {
+                const float * k_s = (const float *) k->data + (int64_t) s * nbk3;
+                dsv4_score_wmma128_kernel<float><<<grid, block, 0, stream>>>(
+                        sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
+            }
+        }
     } else {
-        dsv4_score_kernel<float><<<grid_score, block, smem, stream>>>(
-                scores, q_d, w_d, (const float *) k->data, m_d,
-                nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+        const int j_tile  = 512;
+        const int block   = 256;
+        const size_t smem = ((size_t) d_idx*n_head + n_head) * sizeof(float);
+        dim3 grid_score(nt, (n_lid + j_tile - 1) / j_tile, 1);
+        if (k->type == GGML_TYPE_F16) {
+            dsv4_score_kernel<half><<<grid_score, block, smem, stream>>>(
+                    scores, q_d, w_d, (const half *) k->data, m_d,
+                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+        } else {
+            dsv4_score_kernel<float><<<grid_score, block, smem, stream>>>(
+                    scores, q_d, w_d, (const float *) k->data, m_d,
+                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+        }
     }
 
     // output is contiguous [n_top_k, nt_s, 1, n_stream] == flat [nt * n_top_k]

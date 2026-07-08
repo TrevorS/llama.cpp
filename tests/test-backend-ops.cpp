@@ -5679,7 +5679,11 @@ struct test_dsv4_lid_topk : public test_case {
 
     // Output is index sets per row; compare order-independently (top-k selection
     // is a set — the downstream mask does not care about intra-row order).
-    double max_err() override { return 0.0; }
+    // The CUDA head_dim==128 path scores with fp16 tensor cores (q rounded to
+    // fp16), so a tiny fraction of indices at near-tie score boundaries may
+    // differ from the fp32 CPU reference. Allow a small set-mismatch fraction
+    // there; keep the scalar path (d_idx != 128) strict at exact set match.
+    double max_err(ggml_backend_t) override { return d_idx == 128 ? 3e-3 : 0.0; }
     double err(const float * a, const float * b, size_t n) override {
         const size_t rows = n / (size_t) top_k;
         size_t mism = 0;
@@ -9110,6 +9114,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8,  5000,    2, 1, 128));  // multi-chunk (>4096), not divisible, F16
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  4097,    2, 1, 100));  // just over one chunk boundary
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
+    // wmma score path (d_idx == 128): multi-token-tile, non-128-divisible n_lid, streams
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // wmma: 3 token-tiles (partial), n_lid % 128 != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  6000,   33, 1, 256));  // wmma: multi-chunk topk + partial token tile
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // wmma: n_stream = 2, per-stream launch
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

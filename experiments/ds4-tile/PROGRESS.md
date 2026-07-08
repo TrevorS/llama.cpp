@@ -40,3 +40,47 @@ Status vs targets: tg 16.0 (met, pending re-confirm), pp short 374.8 vs 419 (gap
 Decode fix confirmed: tg64 short = 15.91 (target met). Depth at ub2048: pp2048@d32768 147.3 (ds4: 347.7), tg64@d32768 11.71 (ds4: 13.0), pp512@d8192 242.4.
 nsys pp512@d8192 kernel breakdown: dsv4_score_kernel 22.4% (simple dp -> wmma port needed), k_bin_bcast mul+add 17.7% (25k tiny launches — anomalous, attribute+absorb), mul_mat_q 28.9% (MoE, task #3), flash_attn 10.7% (fine), concat 5.7%.
 -> Iteration 5 (lid-wmma agent): wmma scores + elementwise storm cleanup.
+
+## Iteration 5 results (lid-wmma)
+
+Goal: replace the fused op's scalar `dsv4_score_kernel` (22.4% of GPU @ pp512/d8192,
+41.5ms avg/launch) with a tensor-core kernel, and attribute/eliminate the k_bin_bcast
+storm (op_mul 1150ms + op_add 1080ms cumulative — the #2/#3 GPU consumers at depth).
+
+Profile (pp512@d8192, sqlite): dsv4_score_kernel<half> 68 launches, 2819ms total (#1).
+Storm real cost is in 2 big op_add variants (gridX=8192 173ms, gridX=32768 871ms) and
+2 big op_mul variants (grid 16x512 305ms, 16x2048 720ms); op_div/reduce_rows are cheap.
+
+- [gate 1] test-backend-ops -o DSV4_LID_TOPK: 10/10 PASS (added 4 wmma-path shapes:
+  multi-token-tile, non-128-div n_lid, n_stream=2, F32 k). wmma path (d_idx==128) rounds
+  q to fp16 -> ~1e-4 set-mismatch at near-tie boundaries; gated small max_err there,
+  scalar path stays strict at 0. Deterministic across runs.
+
+### k_bin_bcast storm attribution (target 2) — OUT OF DSV4-INDEXER SCOPE
+
+Attributed by inverting the binbcast grid->dst-shape mapping (block.x=128 for
+contiguous F32; ne0=gridX*256; broadcast operand stops collapse at dim0) and matching
+per-layer op counts. Result: n_embd=4096, nt in {512,2048}, n_layer=43.
+
+The 4 big variants are ALL the DeepSeek-V4 hyper-connection (HC) residual mixing in
+deepseek4.cpp (build_hc_weighted_sum ~L237-238, build_hc_post ~L345-350), NOT the
+lightning indexer:
+- op_add gridX=8192  -> [n_embd, nt=512]  contiguous HC add (full collapse: 8192*256 = 4096*512)
+- op_add gridX=32768 -> [n_embd, nt=2048] contiguous HC add (32768*256 = 4096*2048; the "4x depth" is coincidence = n_embd*2048)
+- op_mul 16x512      -> [n_embd,512]  x [1,nt] broadcast HC weight-mul
+- op_mul 16x2048     -> [n_embd,2048] x [1,nt] broadcast HC weight-mul
+Per layer: 48 HC muls + 39 HC adds; counts match 2 pp512 evals + partial depth-fill evals
+exactly (add:mul ratio 0.813 observed = structural 39:48). ~87 elementwise launches/layer
+x 43 layers.
+
+Both brief-named suspects RULED OUT:
+- build_top_k_mask ggml_add (L653): operates on [n_csa, nt] masks -> cheap (4096,1,1)
+  op_add variant, 42 launches ~1.5ms total. Not the storm.
+- unfused indexer relu->mul->sum_rows->add: ABSENT from profile (no relu kernel; fused
+  dsv4_score/topk kernels present) -> fused path correctly active for prefill, no bug.
+
+Decision: left as-is this iteration. HC mixing is a distinct DSV4 feature, not absorbable
+into ggml_dsv4_lid_topk, and warrants its own fused op / graph-batching workstream with
+independent numerics validation (proposed: batch build_hc_weighted_sum as a broadcast-mul
++ hc-axis reduction, and build_hc_post's comb-mix as a batched ggml_mul_mat over nt;
+~9-14x launch reduction targeting ~2070ms). Filed for a follow-up iteration.
