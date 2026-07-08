@@ -4310,6 +4310,116 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_DSV4_MOE_GATE_UP (DeepSeek-V4 fused gate+up+activation prefill tile op)
+struct test_dsv4_moe_gate_up : public test_case {
+    const ggml_type type_w;   // gate/up expert weight type (IQ2_XXS)
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int n_expert;
+    const int n_used;
+    const int64_t n_tokens;
+    const float clamp;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_w, n_embd, n_ff, n_expert, n_used, n_tokens, clamp);
+    }
+
+    // activations quantize to q8_K on both paths but with slightly different
+    // algorithms (ggml -128/max vs ds4 -127/maxv); agreement, not bit-equality.
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ull * 2 * n_embd * n_ff * n_used * n_tokens; // gate + up
+    }
+
+    test_dsv4_moe_gate_up(ggml_type type_w = GGML_TYPE_IQ2_XXS,
+            int64_t n_embd = 256, int64_t n_ff = 256, int n_expert = 8, int n_used = 2,
+            int64_t n_tokens = 5, float clamp = 0.0f)
+        : type_w(type_w), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used),
+          n_tokens(n_tokens), clamp(clamp) {
+            GGML_ASSERT(n_used <= n_expert);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        // contiguous [n_used, n_tokens] ids (matches ggml_argsort_top_k output)
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_dsv4_moe_gate_up(ctx, gate, up, cur, ids, clamp);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_expert);
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 0 (DeepSeek-V4 hyper-connection weighted sum)
+struct test_dsv4_hc_weighted_sum : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_weighted_sum(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_dsv4_hc_weighted_sum(ctx, x, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 1 (DeepSeek-V4 hyper-connection post/comb mixing)
+struct test_dsv4_hc_post : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_post(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(res, "res");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, x, res, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8811,6 +8921,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // DeepSeek-V4 fused MoE gate+up tile op (IQ2_XXS experts)
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 256,  256,  8,  2, 5,   0.0f));
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  0.0f));
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  7.0f)); // clamp path
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 4096, 512,  32, 6, 64,  0.0f)); // near-real dims
+
+    // DeepSeek-V4 fused hyper-connection mixing (both modes; hc=8 is GGML_DSV4_HC_MAX)
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 4, 1));   // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 8, 17));  // hc max, odd nt
+    test_cases.emplace_back(new test_dsv4_hc_post(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 4, 1));           // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 8, 17));          // hc max, odd nt
 
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {

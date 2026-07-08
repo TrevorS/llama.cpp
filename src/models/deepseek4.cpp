@@ -197,11 +197,35 @@ static ggml_tensor * dsv4_hc_affine(
     return x;
 }
 
+// Env-gated fusion of the DeepSeek-V4 hyper-connection (HC) residual mixing.
+// The scalar per-stream loops in build_hc_weighted_sum / build_hc_post emit
+// ~87 small elementwise launches per layer (the k_bin_bcast "storm", #2 GPU
+// consumer at depth). When LLAMA_DSV4_HC_FUSED=1 they are replaced by the
+// GGML_OP_DSV4_HC_FUSED op: a single traffic-minimal kernel that reads each
+// operand once and writes the output once, accumulating in the same order as
+// the loops (bit-identical). Default OFF -> unchanged scalar graph.
+//
+// (An earlier LLAMA_DSV4_HC_BATCH graph-op restructure — broadcast-mul + a
+// batched mul_mat over the hc axis — regressed -7.8% because this box is
+// bandwidth-bound and the transposes/repeat it needed added traffic; it was
+// replaced by the fused op. See PROGRESS.md.)
+static bool dsv4_hc_fused_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_DSV4_HC_FUSED");
+        return e && e[0] == '1';
+    }();
+    return enabled;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_hc_weighted_sum(
         ggml_tensor * x,
         ggml_tensor * weights) const {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[2];
+
+    if (dsv4_hc_fused_enabled()) {
+        return ggml_dsv4_hc_weighted_sum(ctx0, x, weights);
+    }
 
     ggml_tensor * acc = nullptr;
     for (int64_t ih = 0; ih < hc; ++ih) {
@@ -312,6 +336,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
 
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];
+
+    if (dsv4_hc_fused_enabled()) {
+        return ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
+    }
 
     ggml_tensor * out = nullptr;
     for (int64_t dst = 0; dst < hc; ++dst) {

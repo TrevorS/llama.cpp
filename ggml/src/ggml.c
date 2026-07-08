@@ -1096,9 +1096,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "DSV4_LID_TOPK",
+    "DSV4_MOE_GATE_UP",
+    "DSV4_HC_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1209,9 +1211,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "dsv4_lid_topk(q,k,w,mask)",
+    "dsv4_moe_gate_up(gate,up,x,ids)",
+    "dsv4_hc_fused(x,a,b,c)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5399,6 +5403,112 @@ struct ggml_tensor * ggml_dsv4_lid_topk(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsv4_moe_gate_up
+
+struct ggml_tensor * ggml_dsv4_moe_gate_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * ids,
+        float                 clamp) {
+    GGML_ASSERT(gate);
+    GGML_ASSERT(up);
+    GGML_ASSERT(cur);
+    GGML_ASSERT(ids);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(gate->ne[0] == up->ne[0] && gate->ne[1] == up->ne[1] && gate->ne[2] == up->ne[2]);
+    GGML_ASSERT(gate->type == up->type);
+    GGML_ASSERT(cur->ne[0] == gate->ne[0]);          // n_embd
+
+    const int64_t n_ff          = gate->ne[1];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+    GGML_ASSERT(ggml_nelements(cur) == gate->ne[0] * n_tokens);
+
+    // out mirrors the swiglu_split output shape [n_ff, n_expert_used, n_tokens]
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_expert_used, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, clamp);
+
+    result->op     = GGML_OP_DSV4_MOE_GATE_UP;
+    result->src[0] = gate;
+    result->src[1] = up;
+    result->src[2] = cur;
+    result->src[3] = ids;
+
+    return result;
+}
+
+// ggml_dsv4_hc_weighted_sum
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(weights);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+
+    GGML_ASSERT(weights->ne[0] == hc);
+    GGML_ASSERT(weights->ne[1] == nt);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+
+    ggml_set_op_params_i32(result, 0, 0); // mode 0 = weighted_sum
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_hc_post
+
+struct ggml_tensor * ggml_dsv4_hc_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(residual);
+    GGML_ASSERT(post);
+    GGML_ASSERT(comb);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(post->type     == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type     == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t nt     = x->ne[1];
+    const int64_t hc     = residual->ne[1];
+
+    GGML_ASSERT(residual->ne[0] == n_embd);
+    GGML_ASSERT(residual->ne[2] == nt);
+    GGML_ASSERT(post->ne[0] == hc && post->ne[1] == nt);
+    GGML_ASSERT(comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == nt);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+
+    ggml_set_op_params_i32(result, 0, 1); // mode 1 = post
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
 
     return result;
 }

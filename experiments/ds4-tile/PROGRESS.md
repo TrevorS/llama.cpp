@@ -142,3 +142,28 @@ res*comb reading each operand once, scalar-loop accumulation order for exact A/B
 regressing HC_BATCH branches to be replaced by it (negative result recorded here).
 Also: cross-agent note — new .cu files need cmake reconfigure (ggml-cuda file(GLOB))
 or other exes hit undefined refs at link.
+
+## Iteration 8 — HC fused kernel + MoE gate/up bridge, gates 1-2 (main session)
+
+Two session crashes interrupted this iteration; root causes now understood and
+memorized (gb10-session-crash-causes): (1) 04:00 earlyoom kill storm — resident
+model + parallel nvcc + runaway 9.7GB llama-cli; killed cicc (the "Error 137"s)
+and claude. (2) 07:54 SSH drop (tailscale path flap) tore down the non-tmux,
+non-linger user session. Mitigations: -j 4 builds, never build during model
+residency, claude now runs in tmux.
+
+Code state (written pre-crash by moe-iq2 + main, wired end-to-end):
+- GGML_OP_DSV4_HC_FUSED (LLAMA_DSV4_HC_FUSED=1): dsv4_hc_fused.cu, CPU ref,
+  deepseek4.cpp wiring for weighted_sum + post. Scalar-order accumulation.
+- GGML_OP_DSV4_MOE_GATE_UP (LLAMA_DSV4_MOE_TILE=1): dsv4_moe_gate_up.cu (395L)
+  + IQ2_XXS tables, build_moe_ffn bridge (IQ2_XXS gate/up, nt>1, silu only;
+  down stays mul_mat_q). q8_K activation quant differs from ggml (-127/maxv vs
+  -128/max) -> agreement gate 5e-3 nmse, not bit-equality.
+
+- [gate 1] test-backend-ops: DSV4_HC_FUSED 6/6 PASS (tests added this session —
+  the crash had preempted them: both modes x decode shape, hc=8 max, odd nt);
+  DSV4_MOE_GATE_UP 4/4 PASS incl. clamp path + near-real dims.
+- [gate 2] HC fused greedy A/B (128 tok, temp 0): TOKEN-IDENTICAL vs scalar graph.
+- In flight: 4-leg bench matrix (base/+HC/+MOE/+both at pp512@d8192, pp2048,
+  pp2048@d32768, tg64@d32768) + KL divergence (base vs both) for the MoE bridge's
+  numerics gate.

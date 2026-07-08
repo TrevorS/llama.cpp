@@ -8410,6 +8410,154 @@ void ggml_compute_forward_dsv4_lid_topk(
     }
 }
 
+// ggml_compute_forward_dsv4_moe_gate_up
+//
+// Reference (CPU) implementation of the fused MoE gate+up+activation op. Mirrors
+// the CUDA kernel's numerics: activations are quantized to q8_K, gate/up are the
+// canonical IQ2_XXS . q8_K vec-dots, and mid = silu(clamp(gate)) * clamp(up).
+// The routing weight is intentionally NOT applied here (applied post-down).
+
+void ggml_compute_forward_dsv4_moe_gate_up(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * gate = dst->src[0]; // [n_embd, n_ff, n_expert] IQ2_XXS
+    const ggml_tensor * up   = dst->src[1]; // [n_embd, n_ff, n_expert] IQ2_XXS
+    const ggml_tensor * cur  = dst->src[2]; // [n_embd, .., n_tokens]   F32
+    const ggml_tensor * ids  = dst->src[3]; // [n_expert_used, n_tokens] I32
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd        = gate->ne[0];
+    const int64_t n_ff          = gate->ne[1];
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t n_tokens      = ids->ne[1];
+
+    GGML_ASSERT(n_embd % 256 == 0);
+    GGML_ASSERT(cur->ne[0] == n_embd);
+
+    float clamp;
+    memcpy(&clamp, dst->op_params, sizeof(float));
+
+    const ggml_type_traits_cpu * gtc   = ggml_get_type_traits_cpu(gate->type);
+    const ggml_type            vdt     = gtc->vec_dot_type;      // == GGML_TYPE_Q8_K for IQ2_XXS
+    const ggml_type_traits_cpu * vdtc  = ggml_get_type_traits_cpu(vdt);
+    ggml_vec_dot_t               vec_dot = gtc->vec_dot;
+    ggml_from_float_t            quantize_row = vdtc->from_float;
+    GGML_ASSERT(vec_dot && quantize_row);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t xq_row_size = ggml_row_size(vdt, n_embd);
+
+    // per-thread q8_K activation buffer + memo of which token it holds
+    std::vector<char> xq(xq_row_size);
+    int64_t cached_tok = -1;
+
+    const int64_t n_pairs = n_tokens * n_expert_used;
+    for (int64_t pair = ith; pair < n_pairs; pair += nth) {
+        const int64_t tok  = pair / n_expert_used;
+        const int64_t slot = pair - tok * n_expert_used;
+
+        int32_t expert = ((const int32_t *)((const char *) ids->data + tok*ids->nb[1]))[slot];
+        if (expert < 0) expert = 0;
+
+        if (cached_tok != tok) {
+            const float * xrow = (const float *)((const char *) cur->data + tok*n_embd*sizeof(float));
+            quantize_row(xrow, xq.data(), n_embd);
+            cached_tok = tok;
+        }
+
+        const char * gate_e = (const char *) gate->data + expert*gate->nb[2];
+        const char * up_e   = (const char *) up->data   + expert*up->nb[2];
+        float * mid = (float *)((char *) dst->data + tok*dst->nb[2] + slot*dst->nb[1]);
+
+        for (int64_t r = 0; r < n_ff; r++) {
+            float g = 0.0f, u = 0.0f;
+            vec_dot(n_embd, &g, 0, gate_e + r*gate->nb[1], 0, xq.data(), 0, 1);
+            vec_dot(n_embd, &u, 0, up_e   + r*up->nb[1],   0, xq.data(), 0, 1);
+            if (clamp > 1e-6f) {
+                if (g > clamp) g = clamp;
+                if (u >  clamp) u =  clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            mid[r] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_hc_fused
+//
+// CPU reference for the fused DeepSeek-V4 hyper-connection residual mixing.
+// Mirrors the CUDA kernel and the original scalar ggml graph accumulation order.
+// mode 0 (weighted_sum): out[e,t]     = sum_ih x[e,ih,t] * w[ih,t]
+// mode 1 (post):         out[e,dst,t] = x[e,t]*post[dst,t]
+//                                       + sum_src res[e,src,t]*comb[dst,src,t]
+
+void ggml_compute_forward_dsv4_hc_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (mode == 0) {
+        const ggml_tensor * x = dst->src[0]; // [n_embd, hc, nt]
+        const ggml_tensor * w = dst->src[1]; // [hc, nt]
+
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int64_t n_embd = x->ne[0];
+        const int64_t hc     = x->ne[1];
+        const int64_t nt     = x->ne[2];
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            const float * w_t = (const float *)((const char *) w->data + t*w->nb[1]);
+            float * o_t = (float *)((char *) dst->data + t*dst->nb[1]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float * x_e0 = (const float *)((const char *) x->data + t*x->nb[2]) + e;
+                float acc = x_e0[0] * w_t[0];
+                for (int64_t ih = 1; ih < hc; ++ih) {
+                    acc += *(const float *)((const char *) x->data + t*x->nb[2] + ih*x->nb[1] + e*x->nb[0]) * w_t[ih];
+                }
+                o_t[e] = acc;
+            }
+        }
+    } else {
+        const ggml_tensor * x    = dst->src[0]; // [n_embd, nt]
+        const ggml_tensor * res  = dst->src[1]; // [n_embd, hc, nt]
+        const ggml_tensor * post = dst->src[2]; // [hc, nt]
+        const ggml_tensor * comb = dst->src[3]; // [dst, src, nt]
+
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32);
+        GGML_ASSERT(post->type == GGML_TYPE_F32 && comb->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int64_t n_embd = x->ne[0];
+        const int64_t nt     = x->ne[1];
+        const int64_t hc     = res->ne[1];
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            const float * post_t = (const float *)((const char *) post->data + t*post->nb[1]);
+            const float * comb_t = (const float *)((const char *) comb->data + t*comb->nb[2]);
+            const float * x_t    = (const float *)((const char *) x->data    + t*x->nb[1]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float xv = x_t[e];
+                for (int64_t d = 0; d < hc; ++d) {
+                    float acc = xv * post_t[d];
+                    for (int64_t s = 0; s < hc; ++s) {
+                        const float rv = *(const float *)((const char *) res->data + t*res->nb[2] + s*res->nb[1] + e*res->nb[0]);
+                        acc += rv * comb_t[s*hc + d];
+                    }
+                    *(float *)((char *) dst->data + t*dst->nb[2] + d*dst->nb[1] + e*dst->nb[0]) = acc;
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {

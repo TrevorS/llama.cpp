@@ -1972,7 +1972,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    // DeepSeek-V4 MoE prefill tile fusion (env-gated, default off): replaces the
+    // separate gate/up mul_mat_id + clamp + swiglu chain with the ds4 IQ2_XXS
+    // expert-tile kernel, producing the activated "mid" directly. The routing
+    // weight is applied post-down (below), exactly as in the unfused path. Only
+    // active for IQ2_XXS gate/up experts during prefill; every other case falls
+    // through to the standard path per-layer.
+    bool use_dsv4_moe_tile = false;
+    {
+        static const bool moe_tile_env = [] {
+            const char * e = getenv("LLAMA_DSV4_MOE_TILE");
+            return e && e[0] && e[0] != '0';
+        }();
+        use_dsv4_moe_tile = moe_tile_env &&
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            type_op == LLM_FFN_SILU &&
+            n_tokens > 1 &&
+            gate_exps && up_exps && !gate_up_exps &&
+            gate_exps->type == GGML_TYPE_IQ2_XXS &&
+            up_exps->type   == GGML_TYPE_IQ2_XXS &&
+            !gate_exps_b && !up_exps_b && !gate_exps_s && !up_exps_s;
+    }
+
+    if (use_dsv4_moe_tile) {
+        const float limit = (il >= 0) ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        cur = ggml_dsv4_moe_gate_up(ctx0, gate_exps, up_exps, cur, selected_experts,
+                                    limit > 1e-6f ? limit : 0.0f); // [n_ff, n_expert_used, n_tokens]
+        cb(cur, "ffn_moe_gate_up_tile", il);
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2024,6 +2051,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     const bool has_gate = gate_exps || gate_up_exps;
 
+    if (!use_dsv4_moe_tile)
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate_exps) {
