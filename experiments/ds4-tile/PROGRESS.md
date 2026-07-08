@@ -115,3 +115,14 @@ option (payoff capped at ~14.8% slice, routing bridge hard, numerics unvalidated
 -> moe-tile agent REDIRECTED to HC storm fusion (LLAMA_DSV4_HC_BATCH=1, graph-level
 op batching preferred over new CUDA; targets the 17.7% elementwise slice).
 Fresh nsys re-rank on wmma build in flight (wmma_depth.nsys-rep).
+
+## Iteration 7 — re-rank on wmma build (pp512@d8192, wmma_depth2.nsys-rep)
+
+pp512@d8192 = 308.2 +-9.5. Ranking: mul_mat_q IQ2_XXS(16) 27.5% / IQ3_XXS(18) 15.1% /
+HC storm (bcast mul 10.3 + add 5.6) 15.9% / flash_attn 8.1% / mul_mat_q Q8_0 7.8% /
+concat 6.1% / dsv4_score_wmma128 2.5% (scalar was 22.4%; 41.5ms -> 1.9ms avg, 22x).
+MoE now ~50% of GPU. Gate/up IQ2_XXS share (27.5%) reopens the bridge option from 6b
+at ~2x the payoff originally estimated.
+-> Iteration 7: moe-iq2 agent ports ds4's IQ2_XXS gate_up_mid tile kernel + routing
+bridge (down stays mul_mat_q); moe-tile agent continues HC batching in parallel
+(disjoint files: ggml-cuda vs src/models/deepseek4.cpp).
