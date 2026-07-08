@@ -126,3 +126,19 @@ at ~2x the payoff originally estimated.
 -> Iteration 7: moe-iq2 agent ports ds4's IQ2_XXS gate_up_mid tile kernel + routing
 bridge (down stays mul_mat_q); moe-tile agent continues HC batching in parallel
 (disjoint files: ggml-cuda vs src/models/deepseek4.cpp).
+
+## Iteration 7b — HC graph-restructure NEGATIVE RESULT (moe-tile agent)
+
+LLAMA_DSV4_HC_BATCH op-composition (weighted_sum 7->3 launches via bcast-mul+sum_rows;
+hc_post ~38->~6 via repeat+bcast term1 and k=4 batched mul_mat term2): builds clean,
+greedy diverges after ~30 tokens (fp reassociation from mul_mat, expected), but
+pp512@d8192 REGRESSES 306.5 -> 282.5 (-7.8%, r=4, off-leg reproduces baseline).
+Root cause: box is bandwidth-bound (~87 GB/s); the scalar storm is coalesced
+contiguous elementwise, so launch count was never the bottleneck. The batched path
+adds traffic (full [n_embd,hc,nt] transpose, 4x repeat materialization, skinny n=4
+GEMM with poor utilization). Op composition cannot express the traffic-minimal form.
+Decision: fund fused CUDA op instead (LLAMA_DSV4_HC_FUSED): out = x*post + sum_src
+res*comb reading each operand once, scalar-loop accumulation order for exact A/B;
+regressing HC_BATCH branches to be replaced by it (negative result recorded here).
+Also: cross-agent note — new .cu files need cmake reconfigure (ggml-cuda file(GLOB))
+or other exes hit undefined refs at link.
