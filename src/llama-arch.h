@@ -146,6 +146,7 @@ enum llm_arch {
     LLM_ARCH_EAGLE3,
     LLM_ARCH_DFLASH,
     LLM_ARCH_DSPARK,
+    LLM_ARCH_DEEPSEEK4_MTP,
     LLM_ARCH_UNKNOWN,
 };
 
