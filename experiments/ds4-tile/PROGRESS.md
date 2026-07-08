@@ -84,3 +84,21 @@ into ggml_dsv4_lid_topk, and warrants its own fused op / graph-batching workstre
 independent numerics validation (proposed: batch build_hc_weighted_sum as a broadcast-mul
 + hc-axis reduction, and build_hc_post's comb-mix as a batched ggml_mul_mat over nt;
 ~9-14x launch reduction targeting ~2070ms). Filed for a follow-up iteration.
+
+## Iteration 6 — wmma depth bench (main session, post-crash recovery)
+
+Session crash corrupted .git (11 truncated objects incl. tip commit); recovered by
+resetting to 4944408 and re-committing the intact working tree as a215c85.
+
+wmma score kernel depth results (ub2048, fused LID):
+- pp512@d8192: 242.4 -> 306.3 +-14.1 (+26%)
+- pp2048@d32768: 147.3 -> 298.4 +-0.3 (+103%); gap vs ds4.c 347.7 now 1.17x
+- tg64@d32768: 11.94 +-0.39 (was 11.71; target 13.0 — decode-side, wmma n/a)
+
+Anomaly: tg64@d32768 leg failed with "failed to decode prompt batch, res = 1" when run
+in the same llama-bench process after the pp2048@d32768 test; standalone rerun clean.
+Suspect CUDA pool state carryover between tests; recheck if it recurs.
+
+-> Iteration 6 (moe-tile agent): port experiments/ds4-tile expert-tile kernels into
+mul_mat_id dispatch, env-gated LLAMA_DSV4_MOE_TILE=1 (mul_mat_q 28.9% = #1 consumer).
+HC storm fusion queued behind it.
