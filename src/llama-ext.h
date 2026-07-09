@@ -21,6 +21,15 @@ LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_
 // the first row with sigmoid(logit) below its threshold (DeepSpec semantics).
 LLAMA_API bool llama_dspark_confidence_logit(const struct llama_model * model, llama_token prev, const float * h, float * out);
 
+// DSpark: run the semi-autoregressive draft chain (markov bias + greedy argmax +
+// confidence head) inside the block-decode graph instead of on the host. The
+// results are exported as (id, conf_logit) f32 pairs per proposal row.
+LLAMA_API void          llama_set_dspark_draft_chain(struct llama_context * ctx, bool value);
+// Returns the meta from the most recent decode ([2*K] floats: id, conf_logit
+// per chained row) or nullptr if the last decode built no chain. `count`
+// (optional) receives the number of floats.
+LLAMA_API const float * llama_get_dspark_draft_meta(struct llama_context * ctx, uint32_t * count);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

@@ -1235,6 +1235,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     bool  conf_enabled      = false;
     float conf_thresh_logit = 0.0f;
 
+    // consume the in-graph draft chain (ids + confidence computed on-device)
+    bool fused_chain = false;
+
+    // sliding-window size for the draft blocks' attention (reference: 128);
+    // enforced by pruning old draft-cache cells. 0 disables.
+    int32_t swa_window = 128;
+
     std::vector<float> features_buf;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
@@ -1286,6 +1293,35 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 conf_enabled      = true;
                 conf_thresh_logit = std::log(t / (1.0f - t));
                 llama_set_embeddings(ctx_dft, true);
+            }
+        }
+
+        // draft sliding window (env override LLAMA_DSPARK_SWA; 0 disables)
+        if (const char * s = std::getenv("LLAMA_DSPARK_SWA")) {
+            swa_window = std::atoi(s);
+        }
+
+        // Reference block attention is fully BIDIRECTIONAL within the noise
+        // block (DeepSpec create_dspark_attention_mask: mask_draft has no
+        // causal constraint; eval decodes with is_causal=False) while context
+        // visibility is "strictly before the anchor" — which a non-causal mask
+        // over the pruned cache reproduces exactly. The dspark ctx never runs
+        // a regular causal decode (encode has no attention, inject only writes
+        // KV), so non-causal is safe to set once here.
+        // LLAMA_DSPARK_CAUSAL_BLOCK=1 restores the old causal behavior.
+        if (std::getenv("LLAMA_DSPARK_CAUSAL_BLOCK") == nullptr) {
+            llama_set_causal_attn(ctx_dft, false);
+        }
+
+        // in-graph draft chain (markov bias + argmax + confidence on-device);
+        // LLAMA_DSPARK_NO_FUSED_DRAFT=1 falls back to the host path
+        fused_chain = std::getenv("LLAMA_DSPARK_NO_FUSED_DRAFT") == nullptr;
+        if (fused_chain) {
+            llama_set_dspark_draft_chain(ctx_dft, true);
+            if (conf_enabled) {
+                // confidence comes back in the meta pairs; the separate
+                // embeddings output is only needed by the host fallback
+                llama_set_embeddings(ctx_dft, true); // keep for fallback path
             }
         }
 
@@ -1493,6 +1529,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
             }
+
+            // DSpark draft attention is sliding-window (reference keeps a
+            // 128-position swa cache per draft layer). Enforce the window by
+            // pruning older injected/context cells - without this, deep-context
+            // drafts attend the whole history and acceptance collapses.
+            // The +8 margin keeps cells a checkpoint-restore rewind may revisit.
+            if (swa_window > 0 && n > swa_window + 8) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, n - swa_window - 8);
+            }
         }
 
         if (batch.n_tokens == 0) {
@@ -1517,6 +1562,32 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+
+            // Fused path: the graph already chained markov bias + greedy argmax +
+            // confidence per row; consume the (id, conf_logit) pairs directly.
+            // Greedy-only (matches the host top-k first candidate at temp 0).
+            if (fused_chain && params.p_min <= 0.0f && n_seq == 1) {
+                uint32_t n_meta = 0;
+                const float * meta = llama_get_dspark_draft_meta(ctx_dft, &n_meta);
+                // the graph chains the full decoded block; consume the first
+                // n_block_tokens-1 pairs when the driver wants fewer drafts
+                if (meta != nullptr && n_meta >= 2u * (uint32_t) (n_block_tokens - 1)) {
+                    for (int32_t i = 1; i < n_block_tokens; ++i) {
+                        const float conf = meta[2*(i - 1) + 1];
+                        if (conf_enabled && conf < conf_thresh_logit) {
+                            SPC_DBG("dspark conf cut (fused): seq=%d slot=%d logit=%.3f\n", (int) seq_id, (int) i, conf);
+                            break;
+                        }
+                        result.push_back((llama_token) meta[2*(i - 1) + 0]);
+                    }
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                    }
+                    continue;
+                }
+                SPC_DBG("dspark fused meta unavailable (n_meta=%u, expect %u) - host fallback\n",
+                        n_meta, 2u * (uint32_t) (n_block_tokens - 1));
+            }
 
             // Markov head makes the block semi-autoregressive: position k's logits
             // get B[token_{k-1}] added before sampling. The block was decoded in one

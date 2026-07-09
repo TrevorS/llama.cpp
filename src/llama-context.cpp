@@ -100,6 +100,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.dspark_draft_chain      = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -897,6 +898,13 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+const float * llama_context::get_dspark_draft_meta(uint32_t * count) {
+    if (count) {
+        *count = (uint32_t) dspark_meta.size();
+    }
+    return dspark_meta.empty() ? nullptr : dspark_meta.data();
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -1141,6 +1149,16 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_dspark_draft_chain(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.dspark_draft_chain = value;
+
+    // the meta export tensor must be part of the worst-case reservation
+    // (same failure mode as set_embeddings_nextn above)
+    sched_need_reserve = true;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1974,6 +1992,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 LLAMA_LOG_INFO("nextn-extract SKIPPED: nt=%d data=%d t=%d n_rows=%" PRId64 " pooling=%d\n",
                         (int) ubatch.n_tokens, embd_nextn.data != nullptr, t_h_nextn != nullptr,
                         n_rows, (int) cparams.pooling_type);
+            }
+        }
+
+        // extract dspark in-graph draft meta (small: [2, K] per chained ubatch)
+        if (cparams.dspark_draft_chain) {
+            auto * t_meta = res->get_dspark_meta();
+            if (t_meta != nullptr) {
+                ggml_backend_t backend_meta = ggml_backend_sched_get_tensor_backend(sched.get(), t_meta);
+                GGML_ASSERT(backend_meta != nullptr);
+
+                dspark_meta.resize(ggml_nelements(t_meta));
+                ggml_backend_tensor_get_async(backend_meta, t_meta, dspark_meta.data(), 0, ggml_nbytes(t_meta));
+            } else {
+                dspark_meta.clear();
             }
         }
 
@@ -3714,6 +3746,16 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_dspark_draft_chain(llama_context * ctx, bool value) {
+    ctx->set_dspark_draft_chain(value);
+}
+
+const float * llama_get_dspark_draft_meta(llama_context * ctx, uint32_t * count) {
+    ctx->synchronize();
+
+    return ctx->get_dspark_draft_meta(count);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

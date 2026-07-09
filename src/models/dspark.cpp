@@ -512,6 +512,8 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
+    ggml_tensor * inp_tokens = inp->tokens;
+
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
     res->add_input(std::move(inp));
@@ -582,6 +584,69 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // -------- in-graph semi-autoregressive draft chain (ds4.c-style) ----------
+    // Markov bias + greedy argmax + confidence head per proposal row, chained
+    // on-device so the driver reads only K (id, conf_logit) pairs instead of
+    // pulling full logit rows and running the Markov GEMV on the host.
+    // Gate: enabled by the driver, single-seq token ubatch shaped like a noise
+    // block (rows 1.. all carry the same noise token). Chained greedily — the
+    // host sampler is greedy too (temp 0, top-k first candidate), so ids match.
+    do {
+        const auto * m = dynamic_cast<const llama_model_dspark *>(&model);
+        if (!cparams.dspark_draft_chain || m == nullptr || m->markov_w1 == nullptr || m->markov_w2 == nullptr) {
+            break;
+        }
+        // n_tokens > 16 also excludes reserve-time worst-case ubatches (n_ubatch
+        // wide, dummy all-equal tokens) which would otherwise build a huge chain
+        if (ubatch.embd || ubatch.token == nullptr || n_tokens < 3 || n_tokens > 16 || ubatch.n_seqs_unq != 1) {
+            break;
+        }
+        bool noise_block = true;
+        for (uint32_t i = 2; i < ubatch.n_tokens; ++i) {
+            noise_block &= ubatch.token[i] == ubatch.token[1];
+        }
+        if (!noise_block) {
+            break;
+        }
+
+        const int64_t K       = n_tokens - 1; // proposal rows 0..K-1 draft tokens 1..K
+        const int64_t n_vocab = res->t_logits->ne[0];
+
+        ggml_tensor * prev = ggml_view_1d(ctx0, inp_tokens, 1, 0); // anchor token = id_last
+
+        ggml_tensor * meta = nullptr;
+        for (int64_t k = 0; k < K; ++k) {
+            ggml_tensor * w1p = ggml_get_rows(ctx0, m->markov_w1, prev); // [rank, 1] f32
+            ggml_tensor * bias = ggml_mul_mat(ctx0, m->markov_w2, w1p);  // [vocab, 1]
+
+            ggml_tensor * lrow = ggml_view_2d(ctx0, res->t_logits, n_vocab, 1,
+                    res->t_logits->nb[1], (size_t) k * res->t_logits->nb[1]);
+            ggml_tensor * biased = ggml_add(ctx0, lrow, bias);
+
+            ggml_tensor * id  = ggml_argmax(ctx0, biased); // I32 [1]
+            ggml_tensor * idf = ggml_cpy(ctx0, id, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1));
+
+            ggml_tensor * conf;
+            if (m->confidence_proj != nullptr) {
+                ggml_tensor * hrow = ggml_view_2d(ctx0, res->t_embd, res->t_embd->ne[0], 1,
+                        res->t_embd->nb[1], (size_t) k * res->t_embd->nb[1]);
+                ggml_tensor * feat = ggml_concat(ctx0, hrow, w1p, 0); // [n_embd + rank, 1]
+                conf = ggml_reshape_1d(ctx0, ggml_mul_mat(ctx0, m->confidence_proj, feat), 1);
+            } else {
+                conf = ggml_scale(ctx0, idf, 0.0f); // no head -> logit 0 (sigmoid 0.5)
+            }
+
+            ggml_tensor * pair = ggml_concat(ctx0, idf, conf, 0); // [2]
+            meta = meta ? ggml_concat(ctx0, meta, pair, 0) : pair;
+
+            prev = id;
+        }
+
+        cb(meta, "dspark_draft_meta", -1);
+        res->t_dspark_meta = meta;
+        ggml_build_forward_expand(gf, meta);
+    } while (false);
 }
 
 // --- Markov head bias (host-side, consumed by the draft driver) --------------
