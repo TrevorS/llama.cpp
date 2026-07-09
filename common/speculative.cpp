@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1472,10 +1473,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             // Markov head makes the block semi-autoregressive: position k's logits
             // get B[token_{k-1}] added before sampling. The block was decoded in one
             // pass; only this bias is applied sequentially (host-side).
+            // Draft k comes from row k-1 (next-token semantics: the anchor row
+            // predicts the first draft), per DeepSpec build_dspark_proposal.
             llama_token prev = dp.id_last;
 
             for (int32_t i = 1; i < n_block_tokens; ++i) {
-                float * logits = llama_get_logits_ith(ctx_dft, beg + i);
+                float * logits = llama_get_logits_ith(ctx_dft, beg + i - 1);
                 if (logits) {
                     llama_dspark_markov_bias(model_dft, prev, markov_bias.data());
                     for (int32_t v = 0; v < n_vocab; ++v) {
@@ -1483,7 +1486,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                     }
                 }
 
-                common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                common_sampler_sample(smpl, ctx_dft, beg + i - 1, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1784,6 +1787,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        if (!is_mem_shared) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                double s = 0.0;
+                for (int32_t e = 0; e < n_embd; ++e) {
+                    const float v = verify_h[seq_id][(size_t) (verify_h_rows[seq_id] - 1) * n_embd + e];
+                    s += (double) v * v;
+                }
+                SPC_TRC("process: seq=%d rows=%d pos[%d..%d] dft_pos_max=%d h_last_norm=%.4f\n",
+                        (int) seq_id, verify_h_rows[seq_id],
+                        (int) batch_in.pos[i_batch_beg[seq_id]], (int) batch_in.pos[i_batch_end[seq_id]],
+                        (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id),
+                        std::sqrt(s));
+            }
+        }
+
         return true;
     }
 
@@ -1811,6 +1832,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+
+            {
+                double s = 0.0;
+                for (int32_t e = 0; e < n_embd; ++e) {
+                    const float v = pending_h[seq_id][e];
+                    s += (double) v * v;
+                }
+                SPC_TRC("draft: seq=%d id_last=%d n_past=%d dft_pos_max=%d pending_h_norm=%.4f\n",
+                        (int) seq_id, (int) dp.id_last, (int) dp.n_past,
+                        (int) llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id),
+                        std::sqrt(s));
+            }
 
             i_last[seq_id] = batch.n_tokens - 1;
 
