@@ -374,7 +374,9 @@ def convert(mode, module_dir, main_gguf, out_path):
         overrides["dspark.dspark.block_size"] = (5, U32, None)
         overrides["dspark.dspark.noise_token_id"] = (128799, U32, None)
         overrides["dspark.dspark.markov_rank"] = (256, U32, None)
-        overrides["dspark.target_layers"] = ([40, 41, 42], GGUFValueType.ARRAY, GGUFValueType.INT32)
+        # HF target_layer_ids [40,41,42] are hidden_states[id+1] = layer OUTPUTS;
+        # llama.cpp taps layer INPUTS, so store id+1 (43 = final backbone output)
+        overrides["dspark.target_layers"] = ([41, 42, 43], GGUFValueType.ARRAY, GGUFValueType.INT32)
     # general.architecture is already set by the GGUFWriter(out, arch) constructor.
     copy_kvs(writer, kv, "deepseek4", arch, overrides)
 

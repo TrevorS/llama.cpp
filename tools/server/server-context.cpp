@@ -2920,6 +2920,11 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        // stash the speculative impl state (e.g. draft-mtp's pending_h) so a
+                        // rollback restores it together with the KV it was produced with
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -3822,6 +3827,10 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                             common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                        }
+
+                        if (!ckpt.data_spec.empty()) {
+                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
