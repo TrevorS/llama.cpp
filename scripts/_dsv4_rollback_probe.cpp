@@ -4,6 +4,8 @@
 //         same position, llama_memory_seq_rm it, then decode the real token.
 // Lossless rollback => identical token streams.
 #include "llama.h"
+#include "../src/llama-ext.h"
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -64,6 +66,18 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "prompt tokens: %d\n", n_p);
 
     const llama_token junk = 12345; // arbitrary wrong token
+    const int junk_depth = argc > 4 ? atoi(argv[4]) : 1; // junk tokens decoded ahead before evicting
+    const bool use_ckpt  = argc > 5 && atoi(argv[5]) != 0; // rollback via state save/restore (server ckpt flow)
+    const bool batch_junk = argc > 6 && atoi(argv[6]) != 0; // decode the junk tokens as ONE batch (like a verify)
+
+    const bool with_export = argc > 3 && atoi(argv[3]) != 0;
+    int n_embd_h = 0;
+    if (with_export) {
+        llama_set_embeddings_nextn(ctx, true, /*masked*/ false);
+        n_embd_h = llama_model_n_embd_nextn(model);
+        fprintf(stderr, "h export enabled, n_embd_nextn=%d\n", n_embd_h);
+    }
+    std::vector<std::vector<float>> h_rows_a, h_rows_b;
 
     auto run_pass = [&](bool with_rollback) {
         llama_memory_t mem = llama_get_memory(ctx);
@@ -81,17 +95,53 @@ int main(int argc, char ** argv) {
         if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill failed\n"); exit(1); }
         llama_batch_free(b);
 
+        auto & h_rows = with_rollback ? h_rows_b : h_rows_a;
+        h_rows.clear();
+
         std::vector<llama_token> out;
         llama_token cur = greedy(ctx);
         out.push_back(cur);
         llama_pos pos = n_p;
         for (int t = 0; t < n_gen - 1; ++t) {
             if (with_rollback) {
-                // decode a junk token at this position, then evict it
-                if (decode_one(ctx, junk, pos, true) != 0) { fprintf(stderr, "junk decode failed at %d\n", pos); exit(1); }
+                // decode junk token(s) starting at this position, then evict them
+                // (junk_depth > 1 exercises the deep-rollback branch of seq_rm)
+                std::vector<uint8_t> ckpt;
+                if (use_ckpt) {
+                    const size_t sz = llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.resize(sz);
+                    llama_state_seq_get_data_ext(ctx, ckpt.data(), sz, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+                if (batch_junk) {
+                    llama_batch b = llama_batch_init(junk_depth, 0, 1);
+                    b.n_tokens = junk_depth;
+                    for (int j = 0; j < junk_depth; ++j) {
+                        b.token[j] = junk;
+                        b.pos[j] = pos + j;
+                        b.n_seq_id[j] = 1;
+                        b.seq_id[j][0] = 0;
+                        b.logits[j] = true;
+                    }
+                    if (llama_decode(ctx, b) != 0) { fprintf(stderr, "junk batch decode failed at %d\n", pos); exit(1); }
+                    llama_batch_free(b);
+                } else {
+                    for (int j = 0; j < junk_depth; ++j) {
+                        if (decode_one(ctx, junk, pos + j, true) != 0) { fprintf(stderr, "junk decode failed at %d\n", pos + j); exit(1); }
+                    }
+                }
+                if (use_ckpt) {
+                    // server ckpt flow: restore comp state, then trim the raw tail
+                    if (llama_state_seq_set_data_ext(ctx, ckpt.data(), ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+                        fprintf(stderr, "state restore failed at %d\n", pos); exit(1);
+                    }
+                }
                 if (!llama_memory_seq_rm(mem, 0, pos, -1)) { fprintf(stderr, "seq_rm failed at %d\n", pos); exit(1); }
             }
             if (decode_one(ctx, cur, pos, true) != 0) { fprintf(stderr, "decode failed at %d\n", pos); exit(1); }
+            if (with_export) {
+                const float * h = llama_get_embeddings_nextn(ctx);
+                h_rows.emplace_back(h, h + n_embd_h);
+            }
             cur = greedy(ctx);
             out.push_back(cur);
             pos++;
@@ -105,6 +155,26 @@ int main(int argc, char ** argv) {
     int div = -1;
     for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
         if (a[i] != b[i]) { div = (int) i; break; }
+    }
+    if (with_export) {
+        double max_rel = 0.0; int worst = -1;
+        for (size_t i = 0; i < h_rows_a.size() && i < h_rows_b.size(); ++i) {
+            double num = 0.0, den = 0.0, na = 0.0, nb = 0.0;
+            for (int e = 0; e < n_embd_h; ++e) {
+                const double d = (double) h_rows_a[i][e] - (double) h_rows_b[i][e];
+                num += d * d;
+                den += (double) h_rows_a[i][e] * (double) h_rows_a[i][e];
+                na  += (double) h_rows_a[i][e] * (double) h_rows_a[i][e];
+                nb  += (double) h_rows_b[i][e] * (double) h_rows_b[i][e];
+            }
+            const double rel = den > 0 ? sqrt(num / den) : 0.0;
+            if (rel > 1e-6) {
+                printf("  step %2zu: h rel diff %.6f (|a|=%.1f |b|=%.1f)\n", i, rel, sqrt(na), sqrt(nb));
+            }
+            if (rel > max_rel) { max_rel = rel; worst = (int) i; }
+        }
+        printf("h rows compared: %zu, max relative L2 diff: %.6f (step %d)\n",
+               h_rows_a.size(), max_rel, worst);
     }
     if (div < 0) {
         printf("IDENTICAL: %zu tokens\n", a.size());

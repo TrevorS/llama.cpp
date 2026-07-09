@@ -1120,6 +1120,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // without this reserve the export tensor is not part of the worst-case
+    // allocation: after a graph-shape change (e.g. an nt>1 verify followed by
+    // an nt=1 decode) its memory gets recycled and the extracted rows go
+    // stale - same failure mode as set_embeddings_layer_inp below
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
