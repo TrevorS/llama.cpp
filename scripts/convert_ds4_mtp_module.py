@@ -326,23 +326,25 @@ def emit_scalar(writer, dst, arr, policy):
         raise ValueError(policy)
 
 
-def emit_experts(writer, st, src_block_prefix, dst_name):
-    # Quantize each expert to Q8_0 individually and stack the (small) quantized
+def emit_experts(writer, st, src_block_prefix, dst_name, expert_qtype=GGMLQuantizationType.Q8_0):
+    # Quantize each expert individually and stack the (small) quantized
     # bytes, so we never hold a multi-GB float32 stack of all 256 experts at once.
+    # MXFP4 (E2M1 + per-32 E8M0 scale) is byte-exact for the FP4 source experts
+    # at half the size of Q8_0.
     for w_suffix, dname in EXPERT_STACKS:
         q_rows = []
         for i in range(N_EXPERTS):
             arr = st.decode(f"{src_block_prefix}.ffn.experts.{i}.{w_suffix}")  # (out, in) f32
-            q_rows.append(gq.quantize(np.ascontiguousarray(arr), GGMLQuantizationType.Q8_0))
+            q_rows.append(gq.quantize(np.ascontiguousarray(arr), expert_qtype))
         q = np.stack(q_rows, axis=0)   # (256, out, qbytes) uint8
-        writer.add_tensor(final_name(f"{dst_name}.{dname}"), q, raw_dtype=GGMLQuantizationType.Q8_0)
+        writer.add_tensor(final_name(f"{dst_name}.{dname}"), q, raw_dtype=expert_qtype)
 
 
 # ----------------------------------------------------------------------------
 # conversion driver
 # ----------------------------------------------------------------------------
 
-def convert(mode, module_dir, main_gguf, out_path):
+def convert(mode, module_dir, main_gguf, out_path, expert_quant="q8_0"):
     if mode == "mtp":
         arch = "deepseek4mtp"
         n_blocks = 1
@@ -351,6 +353,11 @@ def convert(mode, module_dir, main_gguf, out_path):
         n_blocks = 3
     else:
         raise ValueError(mode)
+
+    expert_qtype = {
+        "q8_0":  GGMLQuantizationType.Q8_0,
+        "mxfp4": GGMLQuantizationType.MXFP4,
+    }[expert_quant]
 
     st = SafeTensors(sorted(glob.glob(os.path.join(module_dir, "*.safetensors"))))
     main_shards = find_main_gguf_shards(main_gguf)
@@ -388,7 +395,7 @@ def convert(mode, module_dir, main_gguf, out_path):
         src = blk(b)
         for suffix, dst, policy in core_block_map(b):
             emit_scalar(writer, dst, st.decode(f"{src}.{suffix}"), policy)
-        emit_experts(writer, st, src, f"blk.{b}")
+        emit_experts(writer, st, src, f"blk.{b}", expert_qtype)
 
     if mode == "mtp":
         emit_scalar(writer, "output_norm",     st.decode("mtp.0.norm"),          "f32")
@@ -469,9 +476,10 @@ def validate(mode, out_path):
             sh = [int(x) for x in t.shape]
             if sh[-1] != N_EXPERTS:
                 exp_bad.append((t.name, sh))
-            assert t.tensor_type == GGMLQuantizationType.Q8_0, f"{t.name} not Q8_0"
+            assert t.tensor_type in (GGMLQuantizationType.Q8_0, GGMLQuantizationType.MXFP4), \
+                f"{t.name} unexpected type {t.tensor_type}"
     assert not exp_bad, f"expert stacks not [*,*,256]: {exp_bad}"
-    print(f"expert stacks          : all [*, *, {N_EXPERTS}] Q8_0  (OK)")
+    print(f"expert stacks          : all [*, *, {N_EXPERTS}] Q8_0/MXFP4  (OK)")
 
     # dspark heads
     if mode == "dspark":
@@ -505,10 +513,12 @@ def main():
     ap.add_argument("--main-gguf", required=True, help="main deepseek4 GGUF (dir or any split member) for KVs + token_embd/output")
     ap.add_argument("--out", required=True, help="output GGUF path")
     ap.add_argument("--validate-only", action="store_true")
+    ap.add_argument("--expert-quant", default="q8_0", choices=["q8_0", "mxfp4"],
+                    help="ggml type for the routed-expert stacks (mxfp4 is byte-exact for the FP4 source at half the Q8_0 size)")
     args = ap.parse_args()
 
     if not args.validate_only:
-        convert(args.mode, args.module_dir, args.main_gguf, args.out)
+        convert(args.mode, args.module_dir, args.main_gguf, args.out, args.expert_quant)
     validate(args.mode, args.out)
 
 

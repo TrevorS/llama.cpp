@@ -6,10 +6,12 @@
 
 #include "ggml-backend.h" // ggml_backend_tensor_get (Markov weight readback)
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -434,6 +436,9 @@ llama_model_dspark::graph<true>::graph(const llama_model & model, const llm_grap
 
     ggml_set_output(cur);
     res->t_h_nextn = cur;
+    // also publish as t_embd so cparams.embeddings (confidence-head runs) has a
+    // result tensor on the encode path (build_pooling asserts otherwise)
+    res->t_embd    = cur;
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -641,13 +646,99 @@ void llama_dspark_markov_bias(const llama_model * model, llama_token prev, float
     }
     const std::vector<float> & w2f = it->second;
 
-    // out[v] = sum_r W2[r, v] * rvec[r]
-    for (int64_t v = 0; v < vocab; ++v) {
-        const float * col = w2f.data() + (size_t) v * rank;
-        float acc = 0.0f;
-        for (int64_t r = 0; r < rank; ++r) {
-            acc += col[r] * rvec[r];
+    // out[v] = sum_r W2[r, v] * rvec[r] — the columns are contiguous in the
+    // cache, so the inner dot autovectorizes; split the vocab across threads
+    // (this sits on the per-slot draft hot path).
+    const float * rv  = rvec.data();
+    const float * w2p = w2f.data();
+    auto gemv_range = [rank, rv, w2p, out](int64_t v0, int64_t v1) {
+        for (int64_t v = v0; v < v1; ++v) {
+            const float * col = w2p + (size_t) v * rank;
+            float acc = 0.0f;
+            for (int64_t r = 0; r < rank; ++r) {
+                acc += col[r] * rv[r];
+            }
+            out[v] = acc;
         }
-        out[v] = acc;
+    };
+
+    const int64_t n_th = std::clamp<int64_t>((int64_t) std::thread::hardware_concurrency(), 1, 8);
+    if (n_th <= 1 || vocab < 4096) {
+        gemv_range(0, vocab);
+        return;
     }
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_th);
+    const int64_t chunk = (vocab + n_th - 1) / n_th;
+    for (int64_t t = 0; t < n_th; ++t) {
+        const int64_t v0 = t * chunk;
+        const int64_t v1 = std::min(vocab, v0 + chunk);
+        if (v0 >= v1) {
+            break;
+        }
+        workers.emplace_back(gemv_range, v0, v1);
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
+// --- Confidence head (host-side, consumed by the draft driver) ---------------
+//
+// logit = W_conf . [h (n_embd) ; W1[prev] (rank)] with W_conf [n_embd+rank, 1].
+// The reference (DeepSpec _confident_prefix_length) truncates the proposal at
+// the first row whose sigmoid(logit) falls below the confidence threshold.
+// The official DS4-Flash checkpoint carries no bias for this projection.
+
+bool llama_dspark_confidence_logit(const llama_model * model, llama_token prev, const float * h, float * out) {
+    const auto * m = dynamic_cast<const llama_model_dspark *>(model);
+    if (m == nullptr || m->confidence_proj == nullptr || m->markov_w1 == nullptr || h == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * w1 = m->markov_w1;      // [rank, vocab]
+    ggml_tensor * wc = m->confidence_proj; // [n_embd + rank, 1]
+    const int64_t rank   = w1->ne[0];
+    const int64_t n_in   = wc->ne[0];
+    const int64_t n_embd = n_in - rank;
+    if (prev < 0 || prev >= w1->ne[1] || n_embd <= 0) {
+        return false;
+    }
+    if ((w1->type != GGML_TYPE_F32 && w1->type != GGML_TYPE_F16) ||
+        (wc->type != GGML_TYPE_F32 && wc->type != GGML_TYPE_F16)) {
+        return false;
+    }
+
+    // host cache of the projection column (n_in floats), populated once per model
+    static std::mutex mtx;
+    static std::unordered_map<const llama_model *, std::vector<float>> cache;
+    std::lock_guard<std::mutex> lk(mtx);
+
+    auto it = cache.find(model);
+    if (it == cache.end()) {
+        std::vector<float> wcf((size_t) n_in);
+        std::vector<uint8_t> raw(ggml_nbytes(wc));
+        ggml_backend_tensor_get(wc, raw.data(), 0, raw.size());
+        for (int64_t i = 0; i < n_in; ++i) {
+            wcf[i] = dspark_read_f32(raw.data(), wc->type, i);
+        }
+        it = cache.emplace(model, std::move(wcf)).first;
+    }
+    const std::vector<float> & wcf = it->second;
+
+    // read W1[prev] (rank floats)
+    std::vector<uint8_t> row(ggml_row_size(w1->type, rank));
+    ggml_backend_tensor_get(w1, row.data(), (size_t) prev * ggml_row_size(w1->type, rank), row.size());
+
+    float acc = 0.0f;
+    for (int64_t i = 0; i < n_embd; ++i) {
+        acc += wcf[i] * h[i];
+    }
+    for (int64_t r = 0; r < rank; ++r) {
+        acc += wcf[n_embd + r] * dspark_read_f32(row.data(), w1->type, r);
+    }
+
+    *out = acc;
+    return true;
 }

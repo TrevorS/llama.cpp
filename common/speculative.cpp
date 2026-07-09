@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1228,6 +1229,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     int32_t             n_vocab   = 0;
     std::vector<float>  markov_bias; // scratch, length n_vocab
 
+    // confidence-head prefix truncation (reference _confident_prefix_length):
+    // enabled via LLAMA_DSPARK_CONF_THRESH in (0,1); proposals are cut at the
+    // first row whose predicted acceptance falls below the threshold.
+    bool  conf_enabled      = false;
+    float conf_thresh_logit = 0.0f;
+
     std::vector<float> features_buf;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
@@ -1271,10 +1278,23 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
         }
 
+        // confidence-head threshold (0 or unset = disabled). The block decode
+        // must then also output the post-norm hidden states of the proposal rows.
+        if (const char * s = std::getenv("LLAMA_DSPARK_CONF_THRESH")) {
+            const float t = std::atof(s);
+            if (t > 0.0f && t < 1.0f) {
+                conf_enabled      = true;
+                conf_thresh_logit = std::log(t / (1.0f - t));
+                llama_set_embeddings(ctx_dft, true);
+            }
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-dspark'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, noise_token_id=%d, markov_vocab=%d, n_extract=%u\n",
                 __func__, block_size, mask_token_id, n_vocab, target_layer_ids_n);
+        LOG_INF("%s: - confidence truncation %s (thresh_logit=%.3f)\n",
+                __func__, conf_enabled ? "enabled" : "disabled", conf_enabled ? conf_thresh_logit : 0.0f);
 
         // DSpark input is [id_last, <noise> * (block_size-1)], so it drafts at most block_size-1 tokens per step
         if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
@@ -1409,7 +1429,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DSpark encoder produced no output.");
 
-                {
+                if (LOG_LEVEL_TRACE <= common_log_get_verbosity_thold()) {
                     size_t nan_feat = 0, nan_g = 0;
                     for (size_t z = 0; z < (size_t) n_chunk * n_embd_enc; ++z) {
                         nan_feat += std::isnan(features_buf[z]);
@@ -1506,10 +1526,22 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             llama_token prev = dp.id_last;
 
             for (int32_t i = 1; i < n_block_tokens; ++i) {
+                // Confidence gate (reference semantics: row k's predicted accept
+                // rate gates sampled token k, before sampling) — truncate the
+                // proposal at the first unconfident row.
+                if (conf_enabled) {
+                    const float * h = llama_get_embeddings_ith(ctx_dft, beg + i - 1);
+                    float clogit = 0.0f;
+                    if (llama_dspark_confidence_logit(model_dft, prev, h, &clogit) && clogit < conf_thresh_logit) {
+                        SPC_DBG("dspark conf cut: seq=%d slot=%d logit=%.3f\n", (int) seq_id, (int) i, clogit);
+                        break;
+                    }
+                }
+
                 float * logits = llama_get_logits_ith(ctx_dft, beg + i - 1);
                 if (logits) {
                     llama_dspark_markov_bias(model_dft, prev, markov_bias.data());
-                    {
+                    if (LOG_LEVEL_TRACE <= common_log_get_verbosity_thold()) {
                         size_t nan_l = 0, nan_b = 0;
                         for (int32_t v = 0; v < n_vocab; ++v) {
                             nan_l += std::isnan(logits[v]);

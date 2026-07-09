@@ -15,6 +15,12 @@
 // the draft-dspark speculative driver to make the parallel block semi-autoregressive.
 LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * out);
 
+// DSpark: confidence-head logit for one proposal row: W_conf . [h ; W1[prev]],
+// where `h` is the row's post-norm hidden state (length n_embd). Returns false
+// if the model carries no confidence head. The driver truncates the proposal at
+// the first row with sigmoid(logit) below its threshold (DeepSpec semantics).
+LLAMA_API bool llama_dspark_confidence_logit(const struct llama_model * model, llama_token prev, const float * h, float * out);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
