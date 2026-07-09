@@ -1224,6 +1224,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     }
 
     for (int il = 0; il < n_layer; ++il) {
+        if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            // extract_layer_inputs() expects [n_embd, n_tokens]; collapse the hc
+            // streams by mean-pooling, matching the dspark reference taps
+            ggml_tensor * x = ggml_is_contiguous(inpL) ? inpL : ggml_cont(ctx0, inpL);
+            ggml_tensor * tap = ggml_view_2d(ctx0, x, n_embd, n_tokens, x->nb[2], 0);
+            for (int h = 1; h < (int) hc; ++h) {
+                tap = ggml_add(ctx0, tap, ggml_view_2d(ctx0, x, n_embd, n_tokens, x->nb[2], (size_t) h*x->nb[1]));
+            }
+            tap = ggml_scale(ctx0, tap, 1.0f/(float) hc);
+            cb(tap, "layer_inp_hc_mean", il);
+            ggml_build_forward_expand(gf, tap);
+            res->t_layer_inp[il] = tap;
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
