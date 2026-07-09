@@ -1953,6 +1953,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
+            static const bool debug_nextn = getenv("LLAMA_DEBUG_NEXTN") != nullptr;
+
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
@@ -1962,6 +1964,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+
+                if (debug_nextn) {
+                    LLAMA_LOG_INFO("nextn-extract: nt=%d n_rows=%" PRId64 " offset=%" PRId64 " t=%s ne1=%" PRId64 " buft=%s\n",
+                            (int) ubatch.n_tokens, n_rows, offset, t_h_nextn->name, t_h_nextn->ne[1],
+                            ggml_backend_name(backend_h));
+                }
+            } else if (debug_nextn && cparams.embeddings_nextn) {
+                LLAMA_LOG_INFO("nextn-extract SKIPPED: nt=%d data=%d t=%d n_rows=%" PRId64 " pooling=%d\n",
+                        (int) ubatch.n_tokens, embd_nextn.data != nullptr, t_h_nextn != nullptr,
+                        n_rows, (int) cparams.pooling_type);
             }
         }
 
