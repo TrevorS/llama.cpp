@@ -1375,6 +1375,20 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                     }
                 }
 
+                {
+                    // DS4 sink positions carry ~5e4 activations; products inside the
+                    // fp16 fc GEMM overflow fp16 range. The encoder is fc followed by
+                    // an RMS norm, which is scale-invariant, so scaling the features
+                    // down is exact (reference runs main_proj in bf16 and needs none).
+                    float fmax = 0.0f;
+                    for (size_t z = 0; z < (size_t) n_chunk * n_embd_enc; ++z) {
+                        float & v = features_buf[z];
+                        fmax = std::max(fmax, std::fabs(v));
+                        v *= (1.0f/1024.0f);
+                    }
+                    SPC_TRC("dspark features: chunk=%d max_abs=%.1f (scaled 1/1024)\n", (int) n_chunk, fmax);
+                }
+
                 llama_batch enc_batch = {
                     /*.n_tokens =*/ n_chunk,
                     /*.token    =*/ nullptr,
