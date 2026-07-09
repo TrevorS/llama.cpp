@@ -711,7 +711,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(4u*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -758,9 +758,16 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         ggml_format_name(kv,    "dsv4_%s_state_kv_l%d",    name, il);
         ggml_format_name(score, "dsv4_%s_state_score_l%d", name, il);
 
+        // frontier stash for speculative partial-accept rewind (see spec_stash)
+        ggml_tensor * kv_stash    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_stream);
+        ggml_tensor * score_stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_stream);
+
+        ggml_format_name(kv_stash,    "dsv4_%s_stash_kv_l%d",    name, il);
+        ggml_format_name(score_stash, "dsv4_%s_stash_score_l%d", name, il);
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, kv, score });
+        layers.push_back({ il, kv, score, kv_stash, score_stash });
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -901,6 +908,38 @@ ggml_tensor * llama_dsv4_comp_state::cpy_kv(ggml_context * ctx, ggml_tensor * cu
 
 ggml_tensor * llama_dsv4_comp_state::cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
     return ggml_set_rows(ctx, get_score(ctx, il), cur, idxs);
+}
+
+void llama_dsv4_comp_state::spec_stash() {
+    for (auto & l : layers) {
+        ggml_backend_tensor_copy(l.kv,    l.kv_stash);
+        ggml_backend_tensor_copy(l.score, l.score_stash);
+    }
+}
+
+void llama_dsv4_comp_state::spec_restore_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (p1 < p0) {
+        return;
+    }
+    // one verify ubatch never wraps the ring (nt < state_size), asserted by the caller
+    GGML_ASSERT((uint32_t) (p1 - p0 + 1) <= state_size);
+
+    const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
+    const size_t  row_bytes  = (size_t) n_embd_state * sizeof(float);
+
+    std::vector<uint8_t> row(row_bytes);
+
+    for (auto & l : layers) {
+        for (llama_pos pos = p0; pos <= p1; ++pos) {
+            const size_t offs = ((size_t) stream_off + pos % state_size) * row_bytes;
+
+            ggml_backend_tensor_get(l.kv_stash, row.data(), offs, row_bytes);
+            ggml_backend_tensor_set(l.kv,       row.data(), offs, row_bytes);
+
+            ggml_backend_tensor_get(l.score_stash, row.data(), offs, row_bytes);
+            ggml_backend_tensor_set(l.score,       row.data(), offs, row_bytes);
+        }
+    }
 }
 
 size_t llama_dsv4_comp_state::total_size() const {
@@ -1359,6 +1398,33 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_hca_state() const {
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
+}
+
+void llama_kv_cache_dsv4::spec_frontier_stash(llama_seq_id seq_id, llama_pos pos_max) {
+    csa_state->spec_stash();
+    hca_state->spec_stash();
+    lid_state->spec_stash();
+
+    spec_stash_pos[seq_id] = pos_max;
+}
+
+bool llama_kv_cache_dsv4::spec_frontier_restore(llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject) {
+    const auto it = spec_stash_pos.find(seq_id);
+    if (it == spec_stash_pos.end()) {
+        return false; // no stash for this seq
+    }
+    if (p0_reject <= it->second) {
+        return false; // rejected range reaches into pre-stash territory - stash can't cover it
+    }
+
+    csa_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+    hca_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+    lid_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+
+    // single use: the stash matches exactly one verify decode
+    spec_stash_pos.erase(it);
+
+    return true;
 }
 
 void llama_kv_cache_dsv4::clear_compressed(bool data) {

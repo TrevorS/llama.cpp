@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1154,11 +1155,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
 void llama_context::set_dspark_draft_chain(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    // no sched reserve: chain graphs are excluded from reserve-shape ubatches
+    // anyway (nt gate) and the meta tensor is protected by the OUTPUT-flag
+    // propagation in set_outputs. This keeps per-decode toggling free (the
+    // MTP driver flips it around each draft decode).
     cparams.dspark_draft_chain = value;
-
-    // the meta export tensor must be part of the worst-case reservation
-    // (same failure mode as set_embeddings_nextn above)
-    sched_need_reserve = true;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3750,6 +3751,29 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_dspark_draft_chain(llama_context * ctx, bool value) {
     ctx->set_dspark_draft_chain(value);
+}
+
+bool llama_dsv4_spec_stash(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->synchronize();
+
+    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
+    if (kv == nullptr) {
+        return false;
+    }
+
+    kv->spec_frontier_stash(seq_id, kv->seq_pos_max(seq_id));
+    return true;
+}
+
+bool llama_dsv4_spec_restore(llama_context * ctx, llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject) {
+    ctx->synchronize();
+
+    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
+    if (kv == nullptr) {
+        return false;
+    }
+
+    return kv->spec_frontier_restore(seq_id, p0_reject, p1_reject);
 }
 
 const float * llama_get_dspark_draft_meta(llama_context * ctx, uint32_t * count) {

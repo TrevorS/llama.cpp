@@ -30,6 +30,16 @@ LLAMA_API void          llama_set_dspark_draft_chain(struct llama_context * ctx,
 // (optional) receives the number of floats.
 LLAMA_API const float * llama_get_dspark_draft_meta(struct llama_context * ctx, uint32_t * count);
 
+// DSV4 speculative partial-accept rewind (ds4.c compressor-frontier snapshot
+// analog). Call llama_dsv4_spec_stash BEFORE the verify decode to snapshot the
+// compressor frontier; on partial acceptance call llama_dsv4_spec_restore with
+// the REJECTED position range [p0, p1] to rewind only those ring rows, then
+// trim the rejected raw tail with the normal llama_memory_seq_rm. Both return
+// false when the context's memory is not the DSV4 cache (caller falls back to
+// full checkpoint restore).
+LLAMA_API bool llama_dsv4_spec_stash  (struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_dsv4_spec_restore(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
