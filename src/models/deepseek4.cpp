@@ -838,7 +838,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
         ggml_tensor * kv,
         ggml_tensor * sinks,
         float kq_scale,
-        int il) const {
+        int il,
+        int row) const {
     GGML_ASSERT(hparams.is_swa(il));
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -853,9 +854,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     const llama_kv_cache_dsv4_raw_context * mctx_cur = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    ggml_tensor * k_idxs = inp_attn->get_k_idxs();
+    if (row >= 0) {
+        k_idxs = ggml_view_1d(ctx0, k_idxs, 1, (size_t) row * k_idxs->nb[0]);
+    }
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, k_idxs, il));
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+    if (row >= 0) {
+        // single-row slice of the full-ubatch mask (column `row`)
+        kq_mask = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], 1, kq_mask->ne[2], kq_mask->ne[3],
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], (size_t) row * kq_mask->nb[1]);
+    }
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
@@ -873,7 +884,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        int row) const {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -1116,6 +1128,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_build_forward_expand(gf, hca_state_score);
     }
 
+    GGML_ASSERT(row < 0 || ratio == 0); // row slicing only on raw-attention layers
+
     ggml_tensor * out = nullptr;
     if (ratio == DSV4_CSA_RATIO &&
             inp_dsv4->get_csa().kq_mask &&
@@ -1129,7 +1143,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
                 1.0f/sqrtf(float(n_embd_head)), il);
     } else {
         out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), il);
+                1.0f/sqrtf(float(n_embd_head)), il, row);
     }
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
@@ -1163,8 +1177,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_context(params) {
     ggml_tensor * cur;
 
+    // chained-draft graphs return before the shared tail, so inp_out_ids must
+    // not be registered for them: an input handler whose tensor never enters
+    // the graph is never allocated, and set_inputs would abort on it
+    const bool mtp_chain = model.arch == LLM_ARCH_DEEPSEEK4_MTP &&
+            cparams.dspark_draft_chain &&
+            n_tokens >= 2 && n_tokens <= 8 && ubatch.n_seqs_unq == 1;
+
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = mtp_chain ? nullptr : build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
@@ -1198,6 +1219,115 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inp_eh->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
         ggml_set_input(inp_eh->h);
         ggml_set_name(inp_eh->h, "mtp_h_input");
+
+        // Chained draft mode (ds4.c combined-forward analog): K sequential
+        // single-row passes through the MTP block in ONE graph, with greedy
+        // argmax token feedback and in-graph h chaining. Row 0 consumes the
+        // real (token, h) inputs; rows 1..K-1 ignore their placeholder inputs.
+        // Gated per-decode by the driver (llama_set_dspark_draft_chain).
+        if (mtp_chain) {
+            const int64_t K       = n_tokens;
+            const auto  & layer   = model.layers[0];
+
+            // one full single-row pass through the MTP block; returns l_out [n_embd, hc, 1]
+            auto build_block_row = [&](ggml_tensor * x, ggml_tensor * pos_row, int row) {
+                ggml_tensor * residual = x;
+                ggml_tensor * post = nullptr;
+                ggml_tensor * comb = nullptr;
+
+                ggml_tensor * c = build_hc_pre(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, 0);
+                c = build_norm(c, layer.attn_norm, nullptr, LLM_NORM_RMS, 0);
+                c = build_attention(model, inp_dsv4, c, pos_row, 0, row);
+                x = build_hc_post(c, residual, post, comb, 0);
+
+                residual = x;
+                c = build_hc_pre(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, 0);
+                c = build_norm(c, layer.ffn_norm, nullptr, LLM_NORM_RMS, 0);
+
+                ggml_tensor * moe_out = build_moe_ffn(c,
+                        layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                        layer.ffn_exp_probs_b,
+                        n_expert, hparams.n_expert_used,
+                        LLM_FFN_SILU, hparams.expert_weights_norm,
+                        hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        0);
+
+                ggml_tensor * ffn_shexp = build_ffn(c,
+                        layer.ffn_up_shexp, nullptr, nullptr,
+                        layer.ffn_gate_shexp, nullptr, nullptr,
+                        layer.ffn_down_shexp, nullptr, nullptr,
+                        nullptr, LLM_FFN_SILU, LLM_FFN_PAR, 0);
+
+                c = ggml_add(ctx0, moe_out, ffn_shexp);
+                return build_hc_post(c, residual, post, comb, 0);
+            };
+
+            ggml_tensor * tok = ggml_view_1d(ctx0, inp_eh->tokens, 1, 0);
+            ggml_tensor * h_flat = ggml_view_2d(ctx0, inp_eh->h, n_embd_h, 1, inp_eh->h->nb[1], 0);
+
+            ggml_tensor * logits_all = nullptr;
+            ggml_tensor * flat_all   = nullptr;
+            ggml_tensor * meta       = nullptr;
+
+            for (int64_t k = 0; k < K; ++k) {
+                ggml_tensor * e = ggml_get_rows(ctx0, model.tok_embd, tok);
+                e = build_norm(e, layer0.nextn.enorm, nullptr, LLM_NORM_RMS, 0);
+                e = build_lora_mm(layer0.nextn.e_proj, e);
+
+                ggml_tensor * e_hc = ggml_repeat_4d(ctx0,
+                        ggml_reshape_3d(ctx0, e, n_embd, 1, 1), n_embd, hc, 1, 1);
+
+                ggml_tensor * h = ggml_reshape_3d(ctx0, h_flat, n_embd, hc, 1);
+                h = build_norm(h, layer0.nextn.hnorm, nullptr, LLM_NORM_RMS, 0);
+                h = build_lora_mm(layer0.nextn.h_proj, h);
+
+                ggml_tensor * x = ggml_add(ctx0, e_hc, h);
+
+                ggml_tensor * pos_row = ggml_view_1d(ctx0, inp_pos, 1, (size_t) k * inp_pos->nb[0]);
+
+                ggml_tensor * l_out = build_block_row(x, pos_row, (int) k);
+
+                ggml_tensor * flat = ggml_reshape_2d(ctx0, l_out, n_embd*hc, 1);
+                h_flat = flat; // h chaining: next row consumes this row's state
+
+                ggml_tensor * head = build_hc_head(ggml_reshape_3d(ctx0, flat, n_embd, hc, 1),
+                        model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+                head = build_norm(head, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+
+                ggml_tensor * logits_k = ggml_mul_mat(ctx0, model.output, head); // [n_vocab, 1]
+
+                ggml_tensor * id  = ggml_argmax(ctx0, logits_k); // I32 [1]
+                ggml_tensor * idf = ggml_cpy(ctx0, id, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1));
+                tok = id; // greedy token feedback
+
+                ggml_tensor * pair = ggml_concat(ctx0, idf, ggml_scale(ctx0, idf, 0.0f), 0); // conf slot unused
+                meta = meta ? ggml_concat(ctx0, meta, pair, 0) : pair;
+
+                logits_all = logits_all ? ggml_concat(ctx0, logits_all, logits_k, 1) : logits_k;
+                flat_all   = flat_all   ? ggml_concat(ctx0, flat_all,   flat,     1) : flat;
+            }
+
+            cb(logits_all, "result_output", -1);
+            res->t_logits = logits_all;
+
+            cb(flat_all, "h_nextn", -1);
+            if (cparams.embeddings_nextn) {
+                res->t_h_nextn = flat_all;
+            }
+
+            cb(meta, "mtp_draft_meta", -1);
+            res->t_dspark_meta = meta;
+
+            res->add_input(std::move(inp_eh));
+
+            ggml_build_forward_expand(gf, logits_all);
+            ggml_build_forward_expand(gf, meta);
+            if (res->t_h_nextn != nullptr) {
+                ggml_build_forward_expand(gf, flat_all);
+            }
+            return;
+        }
 
         ggml_tensor * e = ggml_get_rows(ctx0, model.tok_embd, inp_eh->tokens);
         e = build_norm(e, layer0.nextn.enorm, nullptr, LLM_NORM_RMS, 0);
