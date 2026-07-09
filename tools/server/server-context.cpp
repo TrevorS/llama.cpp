@@ -2575,6 +2575,23 @@ private:
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // Synthesize a context checkpoint at the restored boundary.
+                    // The SWA/hybrid prompt-reuse gate requires checkpoint
+                    // coverage to resume near the frontier; a freshly restored
+                    // slot has none (checkpoints are not part of the save
+                    // file), so without this the next request silently forces a
+                    // full prompt re-process. pos_min is recorded as 0: the
+                    // restored state resumes at its tail (the pos_max guard in
+                    // the gate rejects deeper rewinds), and the actual
+                    // seq_pos_min sits exactly at the SWA window edge, one
+                    // position too new for the gate's coverage predicate.
+                    {
+                        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (pos_max >= 0) {
+                            create_checkpoint(*slot, 0, /*pos_min=*/ 0, pos_max);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
