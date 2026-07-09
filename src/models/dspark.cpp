@@ -59,7 +59,9 @@ void llama_model_dspark::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
-    ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);
+    // dspark draft blocks are raw-attention only; the converter intentionally
+    // skips compress/indexer keys, and this value is unused in the dspark graph
+    ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base, false);
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
@@ -145,7 +147,9 @@ void llama_model_dspark::load_arch_tensors(llama_model_loader &) {
     // contract ("dspark.markov_w1", "dspark.markov_w2", "dspark.confidence_proj").
     markov_w1       = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1), {(int64_t) markov_rank, n_vocab}, 0);
     markov_w2       = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2), {(int64_t) markov_rank, n_vocab}, 0);
-    confidence_proj = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ), {n_embd, 1}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    // confidence head input is hidden ⊕ markov features (4096 + 256 = 4352 in
+    // the official checkpoint); unused in v1 but must still be consumed
+    confidence_proj = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ), {n_embd + (int64_t) markov_rank, 1}, llama_model_loader::TENSOR_NOT_REQUIRED);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dspark::build_arch_graph(const llm_graph_params & params) const {

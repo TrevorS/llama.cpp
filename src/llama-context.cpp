@@ -2299,8 +2299,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_DEEPSEEK4_MTP ||
+        model.arch == LLM_ARCH_DSPARK) {
+        // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
+        // the 8*n_tensors default budget underestimates them badly
+        return std::max<uint32_t>(std::max(n_tokens * 40, 4096u), 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
