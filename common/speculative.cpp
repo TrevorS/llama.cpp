@@ -1395,6 +1395,18 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DSpark encoder produced no output.");
 
+                {
+                    size_t nan_feat = 0, nan_g = 0;
+                    for (size_t z = 0; z < (size_t) n_chunk * n_embd_enc; ++z) {
+                        nan_feat += std::isnan(features_buf[z]);
+                    }
+                    for (size_t z = 0; z < (size_t) n_chunk * n_embd_dec; ++z) {
+                        nan_g += std::isnan(inp_g[z]);
+                    }
+                    SPC_TRC("dspark process: chunk=%d nan_features=%zu nan_g=%zu g0=%.4f\n",
+                            (int) n_chunk, nan_feat, nan_g, inp_g[0]);
+                }
+
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
@@ -1439,9 +1451,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 n_draft = std::min(n_draft, dp.n_max);
             }
 
-            const int32_t n_block_tokens = n_draft + 1; // id_last + n_draft * <noise>
+            // always decode a full trained block (id_last + (block_size-1) noise);
+            // only the first n_draft samples are consumed below
+            const int32_t n_block_tokens = block_size;
             i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
+            n_block    [seq_id] = std::min(n_draft, block_size - 1) + 1;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
             }
@@ -1481,6 +1495,15 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 float * logits = llama_get_logits_ith(ctx_dft, beg + i - 1);
                 if (logits) {
                     llama_dspark_markov_bias(model_dft, prev, markov_bias.data());
+                    {
+                        size_t nan_l = 0, nan_b = 0;
+                        for (int32_t v = 0; v < n_vocab; ++v) {
+                            nan_l += std::isnan(logits[v]);
+                            nan_b += std::isnan(markov_bias[v]);
+                        }
+                        SPC_TRC("dspark draft: slot=%d nan_logits=%zu nan_bias=%zu l0=%.4f b0=%.4f\n",
+                                (int) i, nan_l, nan_b, logits[0], markov_bias[0]);
+                    }
                     for (int32_t v = 0; v < n_vocab; ++v) {
                         logits[v] += markov_bias[v];
                     }
@@ -1489,6 +1512,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 common_sampler_sample(smpl, ctx_dft, beg + i - 1, true);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                    SPC_DBG(" - seq_id %d, dspark candidate %3d, slot %3d: %6d (%8.3f) '%s'\n",
+                            (int) seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                }
 
                 const llama_token id = cur_p->data[0].id;
 
