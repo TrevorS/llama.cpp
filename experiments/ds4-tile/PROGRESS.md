@@ -243,3 +243,60 @@ SCOREBOARD — all four original targets now met (ds4.c reference in parens):
 Config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
 Remaining open item: long-ctx validation at 512k (target #2 / task #6 —
 allocation proven in iteration 2, needs a real run + tg@512k gate).
+
+## Iteration 10 — post-FA-fix profiling sweep (nsys + ncu app-replay)
+
+Serving config (bd321dec, np2-unified ub2048): 404 t/s @14k. nsys prefill ranking:
+mul_mat_q IQ2_S 22.6% + IQ3_XXS 10.8% (ceiling, confirmed), FA<512,512> 19.2%
+(19.7ms avg), concat_non_cont 4.6% (k_all raw+comp concat — pure data movement),
+rms_norm 4.3%, dsv4 fused kernels 7.4% combined. Decode: CUDA graphs active
+(1 launch/token), mmvq Q8_0 31.8%, elementwise storm 18% (compressor/gating).
+
+- rms_norm fix: **NO-OP — aggregation artifact.** Per-launch ncu: q-norm 622us
+  = 243 GB/s, HC flat_norm 243us = 276 GB/s — both at DRAM ceiling. The 14%
+  SoL average was polluted by Amdahl-irrelevant tiny-grid launches. Do not
+  patch norm.cu.
+- FA<512,512> (uniform shape, trustworthy): 34% compute / 47% memory SoL —
+  ~2x kernel headroom, worth ~9-10% wall. Reference: FlashInfer MLA kernels.
+- ncu on this box: kernel replay snapshots unified memory incl. 96G weights ->
+  earlyoom (killed 2 sessions). MUST use --replay-mode application.
+
+Queue: (next) eliminate k_all concat -> then FA-512 tuning.
+
+## Iteration 11 — concat row-copy fast path: NEGATIVE (traffic-bound)
+
+Hypothesis: concat_non_cont's per-element index math + branch is the cost.
+Wrong — replaced with two vectorized row-copy launches (uint4, narrow-row
+packing): per-concat GPU time unchanged (~1.0ms), bench identical
+(457.51 vs 456.37 t/s pp2048@d8192 ub2048, r=3). The old kernel was already
+coalesced; concat cost IS the ~90MB/instance of traffic. REVERTED.
+- The only remaining path for the 4.6-4.9% concat share is zero-copy layout
+  (raw-window rows allocated adjacent to comp K per layer) — deep
+  llama-kv-cache-dsv4 surgery incl. state save/restore; deferred (risk >> 4%).
+- NEW REFERENCE: pp2048@d8192 ub2048 llama-bench = 457.5 t/s on bd321dec.
+Queue: -> FA-512. First probe: why does dispatch pick flash_attn_ext_f16
+(tile kernel) for D=512/DV=512 on cc12.1 instead of the mma path — if
+fattn-mma lacks 512 support, extending it is the FlashInfer-class fix.
+
+## Iteration 12 — FA-512 mma config sweep: default already optimal
+
+Discovery: the 19% FA<512,512,8,8> kernel IS fattn-mma-f16 (same symbol name
+as the wmma kernel; stream-k fixup companions prove it) — we were never on a
+legacy path. Swept compiled ncols configs via temp env hook (pp2048@d8192
+ub2048, r=2): default (8,8) 458.61 · (16,4) 451.93 · (32,2) 452.72 ·
+(4,8) 408.28. Generic switch wins; hook reverted.
+- Remaining FA headroom (34% compute / 47% mem SoL => ~10% wall) requires
+  kernel-internal work: deeper cp.async pipelining or FlashInfer-style MLA
+  split-KV for D=512 on sm121. Filed as future deep-dive, not config tuning.
+- zsh gotcha: `set -- $cfg` does NOT word-split in zsh — first sweep silently
+  ran the default 4x. Always pass env pairs explicitly.
+
+## Queue summary (iterations 10-12)
+
+All three profiler leads resolved: rms_norm = artifact (at ceiling),
+concat = traffic-bound (kernel rewrite no-op, zero-copy layout deferred),
+FA-512 = config-optimal (kernel-internal headroom remains). Prefill at
+457-459 t/s pp2048@d8192 ub2048 is within ~1-2% of practically achievable
+with current kernel architecture. The day's serving arc: 140 -> 404 t/s
+(unified-FA fix bd321dec + fused kernels + ub2048); further gains need the
+FA kernel deep-dive (~10%) or MoE quant changes (vetoed: no requant).
