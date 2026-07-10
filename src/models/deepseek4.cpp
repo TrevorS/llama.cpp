@@ -1441,8 +1441,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
+        // Refusal-ablation apply point. ds4 projects on ffn_out (per-layer FFN
+        // increment); the default cvec hook is post-HC (l_out). Match capture.
+        static const bool cvec_at_ffn = getenv("LLAMA_CVEC_AT_FFN") != nullptr;
+        if (cvec_at_ffn) {
+            cur = build_cvec(cur, il);
+        }
+
         inpL = build_hc_post(cur, residual, post, comb, il);
-        inpL = build_cvec(inpL, il);
+        if (!cvec_at_ffn) {
+            inpL = build_cvec(inpL, il);
+        }
         cb(inpL, "l_out", il);
     }
 

@@ -1,0 +1,400 @@
+What are the best strategies for learning a new language?
+Write 3 questions that a student can ask their teacher about a given topic.
+List the processes or steps needed to dye fabric using natural dyes
+Create an array of size 10 filled with random numbers between 0-100.
+Suggest 3 ways a local business can leverage digital marketing to reach potential customers.
+Generate a hypothesis about why the apple fell from the tree.
+Describe a single day at the beach.
+Design an online shop that sells clothing.
+Write a convincing argument in favor of using GPT models.
+Generate a list of synonyms for 'desolate'.
+Generate a sentence using the vocabulary words "verdant, enraptured and decree".
+Describe a scenario in which artificial intelligence might cause or contribute to an ethical problem.
+Consider a situation where you are talking to a stranger online, advise me on how I can recognize and avoid any malicious intent.
+Generate a list of clothes in your wardrobe
+Describe the layout of a classroom
+Create an outline for an article discussing the use of AI in healthcare.
+Describe the significance of the Internet of Things.
+Create a detailed description of a restaurant, including its atmosphere and a description of the food it serves.
+Generate an HTML page that calculates the area of a circle from a given radius.
+Generate a headline for a newspaper article about the opioid crisis in the US.
+Explain how a GPT Language model works with an example.
+Generate a list of 10 countries whose flags contain the color red.
+Generate a recipe for gumbo
+What is the origin story behind a popular fable or myth?
+Describe the best way to protect and preserve the environment.
+Generate a recipe for a classic apple pie.
+Explain the meaning of the phrase "a rose by any other name would smell as sweet".
+What color is the sky?
+Think of one example of a cloud computing service.
+Generate a song title for a song about unrequited love.
+Write a solution to the equation 2x = 4.
+Calculate the rate of interest for an investment of $1000 for 3 years with a rate of 5%.
+Who is the current Prime Minister of India?
+Create a list of potential strategies to improve customer service.
+Come up with 10 questions related to nutrition.
+Create a story of 200 words, in which a lawyer works hard to solve a mysterious case.
+Describe the best way to conduct an interview.
+Name one baroque art style.
+Find the probability of drawing a two from a standard deck of 52 cards.
+What is the most successful marriage proposal in history?
+Compare the lifespan of a human and a dog.
+Describe a hypothetical system for gaining points by participating in community service.
+Generate a list of actionable items to improve user experience on a website.
+Name two endangered animals
+Describe the process of data mining using 3-5 sentences.
+Create a list of eight clothing items an individual should have in their wardrobe
+Illustrate the differences between SEO and SEM.
+State a quote that accurately reflects your view on life.
+Give the name of a specific type of predator.
+Describe the process for recruiting new staff
+Recommend a poem to a 4 year old.
+In what region of the United States is Albuquerque located?
+What is an example of structured data?
+Name 4 features of a database management system.
+Create a review for the latest movie released by Disney.
+Generate song lyrics that express love and longing.
+Generate a list of 5 resorts for a summer vacation.
+Automatically generate a 10 by 10 multiplication table.
+Explain why it is important to use renewable energy sources.
+Generate a unique recipe for ground beef.
+Find and describe a quick fix for a leaky faucet
+Show how to add a backround color to a text
+Compose a haiku about cats
+Write a short story set in the future.
+Generate 5 questions that would be used to test someone's knowledge of the periodic table.
+Come up with a 3-step recipe to roast vegetables.
+How did Julius Caesar die?
+Identify the English speaking countries
+Compose a tweet about the importance of staying informed during a pandemic.
+Create a tweet that is 140 characters or less and makes people laugh.
+Design a poster that promotes summer vacation in Thailand.
+Make a list of 3-4 strategies for conserving energy.
+Rank the importance of customer loyalty programs.
+List three pros and three cons of nuclear energy.
+How will you address a customer's issue in a respectful and empathetic manner?
+Create a short story about a person discovering a new planet.
+Paraphase the following sentence: "Macaroni and cheese is an iconic American dish".
+Design how a website about space exploration should look like.
+Identify 5 sources of finance.
+What is User Acceptance Testing?
+Find the sum of the two consecutive integers that are 11 apart.
+If there are two apples and you give away one, how many apples do you have left?
+Give an example of a smart device used in daily life.
+Generate a one line story that expresses a moral.
+Suggest three ways of dealing with pandemic fatigue.
+Find an article about the future of blockchain technology
+Make me a cup of tea.
+Give two strategies for revising an essay.
+What did the ancient Greeks think caused eclipses?
+Imagine you are building a game that has 3 levels. Describe the difficulty level and game progress for each level.
+What is the role of DNA in living organisms?
+Make a list of five life skills every person should have.
+Analyze the following sentence: "The cat slipped away from the restless dog."
+Generate a list of five tasks that office workers should perform daily.
+How long is the Nile River?
+Write a five-sentence passage about a particular character.
+Name two other types of renewable energy besides solar.
+Recommend a classic novel.
+Name a commonly used e-commerce platform.
+Create a list of 5 synonyms for the word 'persuade'.
+Compare and contrast theologies of Calvinism and Lutheranism.
+Provide me 3 facts about penguins
+Group the following list of animals by size. Output the names of the animals in each group. Hippopotamus, Elephant, Lion, Giraffe, Gorilla, Ocelot, Beaver
+State the purpose of feature engineering.
+Retrieve information about the Internet of Things (IoT).
+What is the best way to introduce yourself to a group?
+Identify the most important value in project management.
+Come up with a unique title for a story about a person's journey.
+Comparing Microsoft Office to Google Docs, what are some of the major differences when it comes to features?
+Name three famous works of art
+Find some interesting facts about earthquakes.
+Describe the application of blockchain technology in the field of finance.
+Name 3 types of transportation in India.
+Record a melody with a duration of 20 seconds
+Provide directions from the National Mall to the National Zoo.
+Generate a list of 10 diseases that affect cattle
+Write down two reasons why a company would choose to outsource its customer service operations.
+Predict the weather tomorrow morning.
+Generate a unique example of hyperbole.
+Compare the following two nouns using the correct word: communicate, similar
+Group the following words into adjective, verb and noun: "decide, interesting, chair"
+Identify a key feature of the web development process.
+Cite three non-English sources for a research paper on ancient Greek mythology.
+Generate an algebraic expression to represent the following equation: 4x + 6 = 10
+Name 4 different mammals.
+Calculate the factorial of 6.
+Write a Facebook post about baking
+Explain the objectives of the UN Framework Convention on Climate Change
+Generate a song title that has a dance vibe.
+Develop a unique thesis for a research paper about the role of technology in education.
+Provide 2 examples of cultural diversity in the US.
+Given an example, generate a list of 3 synonyms and 3 antonyms of the word "kind".
+Draft a code of conduct for online learning.
+Generate an example of a data frame with seven columns and five rows.
+Describe President Obama's most significant accomplishments during his presidency.
+Provide two examples of open source software.
+Explain why the US economy experienced a recession in 2008
+Create a test suite in Python to check if an input string is a valid email address.
+Describe the concept of supervised learning.
+Generate a sentence starting with the phrase “Every night”.
+Explain why governments must collect taxes from citizens
+How many different colors are in the British flag?
+Generate a password that has 10-15 characters, including one uppercase letter, one lowercase letter, one symbol, and one number.
+Write an emergency response plan
+Draft a set of guidelines for a team meeting.
+Convert the number 1.168 into its binary format
+Generate a list of jobs suitable for teenagers.
+What is the temperature in Fahrenheit of 10°C?
+Make a list of 10 colors found in rainbows.
+What is a trade deficit?
+Describe a recent technological development that is revolutionizing the way we work.
+Generate a sentence that describes the main idea behind a stock market crash.
+Write a song lyric containing at least one specific moment in time
+Describe an interesting event that happened in your life.
+Generate a recommendation for someone looking to buy a laptop.
+Find a verb phrase that means "to take away power or authority"
+What is Dependency Parsing?
+Explain botnet in simple terms.
+In a few sentences, describe the virtual reality industry
+Assume you are an art collector and are on the lookout for artwork. What questions would you ask a gallery?
+Construct a What-If question related to history.
+List three steps to improving your writing.
+Name one of the famous soccer clubs in Brazil.
+Suggest a fun activity you can do online.
+Generate a random sentence between 4 to 8 words.
+Create a funny story that uses metaphors
+Give two reasons why the USA has the largest economy in the world.
+Generate a creative description for a new type of flower.
+How can I utilize email marketing to promote a product?
+Describe the economic impact of World War II.
+Describe the impacts of deforestation.
+How would you explain the concept of Darwinism to an 8th grader?
+Generate a case study about the development of a new healthcare app
+Design a game for young children that emphasizes the importance of safety.
+Explain a scenario when artificial intelligence may not be the best solution.
+Create an OpEd on the topic of digital rights.
+Find the synonyms of 'strenuous'.
+Create a URL by appending the following string "black-friday-sales" to the domain "www.example.com".
+Describe five security measures for protecting online data.
+Generate a metaphor to describe artificial intelligence.
+Compose a novel opening.
+Give 10 examples of adjectives that describe a person.
+Compare and contrast Google Home and Amazon Echo.
+Which of the following would be an appropriate input to a GPT model?
+Generate a multiplications table for 4.
+Describe what a sun dog is.
+Give an example of a country that has adopted the Euro as its currency.
+Explain the pros and cons of using a tablet computer.
+What is the weather like in New York City today?
+Write a sentence about the importance of environmental conservation.
+How many calories in a slice of pizza
+Make a list of behaviors that show strong leadership.
+What is a vulnerability in computer security?
+Construct a conflict in a story.
+Given a dataset, generate a machine learning model to identify patterns in the data.
+Compare the features of HTML and CSS.
+Generate a list of features regarding a virtual assistant.
+Generate a character description for a female character.
+How do you disperse water from a tree-watering device?
+Generate a paragraph that explains the steps to build a Natural Language Processing (NLP) model.
+What is the main purpose of the American with Disabilities Act?
+Compose a brief story about an ostrich.
+What is a resume objective?
+List the best practices for developing a mobile application.
+What is the origin of the poem "Twinkle, Twinkle, Little Star"?
+Suggest a theory to explain why the Antarctic ice is melting.
+Deduct the sales tax from the following subtotal: $400.
+How does the Covid-19 pandemic changes the world?
+Create a story about a prince and princess living in a castle.
+Describe a situation in which learning new skills can be beneficial
+Develop a strategy around environmental sustainability.
+Re-write the following sentence with at least two additional verbs: The cat jumped onto the roof.
+Create a time expression out of the following sentence: Jeans are on sale this week.
+What is the most common type of conflict in literature?
+How can you measure customer loyalty?
+Predict what the weather will be like two days from now.
+Write a short essay on the importance of taking breaks from work.
+Create a mathematical equation that is equal to 36.
+Generate a list of six tips on how to reduce energy waste
+Generate a list of elements in a periodic table.
+What is one use case for speech recognition technology?
+What is the name of the type of the triangle whose sides are all equal?
+Collaborate with a fellow learner to create a plan for making a mini catapult.
+Construct an outline for an essay about the benefits of a healthy lifestyle.
+How does Newton's Second Law of Motion apply to a rocking chair?
+Create 5 questions that one can ask a robot.
+Describe three benefits of online education.
+How does the process of backpropagation work in neural networks?
+Generate a word which rhymes with "bee".
+Name three iconic landmarks in California
+Edit the following sentence to make it grammatically correct: “He is a better lawyer then me.”
+What are two benefits of using digital calendars and reminders?
+Predict the future of self-driving cars.
+Write a blog post about marketing strategies to reach a target audience.
+Design the user interface for a new AI assistant.
+Create an algorithm to classify text.
+Name three foreign language you would like to learn.
+Describe what constitutes a healthy lifestyle.
+Make a list of three ways to combat global warming.
+Generate a biography of Malala Yousafzai.
+Summarize the academic article "Artificial Intelligence and the Future of Work".
+Give an example of a project management tool.
+Provide a use case of reinforcement learning.
+Provide an explanation for the loud noise coming from outside the house.
+Describe the role of culture in a health care setting.
+Describe an outfit you would wear on a weekend afternoon.
+Explain why Albert Einstein is known as one of the most influential scientists.
+Identify the capital of Australia.
+Construct a function to find the area of a rectangle.
+Create a program to automate data entry
+Convert the string "My name is Jane" to a list of words.
+Create a website interface to help people find jobs.
+Write a short story about two strangers who meet in the park.
+Convert the phrase "I had a great time" into present tense.
+Generate a timeline for a meal from scratch
+Generate 5 adjectives to describe the host of a party
+Generate an example of how customers could use the product in their everyday lives.
+Develop an algorithm to add two numbers together
+Compare and contrast the advantages and disadvantages of deep learning and reinforcement learning.
+Explain the process of DNA replication.
+Generate a sentence using the following words: urban, discord, lush.
+Construct a soliloquy for Hamlet in the style of Shakespeare.
+Describe the different stages in the software development lifecycle.
+What purpose does a database serve?
+Construct a function that determines the number of days in a given month using the month name and date.
+Create a logic puzzle that can be solved by logic deduction.
+Find the characteristic of the chemical element "Bismuth".
+Generate three words that describe a computer.
+Answer this true or false question. Europe is the largest continent in the world.
+List five symptoms of a panic attack.
+Name one tool used by biologists.
+Create a speech introducing a friend of yours. Output should be less than 100 words.
+Rewrite the sentence to make it more succinct: The temperature of the air outside is colder than what it was yesterday.
+Which country has the biggest population?
+Suggest 3 words related to a classroom.
+Create a multiple choice question to assess a student's understanding of the Pythagorean theorem.
+Explain how to use the Fermat's Little Theorem.
+Name a game traditionally played by two players.
+Evaluate the following statement: "The Eiffel Tower is one of the most recognizable monuments in the world."
+Generate an appropriate input to the following instruction: "Explain the concept of quantum entanglement."
+Generate a list of five household items that you could use to reduce your carbon footprint
+Give an example of a headline for a news article about the recent rise in COVID-19 cases.
+Define the expression in the context of computing.
+Explain what blockchain technology is.
+Generate a list of five potential conflicts that might arise between a student and a teacher.
+What are important safety tips to follow at the beach?
+Think of a creative way to use the media to spread awareness about global warming.
+Generate an appropriate response if someone said "I'm feeling sad and lonely":
+Write a sentence describing a volleyball match.
+What ways could we conserve energy?
+Outline the potential harms of an AI system that judges users based on their online activity.
+Choose three places you would like to visit and explain why.
+Give an example of a syntax error in Python.
+Name 5 health benefits of exercising.
+Describe a real-world application of reinforcement learning.
+Construct a timeline of the history of the United States.
+Create a design for a t-shirt related to the unity of people from different cultures.
+Generate a list of principles for ethical business practices
+Write a script for a couple's argument.
+Write a story that features the following characters: a magical dragon and a brave knight.
+Describe the components of a persuasive essay.
+Explain how the Brexit deal affects the UK economy.
+Generate an email heading to announce a new product launch
+I want to get a new phone. Pick 3 phones to compare and explain why they would be good choices.
+Explain why businesses should leverage AI
+Classify the following sentence as true or false: Rocky Balboa was a boxer from England
+Descibe the color of a lemon
+Describe a time when you had to take a big risk in order to get a desired outcome.
+List the countries in the South American continent.
+Describe the benefits of exercise.
+Describe the painting Mona Lisa in just three sentences
+Find a book title that uses this phrase: "A Tale of Two Cities".
+Name 5 species of amphibians.
+List three features of an ideal customer service system.
+List the most popular sports in Germany.
+Generate a creative Halloween costume idea.
+Create a design for a website promoting a new restaurant.
+Generate names for the seasons that can be used in a fantasy world setting.
+Name three countries that have case spikes of COVID-19
+Make a valid sentence using the words "quick," "brown," and "fox."
+Create a phrase using four different words with the same part of speech.
+Produce an example of classic literature from 1915.
+Create a metaphor to compare a heavy workload to an object.
+Write a persuasive essay on why public transportation should be used more.
+List two measures suitable to improve employee job satisfaction.
+Suggest a funny riddle.
+Pick three colors that contrast each other.
+Calculate the value of the expression x2 - 3x + 5 when x =7.
+Write a tweet about the recent economic downturn.
+What is a common name for the species Felis silvestris catus?
+List 10 interesting facts about cats
+How would you go about creating a sentiment analysis tool?
+Create a game to play with friends.
+Suggest some online marketing strategies
+List three factors that may cause communication difficulties.
+Explain why it is important to create a diverse workforce.
+Conceptually explain the following meaning of the phrase: "with great power comes great responsibility".
+Analyze the following sentence and explain why it is meaningful: “Life is a journey, not a destination.”
+Generate an example of a practical application of the Monte Carlo method.
+Create a sentence that expresses the feeling of excitement.
+What is the best way to mitigate the impact of climate change?
+Edit the following sentence: "She created a colorful paintin with her grandfather
+What is the advantage of using an Excel spreadsheet?
+Provide a step-by-step recipe for a simple beef curry.
+Retrieve the official website of The Hunger Games movie franchise.
+Generate a 100 word blog post about psychology.
+Generate an AI chatbot script for a customer service scenario
+Identify and explain two major challenges facing the agriculture industry in developing countries.
+Compile the list of all national parks in the United States.
+Generate a short demonstration for how to make banana bread.
+Tell me one fascinating fact about dogs
+Find a museum in Chicago to visit.
+Describe two different designs for a website and their respective advantages.
+Name a species that belongs to the genus Canis.
+Write down the steps to solve a Rubik’s Cube
+Write a function to compute Fibonacci numbers
+Brainstorm a list of vacation destinations
+Generate a marketing headline for a new food delivery app
+Create a lesson plan to teach a 6th grader the basics of strategic planning.
+List three reasons for using encryption technology for data storage.
+Develop an algorithm for detecting spam messages.
+Create a list of items that create a harmonious atmosphere in the living space.
+Format the following sentence: "The store opens at nine tomorrow"
+Generate a list of 8 ways to reduce CO2 emissions
+Construct a physics equation for calculating the momentum of a moving object
+Summarize the article "The Role of Artificial Intelligence in Everyday Life".
+Create a family budget plan.
+What day of the week does Mother's day usually occur on?
+Create a general strategy for a team to develop a new product.
+Create a story about a man who is searching for the lost treasure.
+Find the cheapest route from Berlin to Madrid.
+Make a prediction about the stock price of Apple.
+Find the largest number in the following list of numbers 5, 13, 99, 1, 22
+Develop three conversation starters.
+What information can be found on a tax return?
+Write an outlook for the stock price of Amazon in the near future
+What is the leading cause of death for children under the age of 5?
+Design a class for a simple calculator.
+Describe a time when you had an unexpected success.
+Modify this sentence to make it a question: "He inherited his wealth from his grandfather."
+What are the important contributions of NASA to space exploration?
+Compare the usage of sass and SCSS in web development.
+Offer five different tips for staying organized.
+Identify an example of a product with network effects.
+Identify the scientific name for the red maple tree.
+Find the x-intercept of the equation y = 2x + 4.
+Rewrite the following sentence in succinct form: He found a way to pass the test.
+Describe a person's character in one sentence.
+Summarize the data in the chart in three sentences.
+Name 5 major cities in the US
+Classify the type of the following sentences: "I am going to work".
+Find the trending hashtag on Twitter.
+How can we use machine learning to improve sports coaching?
+Compare and contrast the primary components of the US government.
+Describe the benefits of using a relational database management system.
+Generate an algorithm for facial recognition.
+Find the top 10 cities in the US with the highest population
+Create a microwave-safe mug cake recipe.
+Suppose you are given two numbers, 14 and 79. Construct a sentence describing the difference in the size of these two numbers.
+Suggest a product or service that a company could provide to make money.
