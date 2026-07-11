@@ -14,8 +14,9 @@ Direction[l] = normalize( winsorized_mean(G[:,l]) - winsorized_mean(B[:,l]) ),
 then Gram-Schmidt orthogonalized vs the harmless mean (remove refusal-specific
 component only), unit-normalized per layer. Positive apply scale SUPPRESSES refusal.
 """
-import argparse, json
+import argparse, json, os, sys
 import numpy as np
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "gguf-py"))
 
 N_LAYER, N_EMBD = 43, 4096
 
@@ -81,9 +82,14 @@ def main():
         w = gguf.GGUFWriter(args.out + ".gguf", "controlvector")
         w.add_string("controlvector.model_hint", "deepseek4")
         w.add_uint32("controlvector.layer_count", N_LAYER)
-        for l in range(N_LAYER):
-            # llama.cpp convention: direction.<il> for layers 1..n (skip embeddings)
-            w.add_tensor(f"direction.{l + 1}", dirs[l])
+        # llama.cpp applies direction.<il> AT layer il, for il in [1, n_layer-1]
+        # (layer 0 is never steered; index 0 is rejected). So direction.il must be
+        # the vector DERIVED at layer il — a straight il->il map, NOT il+1. The old
+        # +1 shift put every layer's vector one layer late and dropped layer 42's
+        # (the </think> decision layer, largest separation) onto direction.43 where
+        # nothing applies it. That off-by-one alone collapsed the flip rate to ~5%.
+        for l in range(1, N_LAYER):
+            w.add_tensor(f"direction.{l}", dirs[l])
         w.write_header_to_file()
         w.write_kv_data_to_file()
         w.write_tensors_to_file()

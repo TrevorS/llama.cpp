@@ -1371,6 +1371,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         res->t_layer_inp[il] = tap;
     };
 
+    // ds4-style refusal steering: project the direction out of ffn_out (and,
+    // unless LLAMA_CVEC_FFN_ONLY, also attn_out) before its HC-post.
+    // ds4's SHIPPED, validated recipe is ffn_out ONLY at scale 2.0-2.5
+    // (refusal-ffn.json: flip 0.68@2.0 / 0.89@2.5, broken 0). Adding attn
+    // steering was an untested assumption that under-performs — set
+    // LLAMA_CVEC_FFN_ONLY=1 to match ds4 exactly.
+    static const bool cvec_at_ffn  = getenv("LLAMA_CVEC_AT_FFN") != nullptr;
+    static const bool cvec_ffn_only = getenv("LLAMA_CVEC_FFN_ONLY") != nullptr;
+    static const bool cvec_at_attn = cvec_at_ffn && !cvec_ffn_only;
+
     for (int il = 0; il < n_layer; ++il) {
         build_layer_inp_tap(il);
 
@@ -1389,6 +1399,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cb(cur, "attn_norm", il);
 
         cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+
+        // attn_out steering, pre-HC (skipped in ds4's ffn-only recipe).
+        if (cvec_at_attn) {
+            cur = build_cvec(cur, il);
+        }
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
@@ -1441,9 +1456,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        // Refusal-ablation apply point. ds4 projects on ffn_out (per-layer FFN
-        // increment); the default cvec hook is post-HC (l_out). Match capture.
-        static const bool cvec_at_ffn = getenv("LLAMA_CVEC_AT_FFN") != nullptr;
+        // ffn_out steering (paired with the attn_out steering above) — ds4
+        // applies the direction at both, pre-HC. Default (no env) = post-HC l_out.
         if (cvec_at_ffn) {
             cur = build_cvec(cur, il);
         }
