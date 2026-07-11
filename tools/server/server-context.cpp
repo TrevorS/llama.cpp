@@ -3919,6 +3919,14 @@ private:
             slot.n_draft_accepted += ids.size() - 1;
             slot.n_draft_verif_steps += 1;
 
+            // per-round spec trace for the offline depth-0/1/2 oracle (LLAMA_SPEC_TRACE=1).
+            // acceptance is prefix-monotone, so the accepted length at the run's draft
+            // depth determines what a shallower depth would have yielded that round.
+            static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+            if (spec_trace) {
+                SLT_INF(slot, "SPECTRACE acc=%zu draft=%zu\n", ids.size() - 1, n_draft);
+            }
+
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
             }
