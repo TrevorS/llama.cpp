@@ -1,0 +1,4 @@
+# large / regenerable — keep directions (*.gguf) and code, not raw activations
+acts/
+*.npz
+*.f32

@@ -38,12 +38,24 @@ public:
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
+    // Speculative-rollback frontier stash. spec_stash() snapshots the whole
+    // kv/score ring per layer (device-to-device). spec_restore_rows() copies
+    // back only the ring rows of the REJECTED positions [p0, p1] — within one
+    // verify ubatch every position occupies a distinct ring slot (nt <
+    // state_size), so the live ring already holds the accepted rows' values
+    // and only the rejected slots need rewinding.
+    void spec_stash();
+    void spec_restore_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
 private:
     struct layer {
         uint32_t il;
 
         ggml_tensor * kv;
         ggml_tensor * score;
+
+        ggml_tensor * kv_stash;
+        ggml_tensor * score_stash;
     };
 
     const uint32_t ratio;
@@ -130,7 +142,22 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // Speculative partial-accept rewind (ds4.c frontier-snapshot analog).
+    // spec_frontier_stash() snapshots the compressor frontier before a verify
+    // decode; spec_frontier_restore() rewinds only the rejected positions'
+    // ring rows afterwards, leaving the accepted rows' contributions (already
+    // in the live ring) and the raw cells (trimmed separately via seq_rm)
+    // intact. The compressed-cache body needs no rewind: visibility is
+    // position-derived and stale block rows are overwritten on re-decode.
+    void spec_frontier_stash(llama_seq_id seq_id, llama_pos pos_max);
+    bool spec_frontier_restore(llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject);
+
 private:
+    // frontier stash bookkeeping: per-seq frontier position at stash time.
+    // The stash tensors cover all streams; per-seq streams isolate slots, so
+    // stashes of the same pre-verify moment coexist across slots.
+    std::map<llama_seq_id, llama_pos> spec_stash_pos;
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;

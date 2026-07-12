@@ -9,6 +9,37 @@
 #include <cstdint>
 #include <map>
 
+// DSpark: compute the low-rank Markov head bias B[prev] = W2 @ W1[prev] for the
+// draft head, writing a length-n_vocab additive bias into `out` (caller-allocated).
+// No-op (leaves `out` untouched) if `model` is not a DSpark draft model. Used by
+// the draft-dspark speculative driver to make the parallel block semi-autoregressive.
+LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * out);
+
+// DSpark: confidence-head logit for one proposal row: W_conf . [h ; W1[prev]],
+// where `h` is the row's post-norm hidden state (length n_embd). Returns false
+// if the model carries no confidence head. The driver truncates the proposal at
+// the first row with sigmoid(logit) below its threshold (DeepSpec semantics).
+LLAMA_API bool llama_dspark_confidence_logit(const struct llama_model * model, llama_token prev, const float * h, float * out);
+
+// DSpark: run the semi-autoregressive draft chain (markov bias + greedy argmax +
+// confidence head) inside the block-decode graph instead of on the host. The
+// results are exported as (id, conf_logit) f32 pairs per proposal row.
+LLAMA_API void          llama_set_dspark_draft_chain(struct llama_context * ctx, bool value);
+// Returns the meta from the most recent decode ([2*K] floats: id, conf_logit
+// per chained row) or nullptr if the last decode built no chain. `count`
+// (optional) receives the number of floats.
+LLAMA_API const float * llama_get_dspark_draft_meta(struct llama_context * ctx, uint32_t * count);
+
+// DSV4 speculative partial-accept rewind (ds4.c compressor-frontier snapshot
+// analog). Call llama_dsv4_spec_stash BEFORE the verify decode to snapshot the
+// compressor frontier; on partial acceptance call llama_dsv4_spec_restore with
+// the REJECTED position range [p0, p1] to rewind only those ring rows, then
+// trim the rejected raw tail with the normal llama_memory_seq_rm. Both return
+// false when the context's memory is not the DSV4 cache (caller falls back to
+// full checkpoint restore).
+LLAMA_API bool llama_dsv4_spec_stash  (struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_dsv4_spec_restore(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

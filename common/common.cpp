@@ -1487,8 +1487,9 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     llama_memory_clear(mem, true);
 
-    // eval 2 tokens to check if the context is compatible
+    // eval 3 tokens to check if the context is compatible
     std::vector<llama_token> tmp;
+    tmp.push_back(0);
     tmp.push_back(0);
     tmp.push_back(0);
 
@@ -1505,7 +1506,9 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         goto done;
     }
 
-    // try to remove the last tokens
+    // try to remove the last TWO tokens: consumers (e.g. speculative verify)
+    // roll back multiple positions at once, and some caches (dsv4) allow only
+    // a single-token tail eviction — those must take the checkpoint path
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
         COM_TRC("%s", "the context does not support partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
