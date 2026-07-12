@@ -1369,6 +1369,26 @@ private:
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
+
+        // optional L2 on-disk tier for the prompt cache
+        if (!params_base.cache_disk_dir.empty()) {
+            if (prompt_cache) {
+                char model_desc[256] = {0};
+                llama_model_desc(llama_get_model(ctx_tgt), model_desc, sizeof(model_desc));
+                // any change here (model, ctx size, draft presence) must invalidate old files,
+                // since a serialized sequence state is only restorable into a matching setup.
+                const std::string compat_desc = string_format("%s|n_ctx=%d|n_embd=%d|draft=%d",
+                        model_desc, n_ctx, llama_model_n_embd(llama_get_model(ctx_tgt)), ctx_dft ? 1 : 0);
+                prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
+                        params_base.cache_disk_dir,
+                        compat_desc,
+                        (size_t) std::max(0, params_base.cache_disk_mib)        * 1024ull * 1024ull,
+                        (size_t) std::max(0, params_base.cache_disk_min_tokens),
+                        (size_t) std::max(0, params_base.cache_disk_max_entry_mib) * 1024ull * 1024ull);
+            } else {
+                SRV_WRN("%s", "--cache-disk requires the RAM prompt cache; enable it with `--cache-ram N`\n");
+            }
+        }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
