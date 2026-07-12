@@ -1115,12 +1115,16 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
 
+        // row >= 0 restricts the attention to a single ubatch row (used by the
+        // chained MTP draft graph): the kq mask column and k-idx entry for that
+        // row are sliced from the full-ubatch inputs. raw-attention layers only.
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                int row = -1) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1185,7 +1189,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * kv,
                 ggml_tensor * sinks,
                 float kq_scale,
-                int il) const;
+                int il,
+                int row = -1) const;
 
         ggml_tensor * build_hc_weighted_sum(
                 ggml_tensor * x,

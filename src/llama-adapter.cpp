@@ -21,7 +21,32 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
 
 ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
     ggml_tensor * layer_dir = tensor_for(il);
-    if (layer_dir != nullptr) {
+    if (layer_dir == nullptr) {
+        return cur;
+    }
+
+    // Ablation mode (Arditi projection): remove the component of the residual
+    // along a unit direction instead of adding a constant vector.
+    //   cur' = cur - scale * <cur, dir> * dir        (dir must be unit-norm)
+    // Load the direction gguf at scale 1.0 and set strength via the env below.
+    static const bool ablate = []{ const char * e = getenv("LLAMA_CVEC_ABLATE"); return e && e[0] == '1'; }();
+    // Scale: a live file (LLAMA_CVEC_SCALE_FILE) re-read every build enables
+    // runtime scale sweeps on a single model load; else a fixed env value.
+    const float ablate_scale = []{
+        const char * f = getenv("LLAMA_CVEC_SCALE_FILE");
+        if (f) {
+            FILE * fp = fopen(f, "r");
+            if (fp) { float s = 0.0f; int ok = fscanf(fp, "%f", &s); fclose(fp); if (ok == 1) return s; }
+        }
+        const char * e = getenv("LLAMA_CVEC_ABLATE_SCALE");
+        return e ? (float) atof(e) : 1.0f;
+    }();
+
+    if (ablate) {
+        ggml_tensor * dot  = ggml_sum_rows(ctx, ggml_mul(ctx, cur, layer_dir)); // [1, n_tokens]
+        ggml_tensor * proj = ggml_mul(ctx, ggml_repeat(ctx, layer_dir, cur), dot); // [n_embd, n_tokens]
+        cur = ggml_sub(ctx, cur, ggml_scale(ctx, proj, ablate_scale));
+    } else {
         cur = ggml_add(ctx, cur, layer_dir);
     }
 

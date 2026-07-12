@@ -1194,6 +1194,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_draft_meta = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1227,25 +1228,39 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+// the allocator's free path only checks the OUTPUT flag on the tensor it is
+// freeing: a flagged VIEW does not protect its source, whose buffer then gets
+// recycled by later nodes while the view still points into it (reads of the
+// view after graph execution return whatever was scribbled over it). flag the
+// whole view chain so the underlying buffer survives.
+static void graph_set_output(ggml_tensor * t) {
+    for (; t != nullptr; t = t->view_src) {
+        ggml_set_output(t);
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
-        ggml_set_output(t_logits);
+        graph_set_output(t_logits);
     }
     if (t_embd != nullptr) {
-        ggml_set_output(t_embd);
+        graph_set_output(t_embd);
     }
     if (t_embd_pooled != nullptr) {
-        ggml_set_output(t_embd_pooled);
+        graph_set_output(t_embd_pooled);
     }
     if (t_h_nextn != nullptr) {
-        ggml_set_output(t_h_nextn);
+        graph_set_output(t_h_nextn);
+    }
+    if (t_mtp_draft_meta != nullptr) {
+        graph_set_output(t_mtp_draft_meta);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
-                ggml_set_output(t_layer_inp[il]);
+                graph_set_output(t_layer_inp[il]);
             }
         }
     }
@@ -1972,7 +1987,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    // DeepSeek-V4 MoE prefill tile fusion (env-gated, default off): replaces the
+    // separate gate/up mul_mat_id + clamp + swiglu chain with the ds4 IQ2_XXS
+    // expert-tile kernel, producing the activated "mid" directly. The routing
+    // weight is applied post-down (below), exactly as in the unfused path. Only
+    // active for IQ2_XXS gate/up experts during prefill; every other case falls
+    // through to the standard path per-layer.
+    bool use_dsv4_moe_tile = false;
+    {
+        static const bool moe_tile_env = [] {
+            const char * e = getenv("LLAMA_DSV4_MOE_TILE");
+            return e && e[0] && e[0] != '0';
+        }();
+        use_dsv4_moe_tile = moe_tile_env &&
+            arch == LLM_ARCH_DEEPSEEK4 &&
+            type_op == LLM_FFN_SILU &&
+            n_tokens > 1 &&
+            gate_exps && up_exps && !gate_up_exps &&
+            gate_exps->type == GGML_TYPE_IQ2_XXS &&
+            up_exps->type   == GGML_TYPE_IQ2_XXS &&
+            !gate_exps_b && !up_exps_b && !gate_exps_s && !up_exps_s;
+    }
+
+    if (use_dsv4_moe_tile) {
+        const float limit = (il >= 0) ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        cur = ggml_dsv4_moe_gate_up(ctx0, gate_exps, up_exps, cur, selected_experts,
+                                    limit > 1e-6f ? limit : 0.0f); // [n_ff, n_expert_used, n_tokens]
+        cb(cur, "ffn_moe_gate_up_tile", il);
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2024,6 +2066,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     const bool has_gate = gate_exps || gate_up_exps;
 
+    if (!use_dsv4_moe_tile)
     switch (type_op) {
         case LLM_FFN_SILU:
             if (gate_exps) {

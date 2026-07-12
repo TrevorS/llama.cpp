@@ -19,7 +19,7 @@ static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;   // v2: partial save now includes base + block caches
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 1;
@@ -720,7 +720,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(4u*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -767,9 +767,16 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         ggml_format_name(kv,    "dsv4_%s_state_kv_l%d",    name, il);
         ggml_format_name(score, "dsv4_%s_state_score_l%d", name, il);
 
+        // frontier stash for speculative partial-accept rewind (see spec_stash)
+        ggml_tensor * kv_stash    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_stream);
+        ggml_tensor * score_stash = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, state_size, n_stream);
+
+        ggml_format_name(kv_stash,    "dsv4_%s_stash_kv_l%d",    name, il);
+        ggml_format_name(score_stash, "dsv4_%s_stash_score_l%d", name, il);
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, kv, score });
+        layers.push_back({ il, kv, score, kv_stash, score_stash });
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -919,6 +926,38 @@ ggml_tensor * llama_dsv4_comp_state::cpy_kv(ggml_context * ctx, ggml_tensor * cu
 
 ggml_tensor * llama_dsv4_comp_state::cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
     return ggml_set_rows(ctx, get_score(ctx, il), cur, idxs);
+}
+
+void llama_dsv4_comp_state::spec_stash() {
+    for (auto & l : layers) {
+        ggml_backend_tensor_copy(l.kv,    l.kv_stash);
+        ggml_backend_tensor_copy(l.score, l.score_stash);
+    }
+}
+
+void llama_dsv4_comp_state::spec_restore_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (p1 < p0) {
+        return;
+    }
+    // one verify ubatch never wraps the ring (nt < state_size), asserted by the caller
+    GGML_ASSERT((uint32_t) (p1 - p0 + 1) <= state_size);
+
+    const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
+    const size_t  row_bytes  = (size_t) n_embd_state * sizeof(float);
+
+    std::vector<uint8_t> row(row_bytes);
+
+    for (auto & l : layers) {
+        for (llama_pos pos = p0; pos <= p1; ++pos) {
+            const size_t offs = ((size_t) stream_off + pos % state_size) * row_bytes;
+
+            ggml_backend_tensor_get(l.kv_stash, row.data(), offs, row_bytes);
+            ggml_backend_tensor_set(l.kv,       row.data(), offs, row_bytes);
+
+            ggml_backend_tensor_get(l.score_stash, row.data(), offs, row_bytes);
+            ggml_backend_tensor_set(l.score,       row.data(), offs, row_bytes);
+        }
+    }
 }
 
 size_t llama_dsv4_comp_state::total_size() const {
@@ -1181,6 +1220,27 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return true;
         }
 
+        // Evict the 1-token tail so the last-token re-eval doesn't duplicate it; deeper rollbacks go to a checkpoint.
+        if (seq_id >= 0 && p0 == kv_raw->seq_pos_max(seq_id)) {
+            return kv_raw->seq_rm(seq_id, p0, p1);
+        }
+
+        // Deeper rollback is allowed iff nothing COMPRESSED exists at or beyond
+        // p0: compression advances only at ratio-block boundaries, so the range
+        // [p0, inf) then lives raw-only and the running compressor state is
+        // unaffected by trimming it. This is exactly the post-checkpoint-restore
+        // situation (speculative verify rollback: restore comp state via
+        // llama_state_seq_set_data PARTIAL, then trim the raw tail).
+        if (seq_id >= 0) {
+            const llama_pos comp_max = std::max(std::max(
+                    kv_csa->seq_pos_max(seq_id),
+                    kv_hca->seq_pos_max(seq_id)),
+                    kv_lid->seq_pos_max(seq_id));
+            if (p0 > comp_max) {
+                return kv_raw->seq_rm(seq_id, p0, p1);
+            }
+        }
+
         return false;
     }
 
@@ -1273,13 +1333,14 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    // DSV4 base + block caches aren't recomputable from a partial re-decode, so save them even in partial mode.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags);
-    }
+    kv_raw->state_write(io, seq_id, raw_flags);
+
+    dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags);
+    dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags);
+    dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags);
 
     csa_state->state_write(io, seq_id, flags);
     hca_state->state_write(io, seq_id, flags);
@@ -1311,18 +1372,29 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    // Mirror state_write. A failure mid-way (e.g. comp state_size mismatch when
+    // the source context had a different n_ctx) must not leave the cache
+    // half-restored: kv_raw succeeds first and would keep the restored cells,
+    // making every subsequent decode fail to find a KV slot. Roll back the
+    // sequence before rethrowing so callers can fall back to a re-decode.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
+    try {
+        kv_raw->state_read(io, seq_id, raw_flags);
+
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (seq_id < 0 || !seq_rm(seq_id, -1, -1)) {
+            clear(true);
+        }
+        throw;
     }
-
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
-
 }
 
 llama_kv_cache_iswa * llama_kv_cache_dsv4::get_raw() const {
@@ -1351,6 +1423,33 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_hca_state() const {
 
 llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
+}
+
+void llama_kv_cache_dsv4::spec_frontier_stash(llama_seq_id seq_id, llama_pos pos_max) {
+    csa_state->spec_stash();
+    hca_state->spec_stash();
+    lid_state->spec_stash();
+
+    spec_stash_pos[seq_id] = pos_max;
+}
+
+bool llama_kv_cache_dsv4::spec_frontier_restore(llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject) {
+    const auto it = spec_stash_pos.find(seq_id);
+    if (it == spec_stash_pos.end()) {
+        return false; // no stash for this seq
+    }
+    if (p0_reject <= it->second) {
+        return false; // rejected range reaches into pre-stash territory - stash can't cover it
+    }
+
+    csa_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+    hca_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+    lid_state->spec_restore_rows(seq_id, p0_reject, p1_reject);
+
+    // single use: the stash matches exactly one verify decode
+    spec_stash_pos.erase(it);
+
+    return true;
 }
 
 void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
