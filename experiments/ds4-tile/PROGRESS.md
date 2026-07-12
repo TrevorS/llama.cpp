@@ -1,0 +1,302 @@
+# DS4 prefill parity loop — progress log
+
+Targets (UD-IQ2_XXS, GB10, llama-bench -ngl 999 -fa 1 -mmp 0, best ub):
+1. Short ctx: pp2048 >= 419 t/s, tg64 >= 14.4 t/s (ds4.c gb10.csv reference).
+2. Long ctx (added by Teej): usable prefill+decode at 512k ctx minimum, ~1M stretch — ds4.c ran near-1M on this box. KV is ~14.1 KB/token (7.2 GiB @ 512k, 14.5 GiB @ 1M) so memory-wise feasible; the blocker is the indexer ctx*ub compute buffer -> task #5 is mandatory. Provisional long-ctx gates until ds4 reference numbers exist at depth: allocates+runs at 512k, coherent output, tg@512k >= ~10 t/s, deep-chunk prefill doesn't collapse (graceful continuation of the <=64k curve). Optionally regenerate ds4 512k reference via ~/Projects/ds4/ds4-bench on a remaining GGUF.
+
+Branch: ds4-tile-prefill (local only, never push).
+
+## Baseline (2026-07-07, build d39e36c + experiments commit 970d3ef)
+
+| config | pp2048 | tg64 |
+| --- | --- | --- |
+| llama.cpp ub512 | 322.13 | 14.16 (parity within noise) |
+| ds4.c target | 419 | 14.36 |
+
+Kernel extraction + A/B harness: PASS at real dims (4096/2048/256/top-6), tile kernels run at ~87 GB/s bandwidth ceiling.
+Same-quant gap at equal-ish batch: 1.30x.
+
+## Iteration 1 — big-ub probe (in flight)
+
+Hypothesis: ds4's 419 used chunk 2048; llama.cpp short-ctx pp2048 can run ub 1024/2048 (indexer buffer small at 2k ctx). Measures the free win before code.
+RESULTS: ub1024 pp 365.0 / tg 15.93; ub2048 pp 374.8 / tg 15.99. tg target MET (16.0 >= 14.4, verify it holds later). pp gap now 374.8 -> 419 (1.12x), batch scaling saturated (+2.7% for 2x ub).
+Conclusion: both #5 (mandatory for depth/512k anyway) and #3 (tile fusion, the remaining short-ctx ~12%) proceed. tg64 anomaly (14.2@ub512 vs 16.0@ub2048) noted — tg should not depend on ub; recheck when re-benching.
+
+## Iteration 2 — Phase A: fused indexer op (agent implementing)
+
+Spec: new fused op replacing the 8-op chain in build_lid_top_k; chunked ctx scores + running top-k; CUDA via ggml_cuda_pool workspace; CPU reference; env-gated (LLAMA_DSV4_FUSED_LID=1); validation = top-k index-set compare + greedy spot check + short PPL; then re-bench short ctx and NEW depth points + 256k/512k allocation test.
+
+RESULTS (lid-fuse agent stalled; main session recovered WIP 22e7db3 and validated):
+- Gate 1 backend-ops: 6/6 PASS (CPU vs CUDA, odd n_lid, n_stream=2)
+- Gate 2 greedy A/B on real model: token-IDENTICAL
+- Gate 3: 256k AND 512k ctx allocate + run with flag on — previously failed to allocate at any ub; the 512k requirement is now met at the allocation level
+- Gate 4: pp2048 372.6 (no regression); tg64 13.52 REGRESSION (vs 16.0) -> fixed in ce16c0b by fusing only nt>1 (decode keeps unfused chain; its buffer is tiny even at 1M)
+- In flight: re-bench tg after fix + first depth points pp2048@d32768/tg64@d32768 at ub2048 (previously unrunnable)
+
+Status vs targets: tg 16.0 (met, pending re-confirm), pp short 374.8 vs 419 (gap 1.12x -> task #3 tile fusion), 512k alloc proven (full #6 validation pending).
+
+## Iteration 4 — depth profile (main session)
+
+Decode fix confirmed: tg64 short = 15.91 (target met). Depth at ub2048: pp2048@d32768 147.3 (ds4: 347.7), tg64@d32768 11.71 (ds4: 13.0), pp512@d8192 242.4.
+nsys pp512@d8192 kernel breakdown: dsv4_score_kernel 22.4% (simple dp -> wmma port needed), k_bin_bcast mul+add 17.7% (25k tiny launches — anomalous, attribute+absorb), mul_mat_q 28.9% (MoE, task #3), flash_attn 10.7% (fine), concat 5.7%.
+-> Iteration 5 (lid-wmma agent): wmma scores + elementwise storm cleanup.
+
+## Iteration 5 results (lid-wmma)
+
+Goal: replace the fused op's scalar `dsv4_score_kernel` (22.4% of GPU @ pp512/d8192,
+41.5ms avg/launch) with a tensor-core kernel, and attribute/eliminate the k_bin_bcast
+storm (op_mul 1150ms + op_add 1080ms cumulative — the #2/#3 GPU consumers at depth).
+
+Profile (pp512@d8192, sqlite): dsv4_score_kernel<half> 68 launches, 2819ms total (#1).
+Storm real cost is in 2 big op_add variants (gridX=8192 173ms, gridX=32768 871ms) and
+2 big op_mul variants (grid 16x512 305ms, 16x2048 720ms); op_div/reduce_rows are cheap.
+
+- [gate 1] test-backend-ops -o DSV4_LID_TOPK: 10/10 PASS (added 4 wmma-path shapes:
+  multi-token-tile, non-128-div n_lid, n_stream=2, F32 k). wmma path (d_idx==128) rounds
+  q to fp16 -> ~1e-4 set-mismatch at near-tie boundaries; gated small max_err there,
+  scalar path stays strict at 0. Deterministic across runs.
+
+### k_bin_bcast storm attribution (target 2) — OUT OF DSV4-INDEXER SCOPE
+
+Attributed by inverting the binbcast grid->dst-shape mapping (block.x=128 for
+contiguous F32; ne0=gridX*256; broadcast operand stops collapse at dim0) and matching
+per-layer op counts. Result: n_embd=4096, nt in {512,2048}, n_layer=43.
+
+The 4 big variants are ALL the DeepSeek-V4 hyper-connection (HC) residual mixing in
+deepseek4.cpp (build_hc_weighted_sum ~L237-238, build_hc_post ~L345-350), NOT the
+lightning indexer:
+- op_add gridX=8192  -> [n_embd, nt=512]  contiguous HC add (full collapse: 8192*256 = 4096*512)
+- op_add gridX=32768 -> [n_embd, nt=2048] contiguous HC add (32768*256 = 4096*2048; the "4x depth" is coincidence = n_embd*2048)
+- op_mul 16x512      -> [n_embd,512]  x [1,nt] broadcast HC weight-mul
+- op_mul 16x2048     -> [n_embd,2048] x [1,nt] broadcast HC weight-mul
+Per layer: 48 HC muls + 39 HC adds; counts match 2 pp512 evals + partial depth-fill evals
+exactly (add:mul ratio 0.813 observed = structural 39:48). ~87 elementwise launches/layer
+x 43 layers.
+
+Both brief-named suspects RULED OUT:
+- build_top_k_mask ggml_add (L653): operates on [n_csa, nt] masks -> cheap (4096,1,1)
+  op_add variant, 42 launches ~1.5ms total. Not the storm.
+- unfused indexer relu->mul->sum_rows->add: ABSENT from profile (no relu kernel; fused
+  dsv4_score/topk kernels present) -> fused path correctly active for prefill, no bug.
+
+Decision: left as-is this iteration. HC mixing is a distinct DSV4 feature, not absorbable
+into ggml_dsv4_lid_topk, and warrants its own fused op / graph-batching workstream with
+independent numerics validation (proposed: batch build_hc_weighted_sum as a broadcast-mul
++ hc-axis reduction, and build_hc_post's comb-mix as a batched ggml_mul_mat over nt;
+~9-14x launch reduction targeting ~2070ms). Filed for a follow-up iteration.
+
+## Iteration 6 — wmma depth bench (main session, post-crash recovery)
+
+Session crash corrupted .git (11 truncated objects incl. tip commit); recovered by
+resetting to 4944408 and re-committing the intact working tree as a215c85.
+
+wmma score kernel depth results (ub2048, fused LID):
+- pp512@d8192: 242.4 -> 306.3 +-14.1 (+26%)
+- pp2048@d32768: 147.3 -> 298.4 +-0.3 (+103%); gap vs ds4.c 347.7 now 1.17x
+- tg64@d32768: 11.94 +-0.39 (was 11.71; target 13.0 — decode-side, wmma n/a)
+
+Anomaly: tg64@d32768 leg failed with "failed to decode prompt batch, res = 1" when run
+in the same llama-bench process after the pp2048@d32768 test; standalone rerun clean.
+Suspect CUDA pool state carryover between tests; recheck if it recurs.
+
+-> Iteration 6 (moe-tile agent): port experiments/ds4-tile expert-tile kernels into
+mul_mat_id dispatch, env-gated LLAMA_DSV4_MOE_TILE=1 (mul_mat_q 28.9% = #1 consumer).
+HC storm fusion queued behind it.
+
+## Iteration 6b — MoE tile port BLOCKED on quant types (moe-tile agent)
+
+Type-check gate failed before any code: lifted tile kernels (ds4_tile_kernels.cuh) are
+Q4_K-only; model experts are ffn_gate/up_exps IQ2_XXS (42L, IQ2_S x1) and ffn_down_exps
+IQ3_XXS (41L, MXFP4 x2). Profile enums confirm: 16=IQ2_XXS (gate/up), 18=IQ3_XXS (down).
+ds4.c has an IQ2_XXS gate/up kernel (not lifted) but ZERO IQ3 support — the fused
+gate_up->mid->down pipeline cannot close on-device for this quant. Coverage: 0/3.
+Decision: Option A (stand down port). Gate/up-only IQ2_XXS bridge filed as future
+option (payoff capped at ~14.8% slice, routing bridge hard, numerics unvalidated).
+-> moe-tile agent REDIRECTED to HC storm fusion (LLAMA_DSV4_HC_BATCH=1, graph-level
+op batching preferred over new CUDA; targets the 17.7% elementwise slice).
+Fresh nsys re-rank on wmma build in flight (wmma_depth.nsys-rep).
+
+## Iteration 7 — re-rank on wmma build (pp512@d8192, wmma_depth2.nsys-rep)
+
+pp512@d8192 = 308.2 +-9.5. Ranking: mul_mat_q IQ2_XXS(16) 27.5% / IQ3_XXS(18) 15.1% /
+HC storm (bcast mul 10.3 + add 5.6) 15.9% / flash_attn 8.1% / mul_mat_q Q8_0 7.8% /
+concat 6.1% / dsv4_score_wmma128 2.5% (scalar was 22.4%; 41.5ms -> 1.9ms avg, 22x).
+MoE now ~50% of GPU. Gate/up IQ2_XXS share (27.5%) reopens the bridge option from 6b
+at ~2x the payoff originally estimated.
+-> Iteration 7: moe-iq2 agent ports ds4's IQ2_XXS gate_up_mid tile kernel + routing
+bridge (down stays mul_mat_q); moe-tile agent continues HC batching in parallel
+(disjoint files: ggml-cuda vs src/models/deepseek4.cpp).
+
+## Iteration 7b — HC graph-restructure NEGATIVE RESULT (moe-tile agent)
+
+LLAMA_DSV4_HC_BATCH op-composition (weighted_sum 7->3 launches via bcast-mul+sum_rows;
+hc_post ~38->~6 via repeat+bcast term1 and k=4 batched mul_mat term2): builds clean,
+greedy diverges after ~30 tokens (fp reassociation from mul_mat, expected), but
+pp512@d8192 REGRESSES 306.5 -> 282.5 (-7.8%, r=4, off-leg reproduces baseline).
+Root cause: box is bandwidth-bound (~87 GB/s); the scalar storm is coalesced
+contiguous elementwise, so launch count was never the bottleneck. The batched path
+adds traffic (full [n_embd,hc,nt] transpose, 4x repeat materialization, skinny n=4
+GEMM with poor utilization). Op composition cannot express the traffic-minimal form.
+Decision: fund fused CUDA op instead (LLAMA_DSV4_HC_FUSED): out = x*post + sum_src
+res*comb reading each operand once, scalar-loop accumulation order for exact A/B;
+regressing HC_BATCH branches to be replaced by it (negative result recorded here).
+Also: cross-agent note — new .cu files need cmake reconfigure (ggml-cuda file(GLOB))
+or other exes hit undefined refs at link.
+
+## Iteration 8 — HC fused kernel + MoE gate/up bridge, gates 1-2 (main session)
+
+Two session crashes interrupted this iteration; root causes now understood and
+memorized (gb10-session-crash-causes): (1) 04:00 earlyoom kill storm — resident
+model + parallel nvcc + runaway 9.7GB llama-cli; killed cicc (the "Error 137"s)
+and claude. (2) 07:54 SSH drop (tailscale path flap) tore down the non-tmux,
+non-linger user session. Mitigations: -j 4 builds, never build during model
+residency, claude now runs in tmux.
+
+Code state (written pre-crash by moe-iq2 + main, wired end-to-end):
+- GGML_OP_DSV4_HC_FUSED (LLAMA_DSV4_HC_FUSED=1): dsv4_hc_fused.cu, CPU ref,
+  deepseek4.cpp wiring for weighted_sum + post. Scalar-order accumulation.
+- GGML_OP_DSV4_MOE_GATE_UP (LLAMA_DSV4_MOE_TILE=1): dsv4_moe_gate_up.cu (395L)
+  + IQ2_XXS tables, build_moe_ffn bridge (IQ2_XXS gate/up, nt>1, silu only;
+  down stays mul_mat_q). q8_K activation quant differs from ggml (-127/maxv vs
+  -128/max) -> agreement gate 5e-3 nmse, not bit-equality.
+
+- [gate 1] test-backend-ops: DSV4_HC_FUSED 6/6 PASS (tests added this session —
+  the crash had preempted them: both modes x decode shape, hc=8 max, odd nt);
+  DSV4_MOE_GATE_UP 4/4 PASS incl. clamp path + near-real dims.
+- [gate 2] HC fused greedy A/B (128 tok, temp 0): TOKEN-IDENTICAL vs scalar graph.
+- In flight: 4-leg bench matrix (base/+HC/+MOE/+both at pp512@d8192, pp2048,
+  pp2048@d32768, tg64@d32768) + KL divergence (base vs both) for the MoE bridge's
+  numerics gate.
+
+## Iteration 8 results — HC fused BIG WIN; MoE tile bridge NEGATIVE RESULT
+
+Matrix (ub2048, r=3, build 38f8cc0; +fix for MOE legs):
+
+| leg | pp512@d8192 | pp2048 | pp2048@d32768 | tg64@d32768 |
+| --- | --- | --- | --- | --- |
+| base (fused LID) | 308.8 | 392.8 | 294.8 | 12.11 |
+| +HC_FUSED | 357.8 (+16%) | 527.4 (+34%) | 364.3 (+24%) | 12.58 (+4%) |
+| +MOE_TILE | 304.3 (flat) | 342.5 (-13%) | 253.4 (-14%) | n/a |
+| +both | 350.3 | — | 301.6 | n/a |
+
+HC_FUSED clears BOTH remaining ds4.c parity targets: pp2048 527.4 vs 419
+(1.26x FASTER than reference) and pp2048@d32768 364.3 vs 347.7. Greedy A/B
+token-identical (scalar-order accumulation worked as designed). tg64@d32768
+12.58 vs target 13.0 is the only remaining red metric.
+
+MOE_TILE post-mortem: first matrix run crashed every leg — ids from
+ggml_argsort_top_k is a VIEW (row stride n_expert, non-contiguous for
+k < n_expert); the CUDA op asserted contiguity. Test had fed a contiguous
+tensor (gate-1 blind spot). Fixed: count/scatter kernels read ids via
+ids_stride; 2 new backend-ops cases route ids through the real
+argsort_top_k view (one at real n_expert=256). 6/6 PASS. But perf is a
+loss everywhere (above): mul_mat_q IQ2_XXS is already near the bandwidth
+ceiling; the ds4 tile8 kernel only paid off inside ds4.c's fused
+gate_up->mid->down pipeline, which IQ3_XXS down blocks (6b). Op kept in
+tree (correct, env-gated off, tested) as a negative result. Do NOT re-fund
+without a fused-down story; improving mul_mat_q scheduling is the better
+attack on the 27.5% gate/up slice.
+
+Session-crash forensics recorded in memory (gb10-session-crash-causes):
+earlyoom (04:00, killed cicc+claude during build-with-model-resident) and
+SSH-drop user-slice teardown (07:54, non-tmux). Claude now runs in tmux.
+
+Recommended config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
+KL gate (base vs HC_FUSED, ctx512, 50-chunk docs corpus; original kl_corpus.txt
+was crash-truncated to 748B which is why the first KL pass silently produced
+nothing): PASS — median KLD 0.000000, max |Δp| 0.006%, same top token 100.000%.
+Base PPL 3.9265 +/- 0.089. Iteration 8 CLOSED.
+Next candidates: (a) deep-decode gap 12.58->13.0 (decode-side LID chain or
+FA/KV traffic at depth — profile tg64@d32768); (b) re-measure short tg with
+HC_FUSED (expect >16); (c) long-ctx validation at 512k (task #6, alloc
+already proven).
+
+## Iteration 9 — deep-decode gap CLOSED; ALL ds4.c parity targets MET
+
+Free datapoint: short tg64 with HC_FUSED = 16.66 +-0.63 (new best; was 15.99).
+
+nsys tg64@d32768 decode-phase attribution (tg_depth capture; note CUPTI
+dropped events after ~2 decode tokens — enough for attribution; window
+anchored on hc_weighted_sum=86/eval): deep decode is LAUNCH-BOUND, not
+kernel-bound. Per token: ~7,644 k_bin_bcast (grid 1x1x1!, 1.6us) + ~3,420
+reduce_rows (4x1x1, 1.4us) + ~620 mul_mat_vec_q = ~11k launches/token,
+GPU ~45% busy. Attribution: the UNFUSED decode-side LID chain
+(relu->mul->sum_rows->add over ~80 ctx chunks/layer at d32768) — the
+iteration-2 decision to keep decode unfused inverts at depth because the
+chain's launch count scales linearly with ctx.
+
+Fix: fuse decode-side LID when n_lid >= threshold (default 4096; env
+LLAMA_DSV4_FUSED_LID_TG_DEPTH, 0=always, huge=never). ~10 LOC in
+deepseek4.cpp, no kernel changes.
+
+Gates (build w/ fix):
+- backend-ops DSV4_LID_TOPK: PASS (no kernel change)
+- greedy A/B at 9k-token depth, 64 gen: TOKEN-IDENTICAL (old vs new)
+- tg64@d32768: 12.57 -> 13.47 +-0.37 (+7%) — BEATS ds4.c 13.0
+- tg64 short: 16.57 (unchanged; d<4096 keeps unfused chain, as designed)
+
+SCOREBOARD — all four original targets now met (ds4.c reference in parens):
+  pp2048 short    527.4  (419)    1.26x FASTER
+  tg64 short       16.6  (14.36)  1.16x
+  pp2048@d32768   364.3  (347.7)  1.05x
+  tg64@d32768      13.47 (13.0)   1.04x
+Config: LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1, ub2048.
+Remaining open item: long-ctx validation at 512k (target #2 / task #6 —
+allocation proven in iteration 2, needs a real run + tg@512k gate).
+
+## Iteration 10 — post-FA-fix profiling sweep (nsys + ncu app-replay)
+
+Serving config (bd321dec, np2-unified ub2048): 404 t/s @14k. nsys prefill ranking:
+mul_mat_q IQ2_S 22.6% + IQ3_XXS 10.8% (ceiling, confirmed), FA<512,512> 19.2%
+(19.7ms avg), concat_non_cont 4.6% (k_all raw+comp concat — pure data movement),
+rms_norm 4.3%, dsv4 fused kernels 7.4% combined. Decode: CUDA graphs active
+(1 launch/token), mmvq Q8_0 31.8%, elementwise storm 18% (compressor/gating).
+
+- rms_norm fix: **NO-OP — aggregation artifact.** Per-launch ncu: q-norm 622us
+  = 243 GB/s, HC flat_norm 243us = 276 GB/s — both at DRAM ceiling. The 14%
+  SoL average was polluted by Amdahl-irrelevant tiny-grid launches. Do not
+  patch norm.cu.
+- FA<512,512> (uniform shape, trustworthy): 34% compute / 47% memory SoL —
+  ~2x kernel headroom, worth ~9-10% wall. Reference: FlashInfer MLA kernels.
+- ncu on this box: kernel replay snapshots unified memory incl. 96G weights ->
+  earlyoom (killed 2 sessions). MUST use --replay-mode application.
+
+Queue: (next) eliminate k_all concat -> then FA-512 tuning.
+
+## Iteration 11 — concat row-copy fast path: NEGATIVE (traffic-bound)
+
+Hypothesis: concat_non_cont's per-element index math + branch is the cost.
+Wrong — replaced with two vectorized row-copy launches (uint4, narrow-row
+packing): per-concat GPU time unchanged (~1.0ms), bench identical
+(457.51 vs 456.37 t/s pp2048@d8192 ub2048, r=3). The old kernel was already
+coalesced; concat cost IS the ~90MB/instance of traffic. REVERTED.
+- The only remaining path for the 4.6-4.9% concat share is zero-copy layout
+  (raw-window rows allocated adjacent to comp K per layer) — deep
+  llama-kv-cache-dsv4 surgery incl. state save/restore; deferred (risk >> 4%).
+- NEW REFERENCE: pp2048@d8192 ub2048 llama-bench = 457.5 t/s on bd321dec.
+Queue: -> FA-512. First probe: why does dispatch pick flash_attn_ext_f16
+(tile kernel) for D=512/DV=512 on cc12.1 instead of the mma path — if
+fattn-mma lacks 512 support, extending it is the FlashInfer-class fix.
+
+## Iteration 12 — FA-512 mma config sweep: default already optimal
+
+Discovery: the 19% FA<512,512,8,8> kernel IS fattn-mma-f16 (same symbol name
+as the wmma kernel; stream-k fixup companions prove it) — we were never on a
+legacy path. Swept compiled ncols configs via temp env hook (pp2048@d8192
+ub2048, r=2): default (8,8) 458.61 · (16,4) 451.93 · (32,2) 452.72 ·
+(4,8) 408.28. Generic switch wins; hook reverted.
+- Remaining FA headroom (34% compute / 47% mem SoL => ~10% wall) requires
+  kernel-internal work: deeper cp.async pipelining or FlashInfer-style MLA
+  split-KV for D=512 on sm121. Filed as future deep-dive, not config tuning.
+- zsh gotcha: `set -- $cfg` does NOT word-split in zsh — first sweep silently
+  ran the default 4x. Always pass env pairs explicitly.
+
+## Queue summary (iterations 10-12)
+
+All three profiler leads resolved: rms_norm = artifact (at ceiling),
+concat = traffic-bound (kernel rewrite no-op, zero-copy layout deferred),
+FA-512 = config-optimal (kernel-internal headroom remains). Prefill at
+457-459 t/s pp2048@d8192 ub2048 is within ~1-2% of practically achievable
+with current kernel architecture. The day's serving arc: 140 -> 404 t/s
+(unified-FA fix bd321dec + fused kernels + ub2048); further gains need the
+FA kernel deep-dive (~10%) or MoE quant changes (vetoed: no requant).

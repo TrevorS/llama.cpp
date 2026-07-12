@@ -1,0 +1,150 @@
+Write a short story about a robot that gets lost in the city.
+Provide an example of how chatbots can be used in the hospitality industry.
+Come up with five ideas for a superhero movie.
+Generate two examples of similes.
+Name one law-enforcement agency that investigates cases of corporate fraud.
+Make a list of activities to teach a 3-year-old the concept of shapes.
+Generate a Shakespearian-style insult.
+What is a characteristic of a good leader?
+Pick the right content for a blog post about having a healthy home
+Write a story about a bird stranded in an unfamiliar land.
+Compute the logarithm to the base 2 of the number 9
+Explain how to-do lists can help increase productivity.
+Identify 4 consequences of climate change.
+Describe a technique used for solving exponential equations.
+List four of the offenses that are considered a felony in the United States
+Generate a phrase that describes a group of people
+Come up with 3 tips for writing effective dialogue.
+Classify each of the following statements as true or false. True or false: Internet communication is always private.
+Given the following input, generate a synonym for "chaos".
+Suggest a movie that features a strong female lead character.
+Compare cats and dogs.
+Generate a rhyme scheme for a poem.
+Name two types of primary sources.
+Suggest a career that would be good for someone interested in both art and mathematics.
+Divide 1000 by 27.
+Explain why some people choose to use alternative energy instead of traditional energy sources.
+How to maximize the effect of the keywords in my SEO content?
+Create a tweet summarizing what happened in the movie Jurassic Park
+Suggest two measures to improve air quality in cities
+Generate a list of five ways to reduce garbage production.
+Compose a song about staying positive in difficult times.
+What are the initials of the United Nations?
+Write a recipe for making pancakes.
+Recommend a way of studying for a test.
+Create a strategy for decreasing global poverty.
+Estimate how many gallons of water the average person uses in one day.
+Write a script of a conversation between two people discussing the benefits of taking a break from work.
+What types of trivia can you think of?
+Come up with a poem about urban lifestyle
+Complete the proof for why the converse of the Pythagorean Theorem is false.
+Tell me what is the process of elimination?
+List 5 Java programming best practices.
+Explain why the Moai statues on Easter Island have no bodies.
+List the three main steps in photosynthesis.
+Describe a natural process using only 5 words.
+What is the current top news story in your local area?
+Come up with a list of 5 job interview questions related to customer service.
+Generate a 3-line poem based on the following theme: 'Celebrating Nature.
+Write a css class for an element with a rounded border
+Name 4 features of a scientific research paper.
+What season is it in the southern hemisphere?
+Write a brief essay about how data privacy affects society.
+Generate a nested list containing data involving user names, passwords and countries.
+Name the benefits of using OAuth.
+Compile a list of seven tools for creating a website.
+Create a mnemonic to help someone remember the planets in order from the sun
+Define the term "subjunctive mood".
+How is a liquid chromatography differs from gas chromatography?
+Identify three elements that are found in the Earth's atmosphere.
+How does exercise affect the body?
+Describe the three main perspectives of sustainable development.
+What is the taxonomy of a human?
+What is the name of the capital of Turkey?
+Explain how deep learning is being used to diagnose diseases.
+What is a mechanical clock?
+Find the most suitable synonym to replace the word "pristine".
+What are the scientific names for a polar bear and a grizzly bear?
+Create a sentence detailing the effects of global climate change.
+Create two architecture designs for a modern home.
+Point out the differences between blue whales and belugas
+What are the health effects of consuming too much sugar?
+Create an outline of steps to take when starting a business.
+Come up with a solution to reduce traffic congestion.
+Generate a list of ten professions in the engineering field.
+Suggest a use of machine learning for a retail store.
+What is the oxidation state of sulfur in sulfurous acid?
+Explain the concept of angles of elevation and angles of depression.
+Generate a 'password reminder' sentence for a user's account.
+Name two steps to increase the visibility of a website on search engines.
+What are the key elements of an effective website?
+Suggest a date night activity.
+Calculate the current value of a 10-year loan of $1000 if the interest rate is 5%.
+Research one popular application of artificial neural networks.
+Find the number of possible combinations of 7 letters.
+Calculate the net price for a product that costs $85, after the application of a discount of 15%.
+Explain the concept of photoelectrical effect.
+Describe a habit that can help people stay productive.
+Write two sentences to explain why water is important for life
+Generate a creative headline for an article about the importance of learning a second language.
+How can the use of predictive analytics benefit a business?
+Generate a sentence that is related to the topic of "living in the city"
+Take this sentence and correct any errors: "The dog barked loudly then ran away"
+Draft a social media post that encourages people to conserve water.
+Give me the simple past tense of "fall".
+Come up with a topic for a scientific paper about the properties of liquid helium.
+Create a rule set for a game of tic-tac-toe.
+Predict the consequences of global warming.
+Provide a comparative analysis of the economic policies of France and Germany.
+Generate a story about a hero overcoming a challenge.
+Summarize the techniques used for summarizing text.
+Select the best option for a headline that expresses the purpose of the research paper "How Our Social Identity Impacts Our Value System".
+Explain the importance of physical activity for teenagers.
+List five benefits that come from playing sports.
+List five fruits that are not citrus fruits.
+Create a list of five open-ended questions for a customer survey.
+Come up with a list of tips for improving speaking skills.
+Explain the significance of the line from Shakespeare's Macbeth - "Double, double toil and trouble"
+Create a fictional creature with three unique characteristics.
+Classify the following statement as either True or False: “It is always colder at night than during the day.”
+Summarize the benefits of artificial intelligence (AI) and GPT-3 in business.
+Provide five examples of stress reduction techniques.
+Create a list of 6 novels from the 21st century.
+What are the core requirements for a successful mobile app?
+Identify the continents of the world
+Create a ‘nice-to-have’ list for a product inventory system.
+Classify different dog breeds using a convolutional neural network.
+Explain why biofuels may be an important part of the renewable energy future.
+Write a song about a person you love.
+Name 5 human body organs
+Create a lyric for the chorus of a song about diamonds.
+Explain the Mediterranean diet
+What is the history of the Atlantic slave trade?
+Describe the Great Pyramid of Giza in one sentence.
+Design a breakout session for a conference on user experience.
+Which chemical element has the atomic number of 4?
+Generate a list of items an AI assistant could help with.
+Create an interesting math problem.
+Tell me an appropriate joke.
+Compare and contrast fiction and non-fiction.
+Construct a sentence using the figure of speech "Simile"
+Name three organizations that are working to combat global warming.
+Why are data models important?
+Is it possible to create a GPT model without a GPU?
+State the differences between a tropical and temperate rainforest.
+Describe the route for a backpacking trip for two weeks through the Yosemite National Park
+Imagine you are playing a board game. Tell me what kind of game it is.
+Create an outline for a news report about climate change.
+Find the area of the triangle with sides 3, 4, and 5.
+How do you use a GPS system?
+Generate a list of five questions to ask someone interested in becoming a doctor.
+Suggest ways to market a new product on a limited budget.
+Come up with a slogan or phrase that expresses the concept of gratitude.
+Make up a sentence using all of the following words: ball, mouth, and forget.
+List 5 activities that a bot could perform to help customers complete tasks.
+Describe what a scientific research article should have.
+Invent a new game involving strategy.
+Make a list of the best five action movies.
+Generate 10 common English idioms related to anger.
+Devise a plan to make the most of a weekend
+Create a sentence that uses the phrase "at this point in time" correctly.
