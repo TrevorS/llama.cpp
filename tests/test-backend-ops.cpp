@@ -4310,6 +4310,126 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_DSV4_MOE_GATE_UP (DeepSeek-V4 fused gate+up+activation prefill tile op)
+struct test_dsv4_moe_gate_up : public test_case {
+    const ggml_type type_w;   // gate/up expert weight type (IQ2_XXS)
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int n_expert;
+    const int n_used;
+    const int64_t n_tokens;
+    const float clamp;
+    // route ids through ggml_argsort_top_k like build_moe_ffn does: the result
+    // is a VIEW with row stride n_expert (non-contiguous for n_used < n_expert)
+    const bool noncont_ids;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_w, n_embd, n_ff, n_expert, n_used, n_tokens, clamp, noncont_ids);
+    }
+
+    // activations quantize to q8_K on both paths but with slightly different
+    // algorithms (ggml -128/max vs ds4 -127/maxv); agreement, not bit-equality.
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ull * 2 * n_embd * n_ff * n_used * n_tokens; // gate + up
+    }
+
+    test_dsv4_moe_gate_up(ggml_type type_w = GGML_TYPE_IQ2_XXS,
+            int64_t n_embd = 256, int64_t n_ff = 256, int n_expert = 8, int n_used = 2,
+            int64_t n_tokens = 5, float clamp = 0.0f, bool noncont_ids = false)
+        : type_w(type_w), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used),
+          n_tokens(n_tokens), clamp(clamp), noncont_ids(noncont_ids) {
+            GGML_ASSERT(n_used <= n_expert);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * ids;
+        if (noncont_ids) {
+            // production layout: argsort_top_k view, row stride n_expert
+            ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+            ggml_set_name(probs, "probs");
+            ids = ggml_argsort_top_k(ctx, probs, n_used);
+        } else {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        }
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_dsv4_moe_gate_up(ctx, gate, up, cur, ids, clamp);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_expert);
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 0 (DeepSeek-V4 hyper-connection weighted sum)
+struct test_dsv4_hc_weighted_sum : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_weighted_sum(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_dsv4_hc_weighted_sum(ctx, x, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 1 (DeepSeek-V4 hyper-connection post/comb mixing)
+struct test_dsv4_hc_post : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_post(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(res, "res");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, x, res, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -5651,6 +5771,66 @@ struct test_argsort : public test_case {
                 GGML_ABORT("fatal error");
             }
         }
+    }
+};
+
+// GGML_OP_DSV4_LID_TOPK
+struct test_dsv4_lid_topk : public test_case {
+    const ggml_type k_type;
+    const int64_t d_idx;
+    const int64_t n_head;
+    const int64_t n_lid;
+    const int64_t nt_s;
+    const int64_t n_stream;
+    const int top_k;
+
+    std::string vars() override {
+        return std::string("k_type=") + ggml_type_name(k_type) +
+               ",d_idx=" + std::to_string(d_idx) + ",n_head=" + std::to_string(n_head) +
+               ",n_lid=" + std::to_string(n_lid) + ",nt_s=" + std::to_string(nt_s) +
+               ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k);
+    }
+
+    test_dsv4_lid_topk(ggml_type k_type = GGML_TYPE_F32,
+            int64_t d_idx = 128, int64_t n_head = 64, int64_t n_lid = 2048,
+            int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512)
+        : k_type(k_type), d_idx(d_idx), n_head(n_head), n_lid(n_lid),
+          nt_s(nt_s), n_stream(n_stream), top_k(top_k) {}
+
+    // Output is index sets per row; compare order-independently (top-k selection
+    // is a set — the downstream mask does not care about intra-row order).
+    // The CUDA head_dim==128 path scores with fp16 tensor cores (q rounded to
+    // fp16), so a tiny fraction of indices at near-tie score boundaries may
+    // differ from the fp32 CPU reference. Allow a small set-mismatch fraction
+    // there; keep the scalar path (d_idx != 128) strict at exact set match.
+    double max_err(ggml_backend_t) override { return d_idx == 128 ? 3e-3 : 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t rows = n / (size_t) top_k;
+        size_t mism = 0;
+        for (size_t r = 0; r < rows; r++) {
+            std::set<int> sa, sb;
+            for (int i = 0; i < top_k; i++) {
+                sa.insert((int) a[r*top_k + i]);
+                sb.insert((int) b[r*top_k + i]);
+            }
+            for (int x : sa) { if (!sb.count(x)) { mism++; } }
+        }
+        return n ? (double) mism / (double) n : 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nt = nt_s * n_stream;
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_idx, n_head, nt);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, d_idx, 1, n_lid, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, nt);
+        ggml_set_name(w, "w");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_lid, nt_s, 1, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_dsv4_lid_topk(ctx, q, k, w, mask, top_k);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -8813,6 +8993,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DeepSeek-V4 fused MoE gate+up tile op (IQ2_XXS experts)
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 256,  256,  8,  2, 5,   0.0f));
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  0.0f));
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  7.0f)); // clamp path
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 4096, 512,  32, 6, 64,  0.0f)); // near-real dims
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 512,  768,  16, 4, 17,  0.0f, true)); // argsort_top_k view ids
+    test_cases.emplace_back(new test_dsv4_moe_gate_up(GGML_TYPE_IQ2_XXS, 4096, 512,  256, 6, 64, 7.0f, true)); // real n_expert + view ids + clamp
+
+    // DeepSeek-V4 fused hyper-connection mixing (both modes; hc=8 is GGML_DSV4_HC_MAX)
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 4, 1));   // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 8, 17));  // hc max, odd nt
+    test_cases.emplace_back(new test_dsv4_hc_post(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 4, 1));           // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 8, 17));          // hc max, odd nt
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
@@ -9106,6 +9302,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
+
+    // GGML_OP_DSV4_LID_TOPK (DeepSeek-V4 fused lightning-indexer score + top-k)
+    //                                       k_type,          d_idx, n_head, n_lid, nt_s, n_stream, top_k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,   300,    1, 1,  64));  // decode (nt=1), single chunk, n_lid % chunk != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    8, 1, 256));  // small
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,    4, 1, 512));  // realistic dims, F16 k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8,  5000,    2, 1, 128));  // multi-chunk (>4096), not divisible, F16
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  4097,    2, 1, 100));  // just over one chunk boundary
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
+    // wmma score path (d_idx == 128): multi-token-tile, non-128-divisible n_lid, streams
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // wmma: 3 token-tiles (partial), n_lid % 128 != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  6000,   33, 1, 256));  // wmma: multi-chunk topk + partial token tile
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // wmma: n_stream = 2, per-stream launch
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

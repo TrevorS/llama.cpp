@@ -587,6 +587,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_DSV4_LID_TOPK,
+        GGML_OP_DSV4_MOE_GATE_UP,
+        GGML_OP_DSV4_HC_FUSED,
+
         GGML_OP_COUNT,
     };
 
@@ -2391,6 +2395,56 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // DeepSeek-V4 lightning-indexer fused score + top-k.
+    // Replaces the 8-op chain (k*q matmul -> relu -> weight -> sum over heads -> mask -> top_k)
+    // with a single op whose working set is O(chunk x n_tokens) instead of O(n_ctx x n_tokens x n_head).
+    //   q       : [d_idx, n_head, n_tokens]              F32 (after hadamard/rope)
+    //   k       : [d_idx, 1, n_lid, n_stream]            F16/F32 (indexer K cache view)
+    //   weights : [n_head, n_tokens]                     F32 (per-head weights, scale already applied)
+    //   mask    : [n_lid, n_tokens/n_stream, 1, n_stream] F32 (additive, carries causality)
+    // score(t,j) = sum_h( relu(q_th . k_j) * weights[h,t] ) + mask[j, t_local, stream(t)]
+    // output  : [n_top_k, n_tokens/n_stream, 1, n_stream] I32, per-token indices into the context,
+    //           descending by score with lower-index tie-break (matches ggml_top_k selection set).
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask,
+            int                   n_top_k);
+
+    // DeepSeek-V4 MoE prefill gate+up+activation fusion (IQ2_XXS experts).
+    //   gate, up : [n_embd, n_ff, n_expert]        IQ2_XXS expert weights
+    //   cur      : [n_embd, .., n_tokens]          F32 activations (contiguous)
+    //   ids      : [n_expert_used, n_tokens]       I32 selected experts
+    // out : [n_ff, n_expert_used, n_tokens] F32, mid = silu(clamp(gate))*clamp(up)
+    //       (routing weight NOT applied; matches the pre-down state of the
+    //        unfused gate/up/swiglu chain). clamp<=0 disables clamping.
+    GGML_API struct ggml_tensor * ggml_dsv4_moe_gate_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * ids,
+            float                 clamp);
+
+    // DeepSeek-V4 hyper-connection residual mixing, fused (see dsv4_hc_fused.cuh).
+    // weighted_sum: out[e,t] = sum_ih x[e,ih,t]*weights[ih,t]
+    //   x [n_embd,hc,nt], weights [hc,nt] -> [n_embd,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // post: out[e,dst,t] = x[e,t]*post[dst,t] + sum_src residual[e,src,t]*comb[dst,src,t]
+    //   x [n_embd,nt], residual [n_embd,hc,nt], post [hc,nt], comb [dst,src,nt] -> [n_embd,hc,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
