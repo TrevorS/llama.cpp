@@ -1856,7 +1856,12 @@ static common_chat_params common_chat_params_init_gigachat_v3(
 }
 
 static common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_template &    tmpl,
-                                                                 const autoparser::generation_params & inputs) {
+                                                                 const autoparser::generation_params & inputs,
+                                                                 const std::string & fc_tag = "function_calls") {
+    // fc_tag is the outer tool-call wrapper the template uses inside the DSML markup:
+    //   DeepSeek V3.2 wraps calls in <｜DSML｜function_calls> ... </｜DSML｜function_calls>
+    //   DeepSeek V4   wraps calls in <｜DSML｜tool_calls>     ... </｜DSML｜tool_calls>
+    // Everything else in the DSML grammar (invoke/parameter markup) is identical.
     common_chat_params data;
 
     data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
@@ -1879,8 +1884,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string FC_START     = "<" + DSML + "function_calls>";
-    const std::string FC_END       = "</" + DSML + "function_calls>";
+    const std::string FC_START     = "<" + DSML + fc_tag + ">";
+    const std::string FC_END       = "</" + DSML + fc_tag + ">";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
@@ -1907,8 +1912,12 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
         } else if (extract_reasoning) {
             // Thinking disabled but reasoning extraction requested: the generation prompt
-            // contains an empty <think></think> pair that must still be consumed.
-            reasoning = p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+            // contains an empty thinking section that must still be consumed. V3.2 emits the
+            // full <think></think> pair; V4 emits a bare </think>.
+            common_peg_parser empty_think = p.choice();
+            empty_think |= p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END);
+            empty_think |= p.literal(THINK_END);
+            reasoning = p.optional(empty_think);
         }
 
         if (has_response_format) {
@@ -2612,13 +2621,19 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_gigachat_v3(tmpl, params);
     }
 
-    // DeepSeek V3.2 format detection: template defines dsml_token and uses it for tool calls.
+    // DeepSeek V3.2 / V4 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.
+    // V3.2 wraps calls in a "function_calls" block; V4 wraps them in a "tool_calls" block.
     if (src.find("dsml_token") != std::string::npos &&
-        src.find("function_calls") != std::string::npos &&
         src.find("DSML") != std::string::npos) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2\n");
-        return common_chat_params_init_deepseek_v3_2(tmpl, params);
+        if (src.find("function_calls") != std::string::npos) {
+            LOG_DBG("Using specialized template: DeepSeek V3.2\n");
+            return common_chat_params_init_deepseek_v3_2(tmpl, params, "function_calls");
+        }
+        if (src.find("tool_calls") != std::string::npos) {
+            LOG_DBG("Using specialized template: DeepSeek V4\n");
+            return common_chat_params_init_deepseek_v3_2(tmpl, params, "tool_calls");
+        }
     }
 
     // Gemma4 format detection
