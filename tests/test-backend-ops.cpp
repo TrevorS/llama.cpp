@@ -5808,7 +5808,8 @@ struct test_dsv4_lid_topk : public test_case {
         // per-row int8 quant flips a small fraction of near-tie selections
         // (observed <= 0.7%). Loosen the set-mismatch gate for that path.
         const char * i8 = getenv("LLAMA_DSV4_LID_INT8");
-        if (i8 && i8[0] == '1' && d_idx == 128) return 1.2e-2;
+        const char * dec = getenv("LLAMA_DSV4_LID_DEC");
+        if (((i8 && i8[0] == '1') || (dec && dec[0] == '1')) && d_idx == 128) return 1.2e-2;
         return d_idx == 128 ? 3e-3 : 0.0;
     }
     double err(const float * a, const float * b, size_t n) override {
@@ -9322,6 +9323,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // wmma: 3 token-tiles (partial), n_lid % 128 != 0
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  6000,   33, 1, 256));  // wmma: multi-chunk topk + partial token tile
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // wmma: n_stream = 2, per-stream launch
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 1, 512));  // decode kernel: d_idx=128, nt_s=1
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512));  // decode kernel: nt_s=1, n_stream=2
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     for (int n = 1; n < 5; ++n) {

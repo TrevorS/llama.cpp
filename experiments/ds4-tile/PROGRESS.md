@@ -599,3 +599,24 @@ word-granular so the 4-bit L1 saving is not guaranteed. Verdict: fp4 mma is NOT
 worth the high-risk packing effort; int8 dp4a is the score-kernel sweet spot.
 int4 code reverted (kept only as this documented negative result).
 Reallocating the fp4-mma budget to the decode kernel + B2 (higher value).
+
+## Iteration 16 — dedicated decode score kernel (LLAMA_DSV4_LID_DEC) +5.2%
+
+Probe 1 (cheap): route decode to the existing scalar kernel -> SLOWER (1304 vs
+930us) — only 65 blocks, GPU starved. Decode bottleneck = parallelism + the
+15/16 tile-padding waste, not the kernel math.
+
+dsv4_score_decode_kernel (nt_s==1): warp-per-comp, q (all heads) int8-quantized
+into smem once and reused, each warp streams one comp's K coalesced (4 dims/
+lane), int8 dot per head via warp-shuffle reduce, grid-strided (cap 512 blocks)
+for high occupancy. No token padding.
+
+Gates:
+- test-backend-ops: added 2 d_idx=128 nt_s=1 cases (n_stream 1 & 2); DEC path OK
+  (int8 tolerance 1.2e-2). Baseline wmma also OK on the new cases.
+- perf nt=1 n_lid=33280: wmma 935us -> int8 773 -> DEC 470us (2.0x vs wmma,
+  1.6x vs int8).
+- e2e tg@d32768: baseline 12.56 -> DEC 13.21 (+5.2%, vs int8's +1.4%);
+  DEC+GATHER 13.91 (+10.8% over baseline). Grows with depth (score is a bigger
+  decode share at d131k). 470us still >> the ~30us memory-ideal K read, so more
+  headroom remains, but 2x banked.

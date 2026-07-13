@@ -360,6 +360,80 @@ static __global__ void dsv4_score_int8_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// dedicated decode score kernel (nt==1, head_dim==128) — LLAMA_DSV4_LID_DEC
+//
+// At decode the wmma/int8 path pads 1 token to a 16-token tile (15/16 wasted)
+// and the scalar path launches too few blocks. This kernel is warp-per-comp:
+// q (all heads) is quantized int8 once into smem and reused; each warp streams
+// one comp's K (coalesced, 4 dims/lane), int8-quantizes it, and reduces the
+// 128-dim dot per head via warp shuffle. Grid-strided over comps for high
+// block count. One stream-group per launch (pointers pre-offset).
+// ---------------------------------------------------------------------------
+
+template <typename KT>
+static __global__ void dsv4_score_decode_kernel(
+        float       * __restrict__ scores,   // [n_lid]
+        const float * __restrict__ q,        // [h*128 + d]  (single token)
+        const float * __restrict__ weights,  // [h]
+        const KT    * __restrict__ k,        // [j*nbk2 + d]
+        const float * __restrict__ mask,     // [j]
+        int64_t nbk2, int n_lid, int n_head) {
+    extern __shared__ char smem_dec[];
+    int8_t * qs   = (int8_t *) smem_dec;                 // [n_head*128]
+    float  * sq   = (float *) (qs + (size_t) n_head * 128); // [n_head]
+    float  * sw   = sq + n_head;                          // [n_head]
+
+    const int tid    = threadIdx.x;
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int nwarps = blockDim.x >> 5;
+
+    // quantize q (all heads) into smem once
+    for (int h = warp; h < n_head; h += nwarps) {
+        const float * qh = q + (int64_t) h * 128;
+        float v[4];
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) { v[i] = qh[lane * 4 + i]; amax = fmaxf(amax, fabsf(v[i])); }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        if (lane == 0) { sq[h] = amax > 0.0f ? amax / 127.0f : 0.0f; sw[h] = weights[h]; }
+#pragma unroll
+        for (int i = 0; i < 4; i++) qs[h * 128 + lane * 4 + i] = (int8_t) __float2int_rn(v[i] * inv);
+    }
+    __syncthreads();
+
+    // grid-stride over comps, one warp per comp
+    for (int j = blockIdx.x * nwarps + warp; j < n_lid; j += gridDim.x * nwarps) {
+        const KT * kj = k + (int64_t) j * nbk2;
+        int8_t kq[4];
+        float amax = 0.0f;
+        float kv[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) { kv[i] = dsv4_ldk(kj + lane * 4 + i); amax = fmaxf(amax, fabsf(kv[i])); }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float ksc = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float kinv = amax > 0.0f ? 127.0f / amax : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) kq[i] = (int8_t) __float2int_rn(kv[i] * kinv);
+        const int kpack = *(const int *) kq;
+
+        float acc = 0.0f;
+        for (int h = 0; h < n_head; h++) {
+            const int qpack = *(const int *) (qs + h * 128 + lane * 4);
+            int dot = __dp4a(qpack, kpack, 0);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            const float d = (float) dot * sq[h] * ksc;
+            acc += fmaxf(d, 0.0f) * sw[h];
+        }
+        if (lane == 0) scores[j] = acc + mask[j];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // top-k (bitonic, descending, lower-index tie-break) — ported from ds4_cuda.cu
 // ---------------------------------------------------------------------------
 
@@ -660,11 +734,35 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const char * e = getenv("LLAMA_DSV4_LID_INT8");
         return e && e[0] == '1';
     }();
+    // Dedicated decode kernel (nt_s==1): warp-per-comp, no 16-token tile padding.
+    static const bool dsv4_lid_dec = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_DEC");
+        return e && e[0] == '1';
+    }();
 
     // Tensor-core path: requires head_dim == 128 (the wmma 16x16x16 k-tiling).
     // One launch per CUDA stream-group so a 16-token tile never straddles a
     // stream boundary; falls back to the scalar dot-product kernel otherwise.
-    if (d_idx == 128) {
+    if (d_idx == 128 && dsv4_lid_dec && nt_s == 1) {
+        const int block   = 256;
+        const int nwarps  = block / 32;
+        const size_t smem = (size_t) n_head * 128 + (size_t) n_head * 2 * sizeof(float);
+        int gx = (n_lid + nwarps - 1) / nwarps;
+        if (gx > 512) gx = 512;
+        for (int s = 0; s < n_stream; s++) {
+            float       * sc_s = scores + (int64_t) s * nt_s * n_lid;
+            const float * q_s  = q_d + (int64_t) s * nt_s * n_head * d_idx;
+            const float * w_s  = w_d + (int64_t) s * nt_s * n_head;
+            const float * m_s  = m_d + (int64_t) s * nbm3;
+            if (k_is_f16) {
+                dsv4_score_decode_kernel<half><<<gx, block, smem, stream>>>(
+                        sc_s, q_s, w_s, (const half *) k->data + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
+            } else {
+                dsv4_score_decode_kernel<float><<<gx, block, smem, stream>>>(
+                        sc_s, q_s, w_s, (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
+            }
+        }
+    } else if (d_idx == 128) {
         const dim3 block(256);
         const dim3 grid((n_lid + 127) / 128, (nt_s + 15) / 16, 1);
         for (int s = 0; s < n_stream; s++) {
