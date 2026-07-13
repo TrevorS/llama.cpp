@@ -5803,7 +5803,14 @@ struct test_dsv4_lid_topk : public test_case {
     // fp16), so a tiny fraction of indices at near-tie score boundaries may
     // differ from the fp32 CPU reference. Allow a small set-mismatch fraction
     // there; keep the scalar path (d_idx != 128) strict at exact set match.
-    double max_err(ggml_backend_t) override { return d_idx == 128 ? 3e-3 : 0.0; }
+    double max_err(ggml_backend_t) override {
+        // LLAMA_DSV4_LID_INT8 scores via int8 dp4a vs the fp32 CPU reference;
+        // per-row int8 quant flips a small fraction of near-tie selections
+        // (observed <= 0.7%). Loosen the set-mismatch gate for that path.
+        const char * i8 = getenv("LLAMA_DSV4_LID_INT8");
+        if (i8 && i8[0] == '1' && d_idx == 128) return 1.2e-2;
+        return d_idx == 128 ? 3e-3 : 0.0;
+    }
     double err(const float * a, const float * b, size_t n) override {
         const size_t rows = n / (size_t) top_k;
         size_t mism = 0;
