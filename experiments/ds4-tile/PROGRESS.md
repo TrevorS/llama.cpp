@@ -620,3 +620,32 @@ Gates:
   DEC+GATHER 13.91 (+10.8% over baseline). Grows with depth (score is a bigger
   decode share at d131k). 470us still >> the ~30us memory-ideal K read, so more
   headroom remains, but 2x banked.
+
+## Iteration 17b — B2 refined design (shapes probed): tractable via 2 bitmap ops
+
+Runtime shapes (il=2, ~10k prefill): head_dim=512 (MLA), raw_k=[512,1,2304,1]
+(n_raw=2304 bounded window), csa_k=[512,1,4096,1] (n_csa=ctx/4), and CRUCIALLY
+prefill CSA is called with nt_s<=16 (already chunked into natural W<=16 tiles).
+
+This collapses B2 from a fused-FA kernel into a MINIMAL edit of the existing
+dense path. Per call (nt_s<=16 tokens = one union tile):
+  1. union op: top_k[512,nt_s] -> union_idx[U] (sorted unique union, padded)
+  2. gather:  get_rows(csa_k, union_idx) -> [512, U]   (shared across nt_s)
+  3. k_all = concat(raw_k[512,2304], union_csa[512,U])  (raw reused as-is)
+  4. memb op: top_k + union_idx -> membership[U, nt_s] (0 if selected else -inf)
+  5. mask  = concat(raw_mask[2304,nt_s], membership[U,nt_s])
+  6. FA(q, k_all, mask)  -- SAME call as dense, just U instead of n_csa
+Steps 3/5/6 already exist in build_csa_lid_attention; only 1,2,4 are new, and 2
+is plain get_rows. So B2 = 2 small bitmap ops (union_idx, membership).
+
+Why not the alternatives (ruled out this iteration):
+- tile-skip FA: selections scatter across all K-tiles -> nothing fully empty
+  (this is exactly why the dense mask FA is already dense, iter 13).
+- per-token gather (q=1 batched FA): FA runs at ~1/16 tile efficiency -> a 12x
+  data cut becomes ~0.8x wall. Union (shared W=16 K) keeps Q-tiles efficient.
+- raw window (2304) is shared+dense, can't cheaply separate from gathered CSA
+  in ggml FA (no LSE merge) -> keep raw in k_all, gather only CSA.
+
+U per call: nt_s=16 union ~500-1500 (grows sublinearly); cut vs n_csa grows with
+depth (n_csa=32768 @d131k, U~1500 -> ~20x on the CSA portion; raw 2304 fixed).
+Building op 1 (union_idx) next.
