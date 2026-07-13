@@ -300,3 +300,104 @@ FA-512 = config-optimal (kernel-internal headroom remains). Prefill at
 with current kernel architecture. The day's serving arc: 140 -> 404 t/s
 (unified-FA fix bd321dec + fused kernels + ub2048); further gains need the
 FA kernel deep-dive (~10%) or MoE quant changes (vetoed: no requant).
+
+## Iteration 13 — depth-scaling attribution (Flash-MSA scouting -> nsys depth sweep)
+
+Motivation: Flash-MSA blog (Nanduru, 2026-07-11; MiniMax sparse-attention train
+kernels) -> audited which forward-pass lessons apply to our inference stack.
+Profiles: experiments/profiles/lid_pp_d{32768,131072}.nsys-rep + lid_tg_d131072.
+
+pp2048 depth curve (ub2048, FUSED_LID+HC_FUSED, IQ3_XXS; nsys ~3% overhead):
+  d8192 457.5 (iter-11 ref) · d32768 354.6 · d131072 179.8 · d262144 111.8
+  => linear ~3.9s flat + ~55us/depth-token per ubatch -> 512k ~63 t/s, 1M ~34.
+tg: d32768 13.47 (iter 9) · d131072 9.29 · d262144 7.11 -> 512k ~5 t/s.
+BOTH task-#6 gates FAIL at 512k without kernel work.
+
+At-depth kernel shares (final measured ubatch, sqlite window):
+  d32768:  FA<512,512> 28.5% · LID 13.5% (score 9.9 + topk 3.6) · MoE 33.6%
+  d131072: FA 44.8% · LID 24.1% (score 18.3 + topk 5.8) · MoE 19.8% (flat ms)
+
+Root causes (source-verified + per-launch math):
+1. FA is effectively DENSE at depth. Its only mask optimization is
+   flash_attn_mask_to_KV_max (fattn-common.cuh:1091) — a per-Q-tile SUFFIX
+   bound. Top-512 selections scatter across the prefix (sinks) so the bound
+   ~= full length; interior fully-masked tiles are never skipped. CSA FA
+   compute is O(n_csa) despite top-512 sparsity. Decode FA 0.278ms/launch
+   scans 33k rows for 512 useful ones.
+2. LID score wmma runs ~11 TFLOPS (~10% fp16 peak) at all nt; decode (nt=1)
+   wastes 15/16 on tile padding (0.79ms vs ~0.04-0.1ms K-read floor; scalar
+   kernel is no better at ~1.2ms).
+3. topk chain 5.8% @ d131k; scores buffer nt x n_lid fp32 = 1 GiB @512k,
+   2 GiB @1M (ds4.c never streamed either — it ate the buffer).
+
+Model facts (GGUF header): indexer 64h x 128d, top_k=512, lid on ~21 CSA
+(ratio-4) layers, n_lid = ctx/4. ds4.c runs the indexer FAKE-QUANTIZED fp4
+(indexer_hadamard_fp4 / *_qat_* — the model is QAT'd for a low-precision
+indexer; all ds4.c reference numbers used it; our fp16 path is over-precise).
+ggml already ships e2m1 block-scale mma (mma_block_scaled_fp4, mmq.cuh:1056,
+BLACKWELL_MMA_AVAILABLE, sm121a) — liftable; int8 m16n8k32 is the fallback.
+
+Funding ranking (by 512k payoff):
+1. Gathered/varlen sparse main attention consuming top-k indices directly
+   (MoBA-style per-Q-tile union+dedup for prefill; decode = 512-row gather).
+   Kills ~60% of the depth slope AND the build_top_k_mask fill/set_rows chain.
+   Projected 512k pp 63 -> ~135 t/s alone.
+2. LID score kernel: fp4 QAT-matching path (oracle gate first: port ds4.c
+   fake-quant into a backend-ops top-512 set-overlap test) or int8; plus a
+   dedicated small-nt decode kernel targeting the K-read floor.
+3. Streaming chunk-topk (carry (score,idx) candidates through the merge tree,
+   never materialize global scores): mandatory for 1M, modest wall-clock.
+Combined projection @512k: pp ~210-230 t/s, tg ~10-12 t/s (gates pass).
+
+## Iteration 13b — rapid-iteration tooling scout (speed + accuracy loops)
+
+Validated toolkit for the funded workstream (gathered sparse FA / fp4 LID /
+streaming topk). All items below verified live on GB10 this session.
+
+INNER LOOP (seconds, no model):
+- Compile: dsv4_lid_topk.cu real nvcc = ~2s (ccache in play: touch/comment
+  edits hit cache in ~1s); link test-backend-ops ~5s. Keep new kernels in
+  their OWN .cu (fattn-common.cuh touch = minutes of template recompiles;
+  file(GLOB) means new .cu needs a cmake reconfigure — iteration 7b note).
+- Accuracy: build/bin/test-backend-ops test -o DSV4_LID_TOPK (5 cases, CPU
+  ref compare). New ops get their own cases + fp4 set-overlap gate.
+- Speed: test-backend-ops perf — GAP: DSV4_LID_TOPK is NOT in
+  make_test_cases_perf() (test-backend-ops.cpp:9687); add deep perf shapes
+  (nt=2048 x n_lid={8704,33280}) so kernel timing needs no model/fill.
+- Kernel SoL: ncu on test-backend-ops perf (tiny footprint — avoids the
+  96G-resident earlyoom trap entirely; --replay-mode application only
+  needed when profiling the full model).
+
+PROFILE LOOP (minutes):
+- experiments/profiles/kernsum.sh <rep> [window_s]: nsys sqlite export +
+  windowed kernel ranking (window isolates the measured pass from depth
+  fill). Validated against iteration-13 numbers.
+- nsys recipe: nsys profile --trace=cuda --sample=none --cpuctxsw=none
+  (~3% overhead on llama-bench legs). CUPTI drops events ~2 tokens into
+  deep decode; grid-shape filtering in sqlite recovers per-shape decode
+  costs (score decode gridY=1; FA stream-k grid is depth-invariant 48/96).
+
+AT-DEPTH E2E LOOP (~1.5 min/variant after one-time fill):
+- llama-completion --prompt-cache state.bin --temp 0: VALIDATED on dsv4 —
+  run 2 logs "session file has exact match" and skips prefill. Fill 131k
+  once (~12 min), then each kernel variant replays greedy from depth in
+  ~1.5 min (model load dominates; restore itself ~seconds). Old llama-cli
+  A/B flow is DEAD: new tools/cli is conversational (silent, ERROR-level
+  logs); --prompt-cache now belongs to llama-completion.
+- test-save-load-state: tests 1-3 PASS on dsv4 (whole-context state
+  save/load works). Test 4 seq-copy FAILS: "n_stream mismatch" in
+  llama_state_load_file — known issue, multi-seq copy only, does not
+  block single-stream A/B. File separately.
+- llama-passkey (--junk N --pos P): in-tree needle retrieval for depth
+  accuracy gates (not yet exercised; use at milestone, not per-iteration).
+- KL gate: llama-perplexity --kl-divergence-base (save once per config)
+  + --kl-divergence (iteration-8 recipe, corpus gate).
+- llama-bench -d legs + kernsum.sh: milestone-level depth curve re-check
+  (fill cost makes it a gate, not a loop).
+
+GOTCHA (cost us a phantom segfault): partial rebuilds desync executables
+from shared libs — cmake --build --target X relinks libllama-common.so
+under yesterday's binaries -> SIGSEGV in common_params_parser_init that
+looks like a real bug. Always full-rebuild (cmake --build build -j4)
+after pulling/committing param-struct changes before trusting any tool
+crash. llama-bench iteration-13 legs ran on matched binaries (verified).
