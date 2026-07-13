@@ -668,3 +668,26 @@ Gates:
   dense) — crashed/oomd before capturing; rerun at safe depth. And depth-trend
   perf at d65536.
 CAUTION: deep PPL (c16384 long corpus) likely triggered the OOM this session.
+
+## Iteration 18b — CORRECTION: B2 integration has a bug; reverted (ops kept)
+
+The +14.6% integration (afdc029ef) was committed with a FALSE correctness claim.
+The "cap8192 token-identical" proof was INVALID: n_csa~4096 < cap 8192 made the
+gate `n_csa > cap` false, so the union path never activated — cap8192 silently
+ran dense. Proper test (env LLAMA_DSV4_CSA_UNION_FULL forcing u_max=n_csa, so
+NO overflow -> must equal dense if correct): full-union DIFFERS from dense and
+emits garbage ("[end of file]", NaN-like). So the get_rows+concat+memb+FA
+integration is BUGGY. Dense verified deterministic (run1==run2), so the diff is
+a real bug not FA noise.
+
+Likely cause: the dense path adds the base CSA mask (inp_csa.kq_mask) inside
+build_top_k_mask (ggml_add at deepseek4.cpp ~L726); the membership op omits it,
+so a top-k-selected cell that is CSA-causally-masked (or padding) gets attended
+-> corrupt softmax. Fix: gather+add the base CSA mask per union cell (or fold it
+into the memb op), then re-verify full-union == dense before any perf/cap work.
+
+Status: integration reverted to ops-only (c0e091d68). union_idx + membership
+ops remain VALIDATED in isolation (backend-ops 5/5 each, CPU==CUDA incl overflow
++ deep n_csa=32768) and committed. The +14.6% perf datapoint is real but on
+INCORRECT output — do not trust until the integration bug is fixed. Clear repro:
+LLAMA_DSV4_CSA_UNION=1 LLAMA_DSV4_CSA_UNION_FULL=1 greedy A/B vs dense.
