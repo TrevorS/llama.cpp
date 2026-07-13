@@ -10019,6 +10019,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // DSV4 fused lightning-indexer score+topk at DS4-Flash serving depths
+    // (ub2048 prefill at depth 32k/131k -> n_lid = (depth+ub)/4; plus decode nt=1)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  8704, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280,    1, 1, 512));
+
     return test_cases;
 }
 

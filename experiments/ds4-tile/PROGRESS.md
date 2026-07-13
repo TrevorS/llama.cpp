@@ -401,3 +401,26 @@ under yesterday's binaries -> SIGSEGV in common_params_parser_init that
 looks like a real bug. Always full-rebuild (cmake --build build -j4)
 after pulling/committing param-struct changes before trusting any tool
 crash. llama-bench iteration-13 legs ran on matched binaries (verified).
+
+## Iteration 13c — lid perf cases + fp4 oracle first data
+
+- test-backend-ops perf now covers DSV4_LID_TOPK at serving depths (nt=2048 x
+  n_lid {8704,33280} + decode nt=1). Timings match iteration-13 nsys within
+  ~3% (34.9ms / 125.9ms / 0.93ms) — kernel speed loop needs no model/fill.
+- fp4_oracle.cpp (CPU+OpenMP, experiments/ds4-tile): verbatim port of ds4.c
+  hadamard128 + e2m1 block-32 QAT round trip; measures top-512 set overlap
+  between our fp16 path (A) and the QAT/fp4 path (B). Synthetic gaussian is
+  the worst case: mean overlap 0.90/0.85/0.80 at n_lid 2176/8704/33280
+  (i.i.d. scores = razor-thin top-k boundary).
+- REAL activations (one-shot dump hook LLAMA_DSV4_LID_DUMP=<dir> +
+  LLAMA_DSV4_LID_DUMP_NLID=<min> in dsv4_lid_topk.cu; captured nt=256,
+  n_lid=7680 from a 30k-token doc prefill): mean overlap 0.9295, min 0.8906.
+- Reading: ds4.c runs the fp4 round trip unconditionally — the official graph
+  IS path B — so our fp16 path already deviates ~7% in selection set from
+  reference serving, and an fp4 score kernel converges TOWARD official
+  numerics. Boundary flips are the lowest-score (lowest attention mass)
+  selections. VERDICT: fp4 kernel green-lit. End-to-end decider stays
+  greedy A/B + KL corpus + passkey-at-depth; the kernel's set-overlap gate
+  should expect ~0.9 vs fp32 ref (not the 3e-3 wmma near-tie tolerance).
+- Follow-ups: score-mass-weighted overlap metric; real-data capture at
+  n_lid ~33k for the depth trend.

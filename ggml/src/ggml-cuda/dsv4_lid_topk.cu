@@ -1,6 +1,10 @@
 #include "dsv4_lid_topk.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <mma.h>
 
 // DSV4_TOPK_SORT_N is defined in dsv4_lid_topk.cuh (shared with supports_op).
@@ -390,6 +394,54 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool & pool = ctx.pool();
+
+    // Env-gated one-shot input dump for the fp4 selection-fidelity oracle
+    // (experiments/ds4-tile/fp4_oracle.cpp). Dumps the first prefill call
+    // whose n_lid reaches the threshold: q/w for the first <=256 tokens
+    // (f32) and the full k view (converted to f32). Layouts match the
+    // oracle's --pre-rotated dump mode.
+    //   LLAMA_DSV4_LID_DUMP=<dir>  LLAMA_DSV4_LID_DUMP_NLID=<min n_lid>
+    static const char * dump_dir = getenv("LLAMA_DSV4_LID_DUMP");
+    static const int dump_nlid = getenv("LLAMA_DSV4_LID_DUMP_NLID")
+        ? atoi(getenv("LLAMA_DSV4_LID_DUMP_NLID")) : 0;
+    static bool dumped = false;
+    if (dump_dir && !dumped && nt > 1 && n_lid >= dump_nlid) {
+        dumped = true;
+        const int nt_dump = nt < 256 ? nt : 256;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> hq((size_t) nt_dump * n_head * d_idx);
+        std::vector<float> hw((size_t) nt_dump * n_head);
+        std::vector<float> hk((size_t) n_lid * d_idx);
+        CUDA_CHECK(cudaMemcpy(hq.data(), q->data, hq.size()*sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hw.data(), weights->data, hw.size()*sizeof(float), cudaMemcpyDeviceToHost));
+        const int64_t nbk2_e = k->nb[2] / ggml_type_size(k->type);
+        if (k->type == GGML_TYPE_F16) {
+            std::vector<half> hk16((size_t) n_lid * d_idx);
+            for (int j = 0; j < n_lid; j++) {
+                CUDA_CHECK(cudaMemcpy(hk16.data() + (size_t) j * d_idx,
+                        (const half *) k->data + (int64_t) j * nbk2_e,
+                        d_idx*sizeof(half), cudaMemcpyDeviceToHost));
+            }
+            for (size_t i = 0; i < hk.size(); i++) hk[i] = __half2float(hk16[i]);
+        } else {
+            for (int j = 0; j < n_lid; j++) {
+                CUDA_CHECK(cudaMemcpy(hk.data() + (size_t) j * d_idx,
+                        (const float *) k->data + (int64_t) j * nbk2_e,
+                        d_idx*sizeof(float), cudaMemcpyDeviceToHost));
+            }
+        }
+        auto wr = [&](const char * name, const void * p, size_t bytes) {
+            std::string path = std::string(dump_dir) + "/" + name;
+            FILE * f = fopen(path.c_str(), "wb");
+            GGML_ASSERT(f && fwrite(p, 1, bytes, f) == bytes);
+            fclose(f);
+        };
+        wr("q.bin", hq.data(), hq.size()*sizeof(float));
+        wr("w.bin", hw.data(), hw.size()*sizeof(float));
+        wr("k.bin", hk.data(), hk.size()*sizeof(float));
+        fprintf(stderr, "\ndsv4_lid_topk: dumped nt=%d n_head=%d n_lid=%d d_idx=%d to %s\n",
+                nt_dump, n_head, n_lid, d_idx, dump_dir);
+    }
 
     // scores buffer lives in the pool, not the graph compute buffer.
     ggml_cuda_pool_alloc<float> scores_alloc(pool, (size_t) nt * n_lid);

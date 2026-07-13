@@ -14,3 +14,7 @@ clean:
 	rm -f ds4-tile-harness
 
 .PHONY: all clean
+
+fp4-oracle: fp4_oracle.cpp
+	g++ -O2 -march=native -fopenmp -o $@ fp4_oracle.cpp
+
