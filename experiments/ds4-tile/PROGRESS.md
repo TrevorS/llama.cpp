@@ -578,3 +578,24 @@ Gates:
 A2 next increments: (1) fp4 mma score kernel (quarter K smem; interleaved-
 nibble + e8m0 packing per quantize_mmq_mxfp4; still L1-bound so real headroom);
 (2) dedicated nt=1 decode score kernel (kill the 15/16 tile-padding waste).
+
+## Iteration 15 — int4 score kernel NEGATIVE RESULT; fp4-mma not worth it
+
+Probed a 4-bit-K-in-smem dp4a kernel (LLAMA_DSV4_LID_INT4): K stored 8KB (vs
+int8 16KB), unsigned-nibble + bias-correction (sum(q*k) = dp4a(q,k+8) - 8*qsum),
+spread nibbles -> int8x4 for dp4a. Two packings tried:
+- uint16 reads (4 dims/read): 47.0ms
+- uint32 reads (8 dims/read, halved read count): 45.6ms
+Both ~1.6x SLOWER than int8 (28.1ms) and slower than wmma (35.0ms). Since int4
+moves HALF the K bytes yet runs slower, it is compute-bound on the nibble
+UNPACK (spread ~10 ALU ops x 32/dot x 8 comps x 64 heads). dp4a needs int8
+operands, so any sub-8-bit storage pays an unpack tax that exceeds the L1
+saving. Accuracy also coarse (~7% set-mismatch, like fp4).
+
+=> The only unpack-free 4-bit path is the native block-scaled fp4 MMA (reads
+e2m1 straight into tensor cores via ldmatrix). But ncu (14c) showed compute is
+IDLE and the bound is L1 — freeing the mma doesn't help, and ldmatrix reads are
+word-granular so the 4-bit L1 saving is not guaranteed. Verdict: fp4 mma is NOT
+worth the high-risk packing effort; int8 dp4a is the score-kernel sweet spot.
+int4 code reverted (kept only as this documented negative result).
+Reallocating the fp4-mma budget to the decode kernel + B2 (higher value).
