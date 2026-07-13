@@ -5842,6 +5842,54 @@ struct test_dsv4_lid_topk : public test_case {
     }
 };
 
+// GGML_OP_DSV4_LID_UNION / GGML_OP_DSV4_LID_MEMB
+struct test_dsv4_lid_union : public test_case {
+    const int64_t n_top_k, nt_s, n_stream, n_csa, u_max;
+    const bool memb; // false: test union_idx; true: test membership mask
+
+    std::string op_desc(ggml_tensor *) override { return memb ? "DSV4_LID_MEMB" : "DSV4_LID_UNION"; }
+    std::string vars() override {
+        return "n_top_k=" + std::to_string(n_top_k) + ",nt_s=" + std::to_string(nt_s) +
+               ",n_stream=" + std::to_string(n_stream) + ",n_csa=" + std::to_string(n_csa) +
+               ",u_max=" + std::to_string(u_max) + ",memb=" + std::to_string(memb);
+    }
+    test_dsv4_lid_union(int64_t n_top_k, int64_t nt_s, int64_t n_stream, int64_t n_csa, int64_t u_max, bool memb)
+        : n_top_k(n_top_k), nt_s(nt_s), n_stream(n_stream), n_csa(n_csa), u_max(u_max), memb(memb) {}
+
+    // both ops are exact vs the CPU reference (deterministic union order); -inf
+    // in the membership mask must compare equal.
+    double max_err(ggml_backend_t) override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        double maxd = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            const bool ia = std::isinf(a[i]) && a[i] < 0, ib = std::isinf(b[i]) && b[i] < 0;
+            if (ia && ib) continue;
+            maxd = std::max(maxd, (double) std::fabs(a[i] - b[i]));
+        }
+        return maxd;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nt_s, 1, n_stream);
+        ggml_set_name(top_k, "top_k");
+        ggml_tensor * uni = ggml_dsv4_lid_union(ctx, top_k, n_csa, u_max);
+        ggml_set_name(uni, "uni");
+        ggml_tensor * out = memb ? ggml_dsv4_lid_memb(ctx, top_k, uni, n_csa) : uni;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && !ggml_is_view_op(t->op) && t->op == GGML_OP_NONE) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) v = rand() % n_csa;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9325,6 +9373,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // wmma: n_stream = 2, per-stream launch
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 1, 512));  // decode kernel: d_idx=128, nt_s=1
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512));  // decode kernel: nt_s=1, n_stream=2
+
+    // B2 union + membership (top_k -> union_idx / membership mask)
+    for (bool memb : { false, true }) {
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  8192, 4096, memb)); // realistic: union < u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  4096, 2048, memb)); // overflow: union may exceed u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  1, 1,  8192, 2048, memb)); // decode-like: nt_s=1
+        test_cases.emplace_back(new test_dsv4_lid_union(256,  8, 2,  3000, 1500, memb)); // n_stream=2, odd n_csa
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1, 32768, 2048, memb)); // deep: n_csa=32768
+    }
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     for (int n = 1; n < 5; ++n) {

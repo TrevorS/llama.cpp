@@ -2227,6 +2227,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_LID_TOPK:
             ggml_cuda_op_dsv4_lid_topk(ctx, dst);
             break;
+        case GGML_OP_DSV4_LID_UNION:
+            ggml_cuda_op_dsv4_lid_union(ctx, dst);
+            break;
+        case GGML_OP_DSV4_LID_MEMB:
+            ggml_cuda_op_dsv4_lid_memb(ctx, dst);
+            break;
         case GGML_OP_DSV4_MOE_GATE_UP:
             ggml_cuda_op_dsv4_moe_gate_up(ctx, dst);
             break;
@@ -4958,6 +4964,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_LID_TOPK:
             return (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    op->ne[0] <= (int64_t) DSV4_TOPK_SORT_N;
+        case GGML_OP_DSV4_LID_UNION:
+        case GGML_OP_DSV4_LID_MEMB:
+            return true;
         case GGML_OP_DSV4_MOE_GATE_UP:
             return op->src[0]->type == GGML_TYPE_IQ2_XXS &&
                    op->src[1]->type == GGML_TYPE_IQ2_XXS &&

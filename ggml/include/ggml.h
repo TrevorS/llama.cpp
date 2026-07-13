@@ -588,6 +588,8 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_DSV4_LID_TOPK,
+        GGML_OP_DSV4_LID_UNION,
+        GGML_OP_DSV4_LID_MEMB,
         GGML_OP_DSV4_MOE_GATE_UP,
         GGML_OP_DSV4_HC_FUSED,
 
@@ -2413,6 +2415,30 @@ extern "C" {
             struct ggml_tensor  * weights,
             struct ggml_tensor  * mask,
             int                   n_top_k);
+
+    // DeepSeek-V4 B2 sparse-CSA: per-call (nt_s tokens = one union tile) union of
+    // the tokens' top-k CSA selections, so main attention runs over the compact
+    // union instead of the full n_csa.
+    //   top_k : [n_top_k, nt_s, 1, n_stream] I32 (from ggml_dsv4_lid_topk)
+    // union : [u_max, 1, 1, n_stream] I32 — sorted unique union per stream,
+    //         padded with (n_csa-1). u_max caps the union (overflow drops the
+    //         highest-index cells; size it >= expected union).
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_union(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            int                   n_csa,
+            int                   u_max);
+
+    // Membership mask for the union: memb[u, t] = 0 if token t selected
+    // union[u], -INFINITY otherwise (and -INFINITY for padded union slots).
+    //   top_k : [n_top_k, nt_s, 1, n_stream] I32
+    //   uni   : [u_max, 1, 1, n_stream]      I32 (from ggml_dsv4_lid_union)
+    // out : [u_max, nt_s, 1, n_stream] F32
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_memb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * uni,
+            int                   n_csa);
 
     // DeepSeek-V4 MoE prefill gate+up+activation fusion (IQ2_XXS experts).
     //   gate, up : [n_embd, n_ff, n_expert]        IQ2_XXS expert weights

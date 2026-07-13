@@ -434,6 +434,117 @@ static __global__ void dsv4_score_decode_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// B2 union + membership (one block per stream, smem bitmap over n_csa)
+// ---------------------------------------------------------------------------
+
+static __global__ void dsv4_union_kernel(
+        int32_t * __restrict__ out, const int32_t * __restrict__ top_k,
+        int64_t nb1_tk, int64_t nb3_tk, int64_t nb3_out,
+        int n_top_k, int nt_s, int n_csa, int u_max) {
+    const int s = blockIdx.x;
+    extern __shared__ uint32_t bm[];
+    const int n_words = (n_csa + 31) / 32;
+    for (int i = threadIdx.x; i < n_words; i += blockDim.x) bm[i] = 0;
+    __syncthreads();
+    const int total = n_top_k * nt_s;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int t = idx / n_top_k, i = idx % n_top_k;
+        const int c = top_k[(int64_t) i + t * nb1_tk + (int64_t) s * nb3_tk];
+        if (c >= 0 && c < n_csa) atomicOr(&bm[c >> 5], 1u << (c & 31));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int32_t * o = out + (int64_t) s * nb3_out;
+        int pos = 0;
+        for (int w = 0; w < n_words && pos < u_max; w++) {
+            uint32_t word = bm[w];
+            while (word && pos < u_max) {
+                const int b = __ffs(word) - 1;
+                o[pos++] = w * 32 + b;
+                word &= word - 1;
+            }
+        }
+        for (; pos < u_max; pos++) o[pos] = n_csa - 1;
+    }
+}
+
+static __global__ void dsv4_memb_kernel(
+        float * __restrict__ memb, const int32_t * __restrict__ top_k,
+        int64_t nb1_tk, int64_t nb3_tk, int64_t nb1_m, int64_t nb3_m,
+        int n_top_k, int nt_s, int n_csa, int u_max) {
+    const int s = blockIdx.x;
+    const int n_words = (n_csa + 31) / 32;
+    extern __shared__ uint32_t smem_mb[];
+    uint32_t * bm   = smem_mb;              // [n_words]
+    uint32_t * pref = smem_mb + n_words;    // [n_words] exclusive prefix popcount
+    for (int i = threadIdx.x; i < n_words; i += blockDim.x) bm[i] = 0;
+    __syncthreads();
+    const int total = n_top_k * nt_s;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int t = idx / n_top_k, i = idx % n_top_k;
+        const int c = top_k[(int64_t) i + t * nb1_tk + (int64_t) s * nb3_tk];
+        if (c >= 0 && c < n_csa) atomicOr(&bm[c >> 5], 1u << (c & 31));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int w = 0; w < n_words; w++) { pref[w] = acc; acc += __popc(bm[w]); }
+    }
+    __syncthreads();
+    // init -inf
+    for (int idx = threadIdx.x; idx < u_max * nt_s; idx += blockDim.x) {
+        const int u = idx % u_max, t = idx / u_max;
+        memb[(int64_t) u + t * nb1_m + (int64_t) s * nb3_m] = -INFINITY;
+    }
+    __syncthreads();
+    // set 0 for selected cells at their union rank
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int t = idx / n_top_k, i = idx % n_top_k;
+        const int c = top_k[(int64_t) i + t * nb1_tk + (int64_t) s * nb3_tk];
+        if (c >= 0 && c < n_csa) {
+            const int w = c >> 5, bit = c & 31;
+            const int u = pref[w] + __popc(bm[w] & ((1u << bit) - 1u));
+            if (u < u_max) memb[(int64_t) u + t * nb1_m + (int64_t) s * nb3_m] = 0.0f;
+        }
+    }
+}
+
+void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    const int n_csa   = ggml_get_op_params_i32(dst, 0);
+    const int u_max   = dst->ne[0];
+    const int n_top_k = top_k->ne[0];
+    const int nt_s    = top_k->ne[1];
+    const int n_stream = top_k->ne[3];
+    const int64_t nb1_tk  = top_k->nb[1] / sizeof(int32_t);
+    const int64_t nb3_tk  = top_k->nb[3] / sizeof(int32_t);
+    const int64_t nb3_out = dst->nb[3] / sizeof(int32_t);
+    const size_t smem = (size_t) ((n_csa + 31) / 32) * sizeof(uint32_t);
+    dsv4_union_kernel<<<n_stream, 256, smem, ctx.stream()>>>(
+        (int32_t *) dst->data, (const int32_t *) top_k->data,
+        nb1_tk, nb3_tk, nb3_out, n_top_k, nt_s, n_csa, u_max);
+}
+
+void ggml_cuda_op_dsv4_lid_memb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    const int n_csa   = ggml_get_op_params_i32(dst, 0);
+    const int u_max   = dst->ne[0];
+    const int nt_s    = dst->ne[1];
+    const int n_stream = dst->ne[3];
+    const int n_top_k = top_k->ne[0];
+    const int64_t nb1_tk = top_k->nb[1] / sizeof(int32_t);
+    const int64_t nb3_tk = top_k->nb[3] / sizeof(int32_t);
+    const int64_t nb1_m  = dst->nb[1] / sizeof(float);
+    const int64_t nb3_m  = dst->nb[3] / sizeof(float);
+    const size_t smem = (size_t) 2 * ((n_csa + 31) / 32) * sizeof(uint32_t);
+    dsv4_memb_kernel<<<n_stream, 256, smem, ctx.stream()>>>(
+        (float *) dst->data, (const int32_t *) top_k->data,
+        nb1_tk, nb3_tk, nb1_m, nb3_m, n_top_k, nt_s, n_csa, u_max);
+}
+
+// ---------------------------------------------------------------------------
 // top-k (bitonic, descending, lower-index tie-break) — ported from ds4_cuda.cu
 // ---------------------------------------------------------------------------
 

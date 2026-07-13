@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <set>
 
 // ggml_compute_forward_dup
 
@@ -8462,6 +8463,72 @@ void ggml_compute_forward_dsv4_lid_topk(
         int32_t * dst_row = (int32_t *)((char *) dst->data + t_local*dst->nb[1] + s*dst->nb[3]);
         for (int64_t kk = 0; kk < n_top_k; kk++) {
             dst_row[kk] = order[kk];
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_lid_union
+
+void ggml_compute_forward_dsv4_lid_union(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+    const ggml_tensor * top_k = dst->src[0]; // [n_top_k, nt_s, 1, n_stream] I32
+
+    const int32_t n_csa = ggml_get_op_params_i32(dst, 0);
+    const int64_t u_max = dst->ne[0];
+    const int64_t n_top_k = top_k->ne[0];
+    const int64_t nt_s    = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+
+    for (int64_t s = 0; s < n_stream; s++) {
+        std::set<int32_t> uni;
+        for (int64_t t = 0; t < nt_s; t++) {
+            const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+            for (int64_t i = 0; i < n_top_k; i++) {
+                const int32_t c = tk[i];
+                if (c >= 0 && c < n_csa) uni.insert(c);
+            }
+        }
+        int32_t * out = (int32_t *)((char *) dst->data + s*dst->nb[3]);
+        int64_t pos = 0;
+        for (int32_t c : uni) { if (pos >= u_max) break; out[pos++] = c; }
+        for (; pos < u_max; pos++) out[pos] = n_csa - 1; // padding (gather-safe)
+    }
+}
+
+// ggml_compute_forward_dsv4_lid_memb
+
+void ggml_compute_forward_dsv4_lid_memb(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+    const ggml_tensor * top_k = dst->src[0]; // [n_top_k, nt_s, 1, n_stream] I32
+    const ggml_tensor * uni   = dst->src[1]; // [u_max, 1, 1, n_stream] I32
+
+    const int32_t n_csa   = ggml_get_op_params_i32(dst, 0);
+    const int64_t u_max   = dst->ne[0];
+    const int64_t nt_s    = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_top_k = top_k->ne[0];
+
+    for (int64_t s = 0; s < n_stream; s++) {
+        // recompute the union count (distinct in-range cells, capped at u_max)
+        std::set<int32_t> u;
+        for (int64_t t = 0; t < nt_s; t++) {
+            const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+            for (int64_t i = 0; i < n_top_k; i++) { const int32_t c = tk[i]; if (c >= 0 && c < n_csa) u.insert(c); }
+        }
+        const int64_t cnt = (int64_t) u.size() < u_max ? (int64_t) u.size() : u_max;
+        const int32_t * uidx = (const int32_t *)((const char *) uni->data + s*uni->nb[3]);
+        for (int64_t t = 0; t < nt_s; t++) {
+            const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+            std::set<int32_t> sel;
+            for (int64_t i = 0; i < n_top_k; i++) { const int32_t c = tk[i]; if (c >= 0 && c < n_csa) sel.insert(c); }
+            float * mrow = (float *)((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
+            for (int64_t uu = 0; uu < u_max; uu++) {
+                mrow[uu] = (uu < cnt && sel.count(uidx[uu])) ? 0.0f : -INFINITY;
+            }
         }
     }
 }

@@ -1097,11 +1097,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "DSV4_LID_TOPK",
+    "DSV4_LID_UNION",
+    "DSV4_LID_MEMB",
     "DSV4_MOE_GATE_UP",
     "DSV4_HC_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,11 +1215,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "dsv4_lid_topk(q,k,w,mask)",
+    "dsv4_lid_union(top_k)",
+    "dsv4_lid_memb(top_k,uni)",
     "dsv4_moe_gate_up(gate,up,x,ids)",
     "dsv4_hc_fused(x,a,b,c)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5405,6 +5409,56 @@ struct ggml_tensor * ggml_dsv4_lid_topk(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsv4_lid_union
+
+struct ggml_tensor * ggml_dsv4_lid_union(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        int                   n_csa,
+        int                   u_max) {
+    GGML_ASSERT(top_k);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_max > 0 && n_csa > 0);
+
+    const int64_t n_stream = top_k->ne[3];
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u_max, 1, 1, n_stream);
+    ggml_set_op_params_i32(result, 0, (int32_t) n_csa);
+    ggml_set_op_params_i32(result, 1, (int32_t) u_max);
+
+    result->op     = GGML_OP_DSV4_LID_UNION;
+    result->src[0] = top_k;
+
+    return result;
+}
+
+// ggml_dsv4_lid_memb
+
+struct ggml_tensor * ggml_dsv4_lid_memb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * uni,
+        int                   n_csa) {
+    GGML_ASSERT(top_k && uni);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(uni->type   == GGML_TYPE_I32);
+
+    const int64_t nt_s     = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+    const int64_t u_max    = uni->ne[0];
+
+    GGML_ASSERT(uni->ne[3] == n_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, u_max, nt_s, 1, n_stream);
+    ggml_set_op_params_i32(result, 0, (int32_t) n_csa);
+
+    result->op     = GGML_OP_DSV4_LID_MEMB;
+    result->src[0] = top_k;
+    result->src[1] = uni;
 
     return result;
 }
