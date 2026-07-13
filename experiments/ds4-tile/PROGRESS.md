@@ -494,3 +494,31 @@ Gates:
 VERDICT: fp4 indexer is quality-safe (model is QAT'd for it). A2 (real
 block-scaled fp4 mma score kernel, the actual ~2-4x speedup) is GREEN-LIT.
 A1 stays in tree env-gated off as the numerics scaffold + accuracy harness.
+
+## Iteration 14b — B1 decode-side gathered CSA attention (env-gated)
+
+LLAMA_DSV4_CSA_GATHER=1 (deepseek4.cpp build_csa_lid_attention): for nt_s==1
+(decode) and n_csa>n_top_k, replace the dense [n_csa] top-k mask + FA-over-all-
+CSA with a ggml_get_rows gather of the n_top_k selected CSA rows, then FA over
+just those + the raw window. Per-stream batched gather (a=[hd,n_csa,n_stream,1]
+indexed by top_k=[n_top_k,n_stream,1,1]); gathered K cast to raw_k type; zero
+mask for the selected block (valid by construction at depth). Prefill (nt_s>1)
+keeps the mask path — per-token index divergence within a tile needs the union
+path (B2, deferred).
+
+Gates:
+- Builds clean; decode greedy A/B (gather off vs on, ~16k depth): first ~25
+  tokens BIT-IDENTICAL, then fp16 FA reassociation drift (gather does FA over
+  n_top_k+window tiles vs mask path's ~4700 — same selected set + softmax
+  denominator, different accumulation order). Wrong-cell bug would flip token
+  #1, not #26 -> gather is correct; drift is benign fp non-assoc (same class
+  as HC-fused / fp4). NOTE: PPL can't test this path (PPL is all nt>1 = mask
+  path); generation-based validation only.
+- tg64 @ d32768: 12.32 -> 13.17 (+6.9%, r=2). Win is CAPPED because gather
+  only fixes CSA FA, not the decode indexer score (16.5ms/tok @d131k, that's
+  A2). d131072 gather-on leg OOM'd mid-fill (earlyoom) before recording; off
+  leg = 9.40. Re-measure deeper win at a conservative depth (d65536) later.
+
+CAUTION: d131k tg bench (131072-ctx KV alloc) triggered earlyoom this session.
+Keep depth benches <= d65536 unless watching free mem; matches
+gb10-session-crash-causes (never provoke earlyoom).

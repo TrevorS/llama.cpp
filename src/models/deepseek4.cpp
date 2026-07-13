@@ -772,13 +772,53 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
-
+    // Decode-side gathered sparse attention (LLAMA_DSV4_CSA_GATHER): instead of
+    // a dense [n_csa] top-k mask + FA over all CSA cells, gather the n_top_k
+    // selected CSA rows and attend only those + the raw window. Depth-flat CSA
+    // attention (cost ~ n_top_k, not n_csa). Only for nt_s==1 (one query per
+    // stream) — per-token index divergence within a tile needs the union path.
+    static const bool dsv4_csa_gather = []() {
+        const char * e = getenv("LLAMA_DSV4_CSA_GATHER");
+        return e && e[0] == '1';
+    }();
+    const int64_t nt_s     = top_k->ne[1];
+    const int64_t n_top_k  = top_k->ne[0];
+    const int64_t n_stream = top_k->ne[3];
+    ggml_tensor * k_all;
+    ggml_tensor * kq_mask;
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    if (dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
+        // present csa_k [hd,1,n_csa,n_stream] as [hd, n_csa, n_stream, 1] and
+        // the indices [n_top_k,1,1,n_stream] as [n_top_k, n_stream, 1, 1].
+        ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
+                csa_k->ne[0], n_csa, n_stream, 1,
+                csa_k->nb[2], csa_k->nb[3], csa_k->nb[3]*n_stream, 0);
+        ggml_tensor * idx = ggml_view_4d(ctx0, top_k,
+                n_top_k, n_stream, 1, 1,
+                top_k->nb[3], top_k->nb[3]*n_stream, top_k->nb[3]*n_stream, 0);
+        ggml_tensor * gathered = ggml_get_rows(ctx0, csa_src, idx); // [hd, n_top_k, n_stream, 1] f32
+        if (gathered->type != raw_k->type) {
+            gathered = ggml_cast(ctx0, gathered, raw_k->type);
+        }
+        gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, n_top_k, n_stream);
+        cb(gathered, "csa_gathered_k", il);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+        k_all = ggml_concat(ctx0, raw_k, gathered, 2);
+
+        // selected cells are valid by construction (invalid cells have -inf
+        // score and are never in the top-k at depth) -> zero mask for the
+        // gathered block.
+        ggml_tensor * csa_mask = ggml_new_tensor_4d(ctx0, raw_mask->type,
+                n_top_k, raw_mask->ne[1], raw_mask->ne[2], raw_mask->ne[3]);
+        csa_mask = ggml_fill(ctx0, csa_mask, 0.0f);
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    } else {
+        k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    }
+    cb(k_all, "csa_k_all", il);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
