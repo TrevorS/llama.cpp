@@ -522,3 +522,9 @@ Gates:
 CAUTION: d131k tg bench (131072-ctx KV alloc) triggered earlyoom this session.
 Keep depth benches <= d65536 unless watching free mem; matches
 gb10-session-crash-causes (never provoke earlyoom).
+
+### B1 depth trend confirmed (d65536, conservative depth, no OOM)
+    tg64 gather off/on:  d32768 12.32->13.17 (+6.9%)   d65536 10.78->11.67 (+8.3%)
+Win GROWS with depth (dense CSA FA scan scales linearly; gather pinned at
+n_top_k=512) -> confirms depth-independence. d131k+ win larger but capped by
+the decode indexer score kernel (A2). 101G free throughout the d65536 pair.
