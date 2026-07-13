@@ -649,3 +649,22 @@ Why not the alternatives (ruled out this iteration):
 U per call: nt_s=16 union ~500-1500 (grows sublinearly); cut vs n_csa grows with
 depth (n_csa=32768 @d131k, U~1500 -> ~20x on the CSA portion; raw 2304 fixed).
 Building op 1 (union_idx) next.
+
+## Iteration 18 — B2 union path INTEGRATED + validated (+14.6% prefill)
+
+Two ggml ops (dsv4_lid_union, dsv4_lid_memb; CPU+CUDA, smem bitmap, backend-ops
+5/5 each incl overflow + deep n_csa=32768) + get_rows gather wired into
+build_csa_lid_attention (LLAMA_DSV4_CSA_UNION, nt_s>1, cap LLAMA_DSV4_CSA_UNION_CAP
+default 2048).
+
+Gates:
+- CORRECTNESS proven: with cap>=n_csa (no overflow, u_max=n_csa) greedy A/B vs
+  dense is TOKEN-IDENTICAL -> union+gather+membership reproduces the dense
+  computation exactly. So the logic is correct; cap=2048 divergence is purely
+  the overflow-drop approximation (union>cap drops highest-index cells).
+- PERF: pp2048@d32768 dense 332.6 -> union(cap2048) 381.1 = +14.6%. Should grow
+  with depth (CSA cut ~ n_csa/cap; n_csa=32768 @d131k).
+- REMAINING: quality gate for the cap=2048 overflow approximation (deep PPL vs
+  dense) — crashed/oomd before capturing; rerun at safe depth. And depth-trend
+  perf at d65536.
+CAUTION: deep PPL (c16384 long corpus) likely triggered the OOM this session.

@@ -784,10 +784,45 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     const int64_t nt_s     = top_k->ne[1];
     const int64_t n_top_k  = top_k->ne[0];
     const int64_t n_stream = top_k->ne[3];
+    // B2 prefill union gather (LLAMA_DSV4_CSA_UNION): per call (nt_s tokens = one
+    // union tile), gather the union of the tokens' top-k CSA cells and attend
+    // only those + raw window, with a per-token membership mask. Cap u_max
+    // (default 2048; overflow drops highest-index cells) via LLAMA_DSV4_CSA_UNION_CAP.
+    static const bool dsv4_csa_union = []() {
+        const char * e = getenv("LLAMA_DSV4_CSA_UNION");
+        return e && e[0] == '1';
+    }();
+    static const int64_t dsv4_union_cap = []() {
+        const char * e = getenv("LLAMA_DSV4_CSA_UNION_CAP");
+        return e ? atoll(e) : (long long) 2048;
+    }();
     ggml_tensor * k_all;
     ggml_tensor * kq_mask;
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    if (dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
+    if (dsv4_csa_union && nt_s > 1 && n_csa > dsv4_union_cap) {
+        const int64_t u_max = dsv4_union_cap < n_csa ? dsv4_union_cap : n_csa;
+        ggml_tensor * uni = ggml_dsv4_lid_union(ctx0, top_k, n_csa, u_max); // [u_max,1,1,n_stream]
+        cb(uni, "csa_union_idx", il);
+
+        ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
+                csa_k->ne[0], n_csa, n_stream, 1,
+                csa_k->nb[2], csa_k->nb[3], csa_k->nb[3]*n_stream, 0);
+        ggml_tensor * uidx = ggml_reshape_4d(ctx0, uni, u_max, n_stream, 1, 1);
+        ggml_tensor * gathered = ggml_get_rows(ctx0, csa_src, uidx); // [hd, u_max, n_stream, 1]
+        if (gathered->type != raw_k->type) {
+            gathered = ggml_cast(ctx0, gathered, raw_k->type);
+        }
+        gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, u_max, n_stream);
+        cb(gathered, "csa_union_k", il);
+
+        k_all = ggml_concat(ctx0, raw_k, gathered, 2);
+
+        ggml_tensor * memb = ggml_dsv4_lid_memb(ctx0, top_k, uni, n_csa); // [u_max,nt_s,1,n_stream] f32
+        if (memb->type != raw_mask->type) {
+            memb = ggml_cast(ctx0, memb, raw_mask->type);
+        }
+        kq_mask = ggml_concat(ctx0, raw_mask, memb, 0);
+    } else if (dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
         // present csa_k [hd,1,n_csa,n_stream] as [hd, n_csa, n_stream, 1] and
         // the indices [n_top_k,1,1,n_stream] as [n_top_k, n_stream, 1, 1].
         ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
