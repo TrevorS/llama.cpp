@@ -235,7 +235,7 @@ int main(int argc, char ** argv) {
                                w.data() + (size_t) t * n_head, ka.data(), n_lid, n_head, s.data());
                     top_k_set(s.data(), n_lid, kk, sel[t]);
                 }
-                for (int W : {8, 16, 32, 64}) {
+                for (int W : {8, 16, 32, 64, 128, 256}) {
                     if (W > nt) continue;
                     double usum = 0; int umax = 0, ntiles = 0;
                     std::vector<char> seen(n_lid);
