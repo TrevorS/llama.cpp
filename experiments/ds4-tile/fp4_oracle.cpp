@@ -222,6 +222,34 @@ int main(int argc, char ** argv) {
             const int low = (int) std::count_if(ovl.begin(), ovl.end(), [](double o) { return o < 0.98; });
             printf("%-8d %-6d %-10.4f %-10.4f %-10.4f %d/%d\n",
                    n_lid, seed, mean, ovl.front(), ovl[(size_t) (0.01 * nt)], low, nt);
+
+            // Q-tile union stats (gathered sparse FA design input): for a tile
+            // of W consecutive queries, the gathered-KV length is the union of
+            // their top-k selections. Reported as mean/max over tiles.
+            {
+                std::vector<std::vector<int>> sel(nt);
+                #pragma omp parallel for schedule(dynamic)
+                for (int t = 0; t < nt; t++) {
+                    std::vector<float> s(n_lid);
+                    scores_row(qa.data() + (size_t) t * n_head * D_IDX,
+                               w.data() + (size_t) t * n_head, ka.data(), n_lid, n_head, s.data());
+                    top_k_set(s.data(), n_lid, kk, sel[t]);
+                }
+                for (int W : {8, 16, 32, 64}) {
+                    if (W > nt) continue;
+                    double usum = 0; int umax = 0, ntiles = 0;
+                    std::vector<char> seen(n_lid);
+                    for (int t0 = 0; t0 + W <= nt; t0 += W, ntiles++) {
+                        std::fill(seen.begin(), seen.end(), 0);
+                        int u = 0;
+                        for (int t = t0; t < t0 + W; t++)
+                            for (int j : sel[t]) u += !seen[j] ? (seen[j] = 1) : 0;
+                        usum += u; umax = std::max(umax, u);
+                    }
+                    printf("    union W=%-3d mean=%7.1f max=%d  (dense=%d, cut=%.1fx)\n",
+                           W, usum / ntiles, umax, n_lid, n_lid / (usum / ntiles));
+                }
+            }
         }
     }
     return 0;

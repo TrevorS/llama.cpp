@@ -32,6 +32,52 @@
 static __device__ __forceinline__ float dsv4_ldk(const float * p) { return *p; }
 static __device__ __forceinline__ float dsv4_ldk(const half  * p) { return __half2float(*p); }
 
+// ---------------------------------------------------------------------------
+// fp4 QAT fake-quant (LLAMA_DSV4_LID_FP4) — e2m1 block-32 round trip matching
+// ds4.c dsv4_fp4_act_quantize_row_inplace_cpu. The indexer q/k arrive already
+// hadamard-rotated (deepseek4.cpp), so we apply the e2m1 simulation only. This
+// is the model's official (QAT) indexer numeric; the CPU reference in
+// ggml-cpu/ops.cpp mirrors it under the same env gate.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float dsv4_e2m1_dequant(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax   = fminf(fabsf(x), 6.0f);
+    const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    int   best = 0;
+    float bd   = fabsf(ax - lv[0]);
+#pragma unroll
+    for (int i = 1; i < 8; i++) {
+        const float d = fabsf(ax - lv[i]);
+        // nearest, even-index tie-break (matches ds4.c device dequant)
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) { best = i; bd = d; }
+    }
+    return sign * lv[best];
+}
+
+// One block per d_idx-wide row (blockDim.x == d_idx, a multiple of 32); each
+// thread owns one component, block-32 amax via warp shuffle. Writes a
+// contiguous f32 [d_idx, n_rows] fake-quantized copy.
+template <typename KT>
+static __global__ void dsv4_fp4_quant_kernel(
+        float * __restrict__ out, const KT * __restrict__ in,
+        int64_t row_stride0, int64_t row_stride1, int rows_per_group, int d_idx) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int64_t g = row / rows_per_group;
+    const int64_t r = row % rows_per_group;
+    const KT * ir = in + g * row_stride1 + r * row_stride0;
+    float v = dsv4_ldk(ir + tid);
+    float a = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    a = fmaxf(a, 7.052966104933725e-38f);
+    const float scale = exp2f(ceilf(log2f(a / 6.0f)));
+    const float q = fminf(6.0f, fmaxf(-6.0f, v / scale));
+    out[(int64_t) row * d_idx + tid] = dsv4_e2m1_dequant(q) * scale;
+}
+
 template <typename KT>
 static __global__ void dsv4_score_kernel(
         float       * __restrict__ scores,   // [nt, n_lid]
@@ -447,14 +493,50 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     ggml_cuda_pool_alloc<float> scores_alloc(pool, (size_t) nt * n_lid);
     float * scores = scores_alloc.get();
 
-    const int64_t nbk2 = k->nb[2] / ggml_type_size(k->type);
-    const int64_t nbk3 = k->nb[3] / ggml_type_size(k->type);
+    int64_t nbk2 = k->nb[2] / ggml_type_size(k->type);
+    int64_t nbk3 = k->nb[3] / ggml_type_size(k->type);
     const int64_t nbm1 = mask->nb[1] / sizeof(float);
     const int64_t nbm3 = mask->nb[3] / sizeof(float);
 
     const float * q_d = (const float *) q->data;
     const float * w_d = (const float *) weights->data;
     const float * m_d = (const float *) mask->data;
+
+    // fp4 QAT path (LLAMA_DSV4_LID_FP4): fake-quant q and k to e2m1 before
+    // scoring. Both become contiguous f32; k is copied out of its strided cache
+    // view into a dense [d_idx, n_lid, n_stream] buffer, so downstream always
+    // takes the float dispatch. Numerics-only (no speedup) — validates the
+    // device e2m1 path against the CPU reference and the resident model.
+    static const bool dsv4_lid_fp4 = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_FP4");
+        return e && e[0] == '1';
+    }();
+    ggml_cuda_pool_alloc<float> q_fp4_alloc(pool);
+    ggml_cuda_pool_alloc<float> k_fp4_alloc(pool);
+    bool k_force_f32 = false;
+    GGML_ASSERT(!dsv4_lid_fp4 || d_idx % 32 == 0);
+    if (dsv4_lid_fp4) {
+        float * q_fp4 = q_fp4_alloc.alloc((size_t) nt * n_head * d_idx);
+        float * k_fp4 = k_fp4_alloc.alloc((size_t) n_stream * n_lid * d_idx);
+        // q: contiguous [d_idx, n_head, nt] -> rows_per_group = n_head*nt,
+        // one flat group, row_stride0 = d_idx.
+        dsv4_fp4_quant_kernel<float><<<n_head * nt, d_idx, 0, stream>>>(
+                q_fp4, q_d, d_idx, 0, n_head * nt, d_idx);
+        // k: strided view, group = stream (stride nbk3), row = j (stride nbk2).
+        if (k->type == GGML_TYPE_F16) {
+            dsv4_fp4_quant_kernel<half><<<n_stream * n_lid, d_idx, 0, stream>>>(
+                    k_fp4, (const half *) k->data, nbk2, nbk3, n_lid, d_idx);
+        } else {
+            dsv4_fp4_quant_kernel<float><<<n_stream * n_lid, d_idx, 0, stream>>>(
+                    k_fp4, (const float *) k->data, nbk2, nbk3, n_lid, d_idx);
+        }
+        q_d = q_fp4;
+        k_force_f32 = true;
+        nbk2 = d_idx;
+        nbk3 = (int64_t) d_idx * n_lid;
+    }
+    const float * k_f32_d = k_fp4_alloc.get();
+    const bool k_is_f16 = (k->type == GGML_TYPE_F16) && !k_force_f32;
 
     // Tensor-core path: requires head_dim == 128 (the wmma 16x16x16 k-tiling).
     // One launch per CUDA stream-group so a 16-token tile never straddles a
@@ -468,12 +550,12 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             const float * q_s   = q_d + t0 * n_head * d_idx;
             const float * w_s   = w_d + t0 * n_head;
             const float * m_s   = m_d + (int64_t) s * nbm3;
-            if (k->type == GGML_TYPE_F16) {
+            if (k_is_f16) {
                 const half * k_s = (const half *) k->data + (int64_t) s * nbk3;
                 dsv4_score_wmma128_kernel<half><<<grid, block, 0, stream>>>(
                         sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
             } else {
-                const float * k_s = (const float *) k->data + (int64_t) s * nbk3;
+                const float * k_s = (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3;
                 dsv4_score_wmma128_kernel<float><<<grid, block, 0, stream>>>(
                         sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
             }
@@ -483,13 +565,13 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const int block   = 256;
         const size_t smem = ((size_t) d_idx*n_head + n_head) * sizeof(float);
         dim3 grid_score(nt, (n_lid + j_tile - 1) / j_tile, 1);
-        if (k->type == GGML_TYPE_F16) {
+        if (k_is_f16) {
             dsv4_score_kernel<half><<<grid_score, block, smem, stream>>>(
                     scores, q_d, w_d, (const half *) k->data, m_d,
                     nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
         } else {
             dsv4_score_kernel<float><<<grid_score, block, smem, stream>>>(
-                    scores, q_d, w_d, (const float *) k->data, m_d,
+                    scores, q_d, w_d, (k_force_f32 ? k_f32_d : (const float *) k->data), m_d,
                     nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
         }
     }

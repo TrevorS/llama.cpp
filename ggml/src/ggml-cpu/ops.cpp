@@ -8336,6 +8336,36 @@ void ggml_compute_forward_argsort(
 
 // ggml_compute_forward_dsv4_lid_topk
 
+// fp4 QAT fake-quant (LLAMA_DSV4_LID_FP4) — e2m1 block-32 round trip, the CPU
+// mirror of dsv4_fp4_quant_kernel / ds4.c. q and k arrive hadamard-rotated, so
+// only the e2m1 activation simulation is applied.
+static float dsv4_e2m1_dequant_cpu_local(float x) {
+    static const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax   = fminf(fabsf(x), 6.0f);
+    int   best = 0;
+    float bd   = fabsf(ax - lv[0]);
+    for (int i = 1; i < 8; i++) {
+        const float d = fabsf(ax - lv[i]);
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) { best = i; bd = d; }
+    }
+    return sign * lv[best];
+}
+
+static void dsv4_fp4_quant_row_cpu(float * dst, const float * src, int64_t d_idx) {
+    for (int64_t off = 0; off < d_idx; off += 32) {
+        float amax = 0.0f;
+        for (int64_t i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(src[off + i]));
+        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
+        const float scale = ldexpf(1.0f, (int) ceilf(log2f(amax / 6.0f)));
+        for (int64_t i = 0; i < 32; i++) {
+            float v = src[off + i] / scale;
+            v = fminf(6.0f, fmaxf(-6.0f, v));
+            dst[off + i] = dsv4_e2m1_dequant_cpu_local(v) * scale;
+        }
+    }
+}
+
 void ggml_compute_forward_dsv4_lid_topk(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -8360,10 +8390,18 @@ void ggml_compute_forward_dsv4_lid_topk(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    static const bool fp4 = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_FP4");
+        return e && e[0] == '1';
+    }();
+    GGML_ASSERT(!fp4 || d_idx % 32 == 0);
+
     const int64_t nrows = n_stream * nt_s;
 
     std::vector<float>   scores(n_lid);
     std::vector<int32_t> order(n_lid);
+    std::vector<float>   qq(fp4 ? (size_t) n_head * d_idx : 0); // e2m1 q rows
+    std::vector<float>   kq(fp4 ? (size_t) d_idx : 0);          // e2m1 k row
 
     for (int64_t r = ith; r < nrows; r += nth) {
         const int64_t s       = r / nt_s;
@@ -8374,13 +8412,31 @@ void ggml_compute_forward_dsv4_lid_topk(
         const char * w_t = (const char *) weights->data + t*weights->nb[1];
         const char * m_r = (const char *) mask->data     + s*mask->nb[3] + t_local*mask->nb[1];
 
+        if (fp4) {
+            for (int64_t h = 0; h < n_head; h++) {
+                dsv4_fp4_quant_row_cpu(qq.data() + h*d_idx, (const float *)(q_t + h*q->nb[1]), d_idx);
+            }
+        }
+
         for (int64_t j = 0; j < n_lid; j++) {
             const char * k_j = (const char *) k->data + s*k->nb[3] + j*k->nb[2];
+            if (fp4) {
+                float tmp[128];
+                if (k->type == GGML_TYPE_F32) {
+                    for (int64_t d = 0; d < d_idx; d++) tmp[d] = ((const float *) k_j)[d];
+                } else {
+                    for (int64_t d = 0; d < d_idx; d++) tmp[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *) k_j)[d]);
+                }
+                dsv4_fp4_quant_row_cpu(kq.data(), tmp, d_idx);
+            }
             float acc = 0.0f;
             for (int64_t h = 0; h < n_head; h++) {
-                const float * qh = (const float *)(q_t + h*q->nb[1]);
+                const float * qh = fp4 ? (qq.data() + h*d_idx) : (const float *)(q_t + h*q->nb[1]);
                 float dot = 0.0f;
-                if (k->type == GGML_TYPE_F32) {
+                if (fp4) {
+                    const float * kh = kq.data();
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
+                } else if (k->type == GGML_TYPE_F32) {
                     const float * kh = (const float *) k_j;
                     for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
                 } else {

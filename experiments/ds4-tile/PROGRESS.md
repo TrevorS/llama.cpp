@@ -424,3 +424,73 @@ crash. llama-bench iteration-13 legs ran on matched binaries (verified).
   should expect ~0.9 vs fp32 ref (not the 3e-3 wmma near-tie tolerance).
 - Follow-ups: score-mass-weighted overlap metric; real-data capture at
   n_lid ~33k for the depth trend.
+
+## Iteration 14 — dual scout: fp4 score kernel + gathered sparse FA
+
+### Gathered sparse FA (Q-tile union measured on real d~30k dump, n_lid=7680)
+    union W=8   mean 1148  max 1303   cut 6.7x
+    union W=16  mean 1519  max 1729   cut 5.1x
+    union W=32  mean 1975  max 2260   cut 3.9x
+    union W=64  mean 2523  max 2877   cut 3.0x
+Union grows SUBLINEARLY in n_lid (adjacent queries attend overlapping KV) while
+dense = n_lid grows linearly -> the cut ratio IMPROVES with depth. At d131k
+(n_lid=33280) expect ~15-20x for W=8 (needs a deeper dump to confirm; trend
+monotonic). FA is 44.8% of GPU @d131k and it's the depth-scaling half.
+
+Graph today (deepseek4.cpp:779-784): build_top_k_mask scatters -inf/0 into a
+DENSE [n_csa] mask, concat with raw-window mask, build_attn_mha over full
+k_all. FA scans every CSA tile; per-query top-512 sparsity is invisible to it.
+This is the MoBA problem exactly.
+
+Staging:
+- B1 (decode, nt=1, THIS iteration): one query -> gather its 512 CSA rows via
+  ggml_get_rows into a [d,512] tensor, FA over 512 + raw window instead of the
+  dense scan. Pure graph-level (get_rows + smaller build_attn_mha), no kernel.
+  Depth-flat decode CSA attention. ~12ms/token -> <1ms projected.
+- B2 (prefill, follow-on): per-W-tile union gather + membership mask over the
+  ~1148 gathered rows (not 7680). Needs a varlen/segmented FA variant or the
+  MoBA re-param. Bigger; deferred behind B1 + A.
+
+### fp4 score kernel
+CPU ref: ggml-cpu/ops.cpp:8337 (relu-weighted-sum + partial_sort, mirrors CUDA).
+Device e2m1 dequant: ds4_cuda.cu:4589 (dsv4_e2m1fn_dequant_dev) — switch-table,
+even-index tie-break. mma.cuh:1126 mma_block_scaled_fp4 (m16n8k64 e2m1.e2m1,
+ue8m0 for MXFP4 / ue4m3 for NVFP4) is BLACKWELL_MMA_AVAILABLE and sm121a builds.
+
+Staging:
+- A1 (THIS iteration, numerics only, NO speedup): LLAMA_DSV4_LID_FP4=1 applies
+  e2m1 block-32 round-trip to q and k in-op (they arrive already hadamard-
+  rotated at deepseek4.cpp:612, so op does e2m1 ONLY — matches oracle
+  --pre-rotated) before the existing wmma/scalar score kernels. CPU ref mirrors
+  it. Purpose: validate device e2m1 path + set the accuracy bar via greedy A/B
+  + KL on the resident model. Oracle says 0.93 set overlap vs current fp16, and
+  since ds4.c applies the round-trip unconditionally this path is CLOSER to the
+  official graph, not further.
+- A2 (follow-on, the actual speedup): real block-scaled fp4 mma score kernel
+  (e2m1-pack q/k, ue8m0 scales, mma_block_scaled_fp4). ~2-4x on the compute-
+  bound nt=2048 path (34.9ms measured); fp4 K storage also cuts the memory-
+  bound decode path (0.93ms @ 8.7GB/s). Gated on A1 accuracy PASS.
+
+## Iteration 14a — A1 fp4 fake-quant path DONE; accuracy PASS, A2 green-lit
+
+Implemented LLAMA_DSV4_LID_FP4=1: e2m1 block-32 fake-quant of q and k inside
+the fused lid_topk op (dsv4_fp4_quant_kernel + dsv4_e2m1_dequant device funcs;
+CPU mirror dsv4_fp4_quant_row_cpu in ops.cpp). Numerics-only, no speedup.
+
+Gates:
+- test-backend-ops DSV4_LID_TOPK: non-fp4 12/12 OK (no regression); fp4 path
+  (LLAMA_DSV4_LID_FP4=1) all OK — device e2m1 == CPU e2m1 exactly.
+- Shallow PPL (-c 2048): 3.5139 identical both ways — EXPECTED, n_lid<=top_k so
+  selection is a no-op (everything selected); not a real test.
+- Greedy A/B at ~10k depth on an instruction-less doc dump: DIVERGED (English
+  vs Chinese continuation). Knife's-edge ambiguous prompt; first-token flip
+  cascades. Weak signal.
+- DEEP PPL (-c 16384, selection active, n_lid up to 4096 >> top_k 512):
+    fp4 off 2.8744 +/- 0.0316
+    fp4 on  2.8751 +/- 0.0317   delta +0.0007 (+0.024%, ~sigma/45)
+  Statistically identical. 7% of selected tokens differ (0.93 overlap) but
+  they're low-attention-mass -> no quality cost. Confirms the oracle theory.
+
+VERDICT: fp4 indexer is quality-safe (model is QAT'd for it). A2 (real
+block-scaled fp4 mma score kernel, the actual ~2-4x speedup) is GREEN-LIT.
+A1 stays in tree env-gated off as the numerics scaffold + accuracy harness.
