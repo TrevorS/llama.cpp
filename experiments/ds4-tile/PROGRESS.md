@@ -528,3 +528,28 @@ gb10-session-crash-causes (never provoke earlyoom).
 Win GROWS with depth (dense CSA FA scan scales linearly; gather pinned at
 n_top_k=512) -> confirms depth-independence. d131k+ win larger but capped by
 the decode indexer score kernel (A2). 101G free throughout the d65536 pair.
+
+## Iteration 14c — A2 PIVOT: score kernel is L1/smem-bound, not compute-bound
+
+ncu on dsv4_score_wmma128 (perf case nt=2048 n_lid=8704, --replay-mode
+application, no model -> no earlyoom):
+    Memory throughput   81.4%   <- BOUND
+    L1/TEX throughput   80.4%   <- real limiter (smem reads by wmma)
+    Compute (SM)        14.1%   <- mma 86% idle
+    L2                   7.25%  (K reused from L1)
+    Achieved occupancy  32.7%   (smem-limited, ~2 CTA/SM)
+    Duration            29.7ms
+
+=> fp4/int8 ON THE MMA gives ~0 (tensor cores already idle). The lever is
+SMEM DATA WIDTH: storing K in smem as int8/fp4 (8/4-bit vs 16-bit fp16) cuts
+the L1/smem traffic that bounds the kernel AND shrinks smem footprint to raise
+occupancy. The block-scaled fp4/int8 mma is the vehicle (reads narrow data
+straight from smem, no dequant), but the WIN is memory, not throughput.
+
+A2 plan (revised): int8 mma score kernel first (LLAMA_DSV4_LID_INT8) — halves
+K smem width, low risk, standard ggml mma:: tiles, projected ~1.5-1.8x since
+L1 is the bound and K dominates smem (b_sh 128x128 vs a_sh 16x128). fp4 mma
+follow-on doubles the smem win again (~2.5-3x) at the cost of the interleaved-
+nibble + e8m0 packing (quantize_mmq_mxfp4 is the reference). Epilogue is scalar
+(14% compute) so watch it becoming the new bound after the memory fix.
+Earlier "fp4 for tensor throughput" framing was WRONG — corrected here.
