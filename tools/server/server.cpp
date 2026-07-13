@@ -262,6 +262,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+    ctx_http.get ("/slots/saves",              ex_wrapper(routes.get_slots_saves));
+    ctx_http.del ("/slots/saves",              ex_wrapper(routes.del_slots_saves));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
     // resumable streaming, the conversation_id is the session identity end to end. router and

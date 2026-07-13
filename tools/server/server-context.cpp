@@ -19,8 +19,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
+#include <ctime>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -4557,6 +4559,82 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_slots_saves = [this](const server_http_req &) {
+        // filesystem only - no task queue, so it responds while slots are busy and
+        // must not wake a sleeping server (bypass_sleep)
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const int64_t t_now_unix = (int64_t) time(nullptr);
+        const auto    ft_now     = std::filesystem::file_time_type::clock::now();
+
+        json saves = json::array();
+        for (const auto & file : fs_list(params.slot_save_path, false)) {
+            // only expose names that a later ?action=restore would accept
+            if (!fs_validate_filename(file.name)) {
+                continue;
+            }
+            std::error_code ec;
+            const auto ftime = std::filesystem::last_write_time(file.path, ec);
+            if (ec) {
+                continue; // deleted mid-listing
+            }
+            // C++17-portable file_time -> unix seconds via delta from now
+            const int64_t delta = std::chrono::duration_cast<std::chrono::seconds>(ft_now - ftime).count();
+            saves.push_back(json {
+                { "filename",   file.name },
+                { "size_bytes", file.size },
+                { "mtime",      t_now_unix - delta },
+            });
+        }
+
+        // newest first; tie-break on filename so same-second saves order deterministically
+        std::sort(saves.begin(), saves.end(), [](const json & a, const json & b) {
+            const int64_t am = a.at("mtime").get<int64_t>();
+            const int64_t bm = b.at("mtime").get<int64_t>();
+            if (am != bm) {
+                return am > bm;
+            }
+            return a.at("filename").get<std::string>() < b.at("filename").get<std::string>();
+        });
+
+        res->ok(json { { "saves", saves } });
+        return res;
+    };
+
+    this->del_slots_saves = [this](const server_http_req & req) {
+        // filesystem only - see get_slots_saves
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const std::string filename = req.get_param("filename");
+        if (filename.empty() || !fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // same path construction as handle_slots_save/restore (slot_save_path ends with a separator)
+        const std::string filepath = params.slot_save_path + filename;
+        std::error_code ec;
+        if (!std::filesystem::remove(filepath, ec)) {
+            if (ec) {
+                res->error(format_error_response("Failed to delete slot save file: " + ec.message(), ERROR_TYPE_SERVER));
+            } else {
+                res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+            }
+            return res;
+        }
+
+        res->ok(json { { "success", true }, { "filename", filename } });
+        return res;
+    };
+
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.slot_save_path.empty()) {
@@ -5211,6 +5289,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+
+    // distinguish a missing file from a real restore failure up front - the task-level
+    // error lumps both into "no available space in KV cache or invalid slot save file"
+    if (!std::filesystem::is_regular_file(filepath)) {
+        res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+        return res;
+    }
 
     auto & rd = res->rd;
     {
