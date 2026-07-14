@@ -691,3 +691,31 @@ ops remain VALIDATED in isolation (backend-ops 5/5 each, CPU==CUDA incl overflow
 + deep n_csa=32768) and committed. The +14.6% perf datapoint is real but on
 INCORRECT output — do not trust until the integration bug is fixed. Clear repro:
 LLAMA_DSV4_CSA_UNION=1 LLAMA_DSV4_CSA_UNION_FULL=1 greedy A/B vs dense.
+
+## Iteration 18c — B2 debug: bug isolated to CUMULATIVE (single-layer correct)
+
+Extensive bisection of the full-union (u_max=n_csa, no overflow, must==dense)
+garbage. Every component VERIFIED CORRECT:
+- memb values: zeros_tok0/1024/2047 = 512 each (exactly n_top_k). Correct.
+- gather/memb ALIGNMENT: union_idx[rank(c)]==c confirmed on device. Correct.
+- shapes: raw_mask/memb ne match (both [.,nt_s,1,n_stream] F16). Correct.
+RULED OUT: ggml_cast F32->F16 (Mode A + cast still works); base CSA mask (dense
+is coherent WITHOUT the build_top_k_mask base add); FA KV_max opt (disabled,
+still garbage); -inf vs finite -50000 (both garbage); memory corruption (short
+prompt / small n_csa where memb is all-zero is coherent); CUDA graphs (prefill
+doesn't use them).
+
+KEY ISOLATION: union on a SINGLE layer (LLAMA_DSV4_UNION_IL=2 or 4) is COHERENT
+and close to dense. Union on ALL layers -> garbage. So each layer's op is
+correct; the failure is CUMULATIVE across layers. Also: Mode A (compaction +
+ZEROS mask = attend-all-union) works on all layers; only compaction + the
+SPARSE membership mask fails cumulatively. Real correctness structure is sound
+(1-layer ~= dense); the bug is a subtle multi-layer interaction — leading
+theories: (a) peaked-attention numerical drift amplifying across 21 layers
+(reordered union-K vs dense cell-order K), (b) an allocator/compute-buffer
+reuse issue when many union subgraphs coexist. Next: per-layer output diff
+(eval-callback) dense vs union, or compute-sanitizer, to find where NaN first
+appears.
+
+Status: integration kept env-gated OFF (LLAMA_DSV4_CSA_UNION, default off);
+ops validated + committed. Do NOT enable until the cumulative bug is fixed.
