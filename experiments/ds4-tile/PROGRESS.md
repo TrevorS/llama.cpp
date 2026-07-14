@@ -910,3 +910,31 @@ TILE_MIN 12288): IQ3 +12.2% @d65k, +32.1% @d131k, correct-construction.
 REMAINING gates to default-on: passkey-at-depth + PPL (safe ctx), both IQ3.
 NEXT LEVER: fattn small-nb column config (12->41 TFLOPS headroom) -> exact
 u_cap affordable everywhere + bigger wins; then 256k/512k depth points.
+
+## Iteration 19g — PPL gate PASSES (both caps); scout of follow-up levers
+
+PPL c32768 IQ3 (docs corpus, fused lid): dense 2.4348 +/- 0.0226 | tile16
+cap4096 2.4371 (+0.1 sigma) | cap2048 2.4343 (-0.02 sigma). Statistically
+identical even at cap2048's ~48% tile truncation rate. Caveat (ds4.c contract
+comment): PPL can miss tail retrieval -> passkey-at-depth is the decisive
+gate (v2 running; v1 was harness error — 185KB prompt overran c49152 at
+~3.6 chars/tok for markdown, stderr was discarded. v2: 150KB + stderr kept).
+
+Scout results (follow-up levers, ordered by payoff):
+1. fattn small-nb stalls (12->41 TFLOPS): dispatch picks the SAME config for
+   dense and tiled (ncols2=8 via gqa>4, ncols1=64/8=8, 2048 blocks both) —
+   NOT column starvation. DRAM ruled out by arithmetic (640MB tile K ~2.3ms
+   vs 85ms measured). Hypothesis: short-inner-loop pipeline drain (kv 4352
+   vs 18688/block; prologue/softmax-rescale/epilogue amortize 4.3x worse).
+   Probe: ncu --replay-mode application on the backend-ops tiled perf case
+   (model-free — GB10 ncu hazard doesn't apply). Candidate fix: fatter
+   ncols1=16,ncols2=8 instantiation for small-Q ne3-batched shapes.
+2. 512k run gate (task #6): iter-13 "FAIL without kernel work" is now
+   plausibly unblocked (B2 +32% @d131k, FA share ~60% @512k -> pp proj
+   ~90-110 t/s; B1+DEC already flattened decode FA). Plan: d262144 rehearsal
+   -> d524288 pp -r1 -> tg64@512k vs >=10 t/s gate -> coherence run.
+   Memory ~105-108GB of 121.
+3. Streaming chunk-topk (iter-13 item 3): remaining LID lever, ~6% @d131k,
+   grows with depth.
+4. Overflow policy: truncation drops NEWEST cells; keep-newest variant is a
+   ~3-line kernel change — decide from passkey v2 position sensitivity.
