@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_LID_MEMB",
     "DSV4_MOE_GATE_UP",
     "DSV4_HC_FUSED",
+    "DSV4_FP4_RT",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,9 +1220,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_lid_memb(top_k,uni)",
     "dsv4_moe_gate_up(gate,up,x,ids)",
     "dsv4_hc_fused(x,a,b,c)",
+    "dsv4_fp4_rt(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5595,6 +5597,24 @@ struct ggml_tensor * ggml_dsv4_hc_sinkhorn(
 
     result->op     = GGML_OP_DSV4_HC_FUSED;
     result->src[0] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_fp4_rt
+
+struct ggml_tensor * ggml_dsv4_fp4_rt(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0] % 32 == 0);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, x->ne);
+
+    result->op     = GGML_OP_DSV4_FP4_RT;
+    result->src[0] = x;
 
     return result;
 }

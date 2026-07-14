@@ -8,4 +8,5 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 // B2 sparse-CSA union + membership. See ggml_dsv4_lid_union/_memb in ggml.h.
 void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_dsv4_fp4_rt(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_lid_memb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

@@ -1249,3 +1249,29 @@ under EXACT+QAT_WRITE; e2e determinism; pp2048@d65536 re-leg (predict
 ~300 t/s, i.e. exact-mode cost collapses from -28.3% to ~1-2%).
 Risk: public API no · cache-content migration (flag=process-lifetime) ·
 cross-module no · reversible yes · external blocker no.
+
+## Iteration 23 — P3a landed after a two-round rescore-kernel fight
+
+P3a build: GGML_OP_DSV4_FP4_RT (op count 103->104; CUDA reuses the A1 quant
+kernel, CPU reuses the row helper), graph insert at the single lid write site
+(LLAMA_DSV4_LID_QAT_WRITE), fused-op k-side re-quant skip (f16 fast paths
+kept), CPU-ref mirror. FP4_RT 3/3 exact; LID_TOPK 36/36 zero-tolerance
+(EXACT+QAT_WRITE x {plain, int8, dec}).
+
+THE SURPRISE: qat_write alone did NOT fix the -28% (217->213 e2e; op-level
+359->250ms). nsys: dsv4_lid_rescore_kernel cost 2.8x the ENTIRE score kernel.
+Two real bugs in my kernel, found by measurement not guessing:
+1. K rows re-read from global 64x (once per head), uncoalesced 2B loads
+   -> smem wave staging (each row read once, coalesced): 250->192ms.
+2. Serial FP dependency chains with zero ILP (128-deep dot x 64 heads)
+   -> 8 heads interleaved as independent chains (bitwise order preserved:
+   each head's chain stays ascending-d, heads combined ascending): 192->124ms.
+   (n_head=4 tail case caught by zero-tolerance test: predication guard
+   regressed ILP 124->137 -> split hot/tail paths -> 127ms.)
+3. Decode was still 1 block on 1 SM (+822us/layer = tg-gate killer at x21):
+   split into two phases — parallel score chunks (grid nt x ceil(cand/128))
+   + tiny sort-only finale -> decode 3039 -> 974us (+200us/layer vs baseline
+   774, ~+4% decode at 512k — tg gate holds ~10.6).
+
+Final op-level (n_lid=33280): prefill 103.8 -> 126.7ms (+22%, ~+2.8% e2e);
+decode 774 -> 974us. Final e2e legs running.

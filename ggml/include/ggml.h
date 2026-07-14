@@ -592,6 +592,7 @@ extern "C" {
         GGML_OP_DSV4_LID_MEMB,
         GGML_OP_DSV4_MOE_GATE_UP,
         GGML_OP_DSV4_HC_FUSED,
+        GGML_OP_DSV4_FP4_RT,
 
         GGML_OP_COUNT,
     };
@@ -2476,6 +2477,13 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DeepSeek-V4 QAT e2m1 block-32 activation round-trip (fake-quant), the
+    // official indexer numeric applied at lid-cache write time. Unary f32->f32;
+    // ne0 must be a multiple of 32.
+    GGML_API struct ggml_tensor * ggml_dsv4_fp4_rt(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x);
 
     // sinkhorn: softmax along ne0, +eps per element, then column normalization
     // followed by (n_iters-1) x (row, column) normalizations — the whole

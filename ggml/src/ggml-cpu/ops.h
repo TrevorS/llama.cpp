@@ -88,6 +88,7 @@ void ggml_compute_forward_dsv4_lid_union(const struct ggml_compute_params * para
 void ggml_compute_forward_dsv4_lid_memb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_moe_gate_up(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_fp4_rt(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);

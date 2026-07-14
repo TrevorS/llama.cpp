@@ -5919,6 +5919,24 @@ struct test_dsv4_lid_union : public test_case {
     }
 };
 
+// GGML_OP_DSV4_FP4_RT (QAT e2m1 block-32 activation round-trip)
+struct test_dsv4_fp4_rt : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override { return VARS_TO_STR1(ne); }
+    double max_err(ggml_backend_t) override { return 0.0; } // exact deterministic rounding
+
+    test_dsv4_fp4_rt(std::array<int64_t, 4> ne = {128, 64, 4, 1}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_dsv4_fp4_rt(ctx, x);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9514,6 +9532,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_lid_union(256,  48, 2,  3000, 1500,  8, memb)); // tiles x streams
         test_cases.emplace_back(new test_dsv4_lid_union(512,  32, 1, 32768, 1024, 16, memb)); // deep per-tile
     }
+    // QAT e2m1 round-trip (lid-cache write op)
+    test_cases.emplace_back(new test_dsv4_fp4_rt({128, 64, 4, 1}));   // indexer rows
+    test_cases.emplace_back(new test_dsv4_fp4_rt({128, 1, 1, 1}));    // single row
+    test_cases.emplace_back(new test_dsv4_fp4_rt({256, 7, 1, 2}));    // multi-block rows
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     for (int n = 1; n < 5; ++n) {

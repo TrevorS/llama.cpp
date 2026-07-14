@@ -1186,6 +1186,20 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
             cb(kv_comp_lid_state, "lid_state_compress_rot", il);
         }
 
+        // QAT-at-write (LLAMA_DSV4_LID_QAT_WRITE): apply the official e2m1
+        // round-trip ONCE here, on pristine f32 post-hadamard rows, instead of
+        // re-quantizing the whole cache every score call. f16 storage of QAT
+        // values is bit-exact (2-bit mantissa, power-of-2 scales), so the
+        // cache then holds the official numerics in half ds4.c's bytes.
+        static const bool dsv4_lid_qat_write = []() {
+            const char * e = getenv("LLAMA_DSV4_LID_QAT_WRITE");
+            return e && e[0] == '1';
+        }();
+        if (dsv4_lid_qat_write) {
+            kv_comp_lid_state = ggml_dsv4_fp4_rt(ctx0, kv_comp_lid_state);
+            cb(kv_comp_lid_state, "lid_state_compress_qat", il);
+        }
+
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
                     kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
 

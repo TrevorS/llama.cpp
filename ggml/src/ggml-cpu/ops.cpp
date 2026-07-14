@@ -8398,6 +8398,12 @@ void ggml_compute_forward_dsv4_lid_topk(
         const char * x = getenv("LLAMA_DSV4_LID_EXACT");
         return (e && e[0] == '1') || (x && x[0] == '1');
     }();
+    // QAT-at-write: k cache rows are ALREADY the official QAT values (written
+    // through GGML_OP_DSV4_FP4_RT) — skip the k-side re-simulation, keep q-side.
+    static const bool qat_write = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_QAT_WRITE");
+        return e && e[0] == '1';
+    }();
     GGML_ASSERT(!fp4 || d_idx % 32 == 0);
 
     const int64_t nrows = n_stream * nt_s;
@@ -8431,7 +8437,12 @@ void ggml_compute_forward_dsv4_lid_topk(
                 } else {
                     for (int64_t d = 0; d < d_idx; d++) tmp[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *) k_j)[d]);
                 }
-                dsv4_fp4_quant_row_cpu(kq.data(), tmp, d_idx);
+                if (qat_write) {
+                    // cache already QAT -> use values as-is
+                    for (int64_t d = 0; d < d_idx; d++) kq[d] = tmp[d];
+                } else {
+                    dsv4_fp4_quant_row_cpu(kq.data(), tmp, d_idx);
+                }
             }
             float acc = 0.0f;
             for (int64_t h = 0; h < n_head; h++) {
@@ -8753,6 +8764,32 @@ void ggml_compute_forward_dsv4_hc_fused(
                 }
             }
         }
+    }
+}
+
+// ggml_compute_forward_dsv4_fp4_rt
+//
+// QAT e2m1 block-32 activation round-trip (official DeepSeek-V4 indexer
+// numeric), applied at lid-cache write time. Mirrors dsv4_fp4_quant_kernel /
+// ds4.c dsv4_fp4_act_quantize_row_inplace_cpu.
+
+void ggml_compute_forward_dsv4_fp4_rt(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+    GGML_ASSERT(x->ne[0] % 32 == 0);
+
+    const int64_t ne0   = x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+
+    for (int64_t r = params->ith; r < nrows; r += params->nth) {
+        dsv4_fp4_quant_row_cpu(
+                (float *)((char *) dst->data + r*dst->nb[1]),
+                (const float *)((const char *) x->data + r*x->nb[1]),
+                ne0);
     }
 }
 
