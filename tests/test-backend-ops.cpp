@@ -6967,6 +6967,99 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT — DSV4 union-gather padding pattern:
+// the last n_pad KV columns are duplicates of the last real row and are fully
+// masked (-inf for EVERY query row). This is what per-tile union padding
+// produces (union_idx padded with n_csa-1). V is the K tensor itself (MLA-style
+// k_all passed as both K and V, hsk == hsv == 512, n_head_kv = 1).
+struct test_fa_pad : public test_case {
+    const int64_t hs;     // head size (K and V)
+    const int64_t kv_real;
+    const int64_t n_pad;  // trailing fully-masked duplicate columns
+    const int64_t nb;     // batch (query tokens)
+    const int64_t nr2;    // GQA repeat (query heads per KV head)
+    const int64_t nr3;    // dim-3 batch (tiles/streams)
+    const bool sinks;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    std::string vars() override {
+        return "PAD,hs=" + std::to_string(hs) + ",kv_real=" + std::to_string(kv_real) +
+               ",n_pad=" + std::to_string(n_pad) + ",nb=" + std::to_string(nb) +
+               ",nr2=" + std::to_string(nr2) + ",nr3=" + std::to_string(nr3) +
+               ",sinks=" + std::to_string(sinks);
+    }
+
+    test_fa_pad(int64_t hs, int64_t kv_real, int64_t n_pad, int64_t nb, int64_t nr2, int64_t nr3, bool sinks)
+        : hs(hs), kv_real(kv_real), n_pad(n_pad), nb(nb), nr2(nr2), nr3(nr3), sinks(sinks) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv = kv_real + n_pad;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nr2, nr3);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, nr3);
+        ggml_set_name(k, "k");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr3);
+        ggml_set_name(m, "m");
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr2);
+            ggml_set_name(s, "s");
+        }
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, k, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_prec (out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        const int64_t kv = kv_real + n_pad;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "k") == 0) {
+                std::vector<float>       kf(hs*kv*nr3);
+                std::vector<ggml_fp16_t> kh(kf.size());
+                for (int64_t i3 = 0; i3 < nr3; i3++) {
+                    float * kp = kf.data() + i3*hs*kv;
+                    for (int64_t i = 0; i < hs*kv_real; i++) {
+                        kp[i] = dis(gen);
+                    }
+                    // padding rows duplicate the last real row
+                    for (int64_t r = kv_real; r < kv; r++) {
+                        memcpy(kp + r*hs, kp + (kv_real - 1)*hs, hs*sizeof(float));
+                    }
+                }
+                ggml_fp32_to_fp16_row(kf.data(), kh.data(), kf.size());
+                ggml_backend_tensor_set(t, kh.data(), 0, kh.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<float>       mf(kv*nb*nr3);
+                std::vector<ggml_fp16_t> mh(mf.size());
+                for (int64_t i3 = 0; i3 < nr3; i3++) {
+                    for (int64_t i1 = 0; i1 < nb; i1++) {
+                        float * row = mf.data() + i3*nb*kv + i1*kv;
+                        for (int64_t i0 = 0; i0 < kv_real; i0++) {
+                            row[i0] = dis(gen);
+                        }
+                        for (int64_t i0 = kv_real; i0 < kv; i0++) {
+                            row[i0] = -INFINITY;
+                        }
+                    }
+                }
+                ggml_fp32_to_fp16_row(mf.data(), mh.data(), mf.size());
+                ggml_backend_tensor_set(t, mh.data(), 0, mh.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9618,6 +9711,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
+    // DSV4 union-gather padding repro: trailing fully-masked duplicate KV columns
+    // (union_idx padded with n_csa-1). n_pad=0 is the control. Total kv must be
+    // 256-aligned for CUDA FA; the real full-union case has padding starting
+    // MID-TILE (kv_real not 256-aligned), so cover both boundary and mid-tile.
+    for (int64_t n_pad : {(int64_t)0, (int64_t)7, (int64_t)64, (int64_t)167, (int64_t)512, (int64_t)2048}) {
+        for (bool fa_sinks : {false, true}) {
+            test_cases.emplace_back(new test_fa_pad(512, 4352 - n_pad, n_pad, 256, 64, 1, fa_sinks));
+        }
+    }
+    // tile-boundary-aligned padding (kv_real 256-aligned)
+    test_cases.emplace_back(new test_fa_pad(512, 4352, 512,  256, 64, 1, true));
+    test_cases.emplace_back(new test_fa_pad(512, 4352, 2048, 256, 64, 1, true));
+    // full prefill batch width (different mma ncols config than nb=256)
+    test_cases.emplace_back(new test_fa_pad(512, 4185, 167, 2048, 64, 1, true));
+    // per-tile B2 geometry: W=16 queries per tile, tiles batched in dim 3, mid-tile padding
+    test_cases.emplace_back(new test_fa_pad(512, 1017, 519, 16, 64, 8,   true));
+    test_cases.emplace_back(new test_fa_pad(512, 3777, 63,  16, 64, 128, true));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9951,6 +10062,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // DSV4 B2 per-tile probe: dense CSA FA vs W=16 tiled batched FA (T=128 tiles in dim 3)
+    // d32k:  dense kv = 2304 raw + 8192 csa;  tiled kv = 2304 + u_cap(1024)
+    // d131k: dense kv = 2304 raw + 32768 csa; tiled kv = 2304 + u_cap(1536|2048)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   10496, 2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 3328,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   35072, 2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 3840,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 4352,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // W=64 variant (T=32): better Q-tile efficiency, weaker union cut (u_cap 3072)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 32},  5376,  64,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
