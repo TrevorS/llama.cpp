@@ -8644,6 +8644,61 @@ void ggml_compute_forward_dsv4_hc_fused(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    if (mode == 2) {
+        // sinkhorn: softmax along ne0, +eps, norm_cols, then
+        // (iters-1) x (norm_rows, norm_cols). Mirrors the unfused chain
+        // (build_hc_sinkhorn) with serial per-lane sums.
+        const ggml_tensor * comb = dst->src[0]; // [hc, hc, nt]
+        GGML_ASSERT(comb->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int32_t iters = ggml_get_op_params_i32(dst, 1);
+        const float   eps   = ggml_get_op_params_f32(dst, 2);
+        const int64_t hc    = comb->ne[0];
+        const int64_t nt    = comb->ne[2];
+        GGML_ASSERT(hc <= 16);
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            float m[16*16];
+            for (int64_t s = 0; s < hc; ++s) {
+                const float * src = (const float *)((const char *) comb->data + t*comb->nb[2] + s*comb->nb[1]);
+                for (int64_t d = 0; d < hc; ++d) m[d + s*hc] = src[d];
+            }
+            // softmax along d for each s, then +eps per element
+            for (int64_t s = 0; s < hc; ++s) {
+                float mx = -INFINITY;
+                for (int64_t d = 0; d < hc; ++d) mx = m[d + s*hc] > mx ? m[d + s*hc] : mx;
+                float sum = 0.0f;
+                for (int64_t d = 0; d < hc; ++d) { const float e = expf(m[d + s*hc] - mx); m[d + s*hc] = e; sum += e; }
+                for (int64_t d = 0; d < hc; ++d) m[d + s*hc] = m[d + s*hc]/sum + eps;
+            }
+            // norm_cols: m[d,s] /= (sum_s m[d,s] + eps)
+            auto norm_cols = [&]() {
+                for (int64_t d = 0; d < hc; ++d) {
+                    float cs = 0.0f;
+                    for (int64_t s = 0; s < hc; ++s) cs += m[d + s*hc];
+                    cs += eps;
+                    for (int64_t s = 0; s < hc; ++s) m[d + s*hc] /= cs;
+                }
+            };
+            // norm_rows: m[d,s] /= (sum_d m[d,s] + eps)
+            auto norm_rows = [&]() {
+                for (int64_t s = 0; s < hc; ++s) {
+                    float rs = 0.0f;
+                    for (int64_t d = 0; d < hc; ++d) rs += m[d + s*hc];
+                    rs += eps;
+                    for (int64_t d = 0; d < hc; ++d) m[d + s*hc] /= rs;
+                }
+            };
+            norm_cols();
+            for (int32_t i = 1; i < iters; ++i) { norm_rows(); norm_cols(); }
+            for (int64_t s = 0; s < hc; ++s) {
+                float * out = (float *)((char *) dst->data + t*dst->nb[2] + s*dst->nb[1]);
+                for (int64_t d = 0; d < hc; ++d) out[d] = m[d + s*hc];
+            }
+        }
+        return;
+    }
+
     if (mode == 0) {
         const ggml_tensor * x = dst->src[0]; // [n_embd, hc, nt]
         const ggml_tensor * w = dst->src[1]; // [hc, nt]

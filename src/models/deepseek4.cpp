@@ -260,9 +260,12 @@ static ggml_tensor * dsv4_hc_affine(
 // bandwidth-bound and the transposes/repeat it needed added traffic; it was
 // replaced by the fused op. See PROGRESS.md.)
 static bool dsv4_hc_fused_enabled() {
+    // default ON as of 2026-07-14: weighted_sum/post were greedy-token-identical
+    // vs the scalar graph (PROGRESS gate 2) and sinkhorn (mode 2) collapses the
+    // unrolled ~85-node chain per call. Set LLAMA_DSV4_HC_FUSED=0 to disable.
     static const bool enabled = []() {
         const char * e = getenv("LLAMA_DSV4_HC_FUSED");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     return enabled;
 }
@@ -296,6 +299,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
     // row softmax over dst, one column normalization, then repeated row/column normalization.
+    // Fused: the unrolled chain is ~85 nodes of 1-2us launches on a [hc,hc,nt]
+    // tensor, ~30% of decode GPU time at depth (PROGRESS iter 20d) — one
+    // kernel replaces softmax + all normalization iterations.
+    if (dsv4_hc_fused_enabled()) {
+        return ggml_dsv4_hc_sinkhorn(ctx0, comb,
+                (int) hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+    }
+
     comb = ggml_soft_max(ctx0, comb);
 
     ggml_tensor * eps = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);

@@ -72,10 +72,72 @@ static __global__ void dsv4_hc_post_kernel(
     }
 }
 
+// One block per token; the [hc, hc] matrix lives in shared memory. Lane s
+// (resp. d) does SERIAL sums over the other axis so the accumulation order
+// matches the CPU reference exactly (hc <= 8, negligible work — the win is
+// replacing ~85 kernel launches with one).
+static __global__ void dsv4_hc_sinkhorn_kernel(
+        float * __restrict__ out, const float * __restrict__ comb,
+        int hc, int nt, int iters, float eps) {
+    const int t = blockIdx.x;
+    if (t >= nt) return;
+    __shared__ float m[GGML_DSV4_HC_MAX * GGML_DSV4_HC_MAX];
+    const int n = hc * hc;
+    const int tid = threadIdx.x;
+    if (tid < n) m[tid] = comb[(int64_t) t * n + tid];
+    __syncthreads();
+    // softmax along d for each s, then +eps
+    if (tid < hc) {
+        const int s = tid;
+        float mx = -INFINITY;
+        for (int d = 0; d < hc; ++d) mx = fmaxf(mx, m[d + s*hc]);
+        float sum = 0.0f;
+        for (int d = 0; d < hc; ++d) { const float e = expf(m[d + s*hc] - mx); m[d + s*hc] = e; sum += e; }
+        for (int d = 0; d < hc; ++d) m[d + s*hc] = m[d + s*hc]/sum + eps;
+    }
+    __syncthreads();
+    for (int i = 0; i < iters; ++i) {
+        if (i > 0) { // norm_rows (skipped before the first norm_cols)
+            if (tid < hc) {
+                const int s = tid;
+                float rs = 0.0f;
+                for (int d = 0; d < hc; ++d) rs += m[d + s*hc];
+                rs += eps;
+                for (int d = 0; d < hc; ++d) m[d + s*hc] /= rs;
+            }
+            __syncthreads();
+        }
+        if (tid < hc) { // norm_cols
+            const int d = tid;
+            float cs = 0.0f;
+            for (int s = 0; s < hc; ++s) cs += m[d + s*hc];
+            cs += eps;
+            for (int s = 0; s < hc; ++s) m[d + s*hc] /= cs;
+        }
+        __syncthreads();
+    }
+    if (tid < n) out[(int64_t) t * n + tid] = m[tid];
+}
+
 void ggml_cuda_op_dsv4_hc_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
     cudaStream_t stream = ctx.stream();
     const int block = 256;
+
+    if (mode == GGML_DSV4_HC_MODE_SINKHORN) {
+        const ggml_tensor * comb = dst->src[0]; // [hc, hc, nt]
+        GGML_ASSERT(comb->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(comb) && ggml_is_contiguous(dst));
+        const int hc = comb->ne[0];
+        const int nt = comb->ne[2];
+        GGML_ASSERT(hc <= GGML_DSV4_HC_MAX);
+        const int iters = ggml_get_op_params_i32(dst, 1);
+        const float eps = ggml_get_op_params_f32(dst, 2);
+        const int n_iters_eff = iters > 0 ? iters : 1; // iters==0 still does one norm_cols
+        dsv4_hc_sinkhorn_kernel<<<nt, 64, 0, stream>>>(
+                (float *) dst->data, (const float *) comb->data, hc, nt, n_iters_eff, eps);
+        return;
+    }
 
     if (mode == GGML_DSV4_HC_MODE_WEIGHTED_SUM) {
         const ggml_tensor * x = dst->src[0]; // [n_embd, hc, nt]

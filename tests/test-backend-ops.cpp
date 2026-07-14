@@ -4430,6 +4430,28 @@ struct test_dsv4_hc_post : public test_case {
     }
 };
 
+// GGML_OP_DSV4_HC_FUSED mode 2 (DeepSeek-V4 hyper-connection Sinkhorn normalization)
+struct test_dsv4_hc_sinkhorn : public test_case {
+    const int64_t hc, nt;
+    const int iters;
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(hc, nt, iters, eps);
+    }
+
+    test_dsv4_hc_sinkhorn(int64_t hc = 8, int64_t nt = 5, int iters = 20, float eps = 1e-6f)
+        : hc(hc), nt(nt), iters(iters), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_name(comb, "comb");
+        ggml_tensor * out = ggml_dsv4_hc_sinkhorn(ctx, comb, iters, eps);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -9159,6 +9181,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(256,  4, 5));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 4, 1));           // decode shape
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 8, 17));          // hc max, odd nt
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 1,  20, 1e-6f)); // decode shape, real iters
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 17, 20, 1e-6f)); // odd nt
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(4, 5,   1, 1e-4f)); // single iteration
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 2048, 20, 1e-6f)); // prefill width
 
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {

@@ -15,10 +15,16 @@
 //                                     + sum_src res[e,src,t]*comb[dst,src,t]
 //                      src0 x [n_embd,nt], src1 res [n_embd,hc,nt],
 //                      src2 post [hc,nt], src3 comb [dst,src,nt] -> [n_embd,hc,nt]
+//   MODE_SINKHORN:     softmax along dst, +eps, col-normalize, then
+//                      (iters-1) x (row-, col-normalize) — the whole unrolled
+//                      ~85-node chain (per call, on a [hc,hc,nt] tensor) in one
+//                      launch. op_params[1] = iters, op_params[2] = eps (f32).
+//                      src0 comb [dst,src,nt] -> [dst,src,nt]
 // See ggml_dsv4_hc_weighted_sum() / ggml_dsv4_hc_post() in ggml.h.
 
 #define GGML_DSV4_HC_MODE_WEIGHTED_SUM 0
 #define GGML_DSV4_HC_MODE_POST         1
+#define GGML_DSV4_HC_MODE_SINKHORN     2
 #define GGML_DSV4_HC_MAX               8   // max supported hc_mult
 
 void ggml_cuda_op_dsv4_hc_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

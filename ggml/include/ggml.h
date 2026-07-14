@@ -2477,6 +2477,16 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // sinkhorn: softmax along ne0, +eps per element, then column normalization
+    // followed by (n_iters-1) x (row, column) normalizations — the whole
+    // unrolled ~85-node ggml chain in one op.
+    //   comb [dst,src,nt] -> [dst,src,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * comb,
+            int                   n_iters,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,

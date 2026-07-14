@@ -5575,6 +5575,30 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+// ggml_dsv4_hc_sinkhorn
+
+struct ggml_tensor * ggml_dsv4_hc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * comb,
+        int                   n_iters,
+        float                 eps) {
+    GGML_ASSERT(comb);
+    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb->ne[0] == comb->ne[1]); // square combine matrix
+    GGML_ASSERT(n_iters >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, comb->ne[0], comb->ne[1], comb->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, 2); // mode 2 = sinkhorn
+    ggml_set_op_params_i32(result, 1, n_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = comb;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(

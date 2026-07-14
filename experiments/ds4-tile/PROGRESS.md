@@ -1053,3 +1053,23 @@ Two tg levers, quantified:
 Either alone likely covers the 3.6% gap to the >=10 t/s gate.
 Trace: scratchpad tg_d524288.nsys-rep (CUPTI drops decode events ~2 tokens
 in — known GB10 limitation, shares valid).
+
+## Iteration 21 — Sinkhorn FUSED (HC mode 2) + HC-fused default ON (graph -74%)
+
+Storm attribution (20d) -> root cause: build_hc_sinkhorn's unrolled chain
+(softmax + eps + 20 col/row normalization iterations = ~85 nodes of 1-2us
+launches on a [8,8,nt] tensor), x2 per layer — AND the existing HC fused
+weighted_sum/post kernels (token-identical, iter gate 2) were still ENV-OPT-IN:
+every bench this session ran the scalar HC chains. (Campaign refs carried
+LLAMA_DSV4_HC_FUSED=1 — iter-13 d131k dense pp 179.8 vs yesterday's 163.1
+reconciles. Ratios were valid; absolutes were handicapped.)
+
+Built: ggml_dsv4_hc_sinkhorn (GGML_OP_DSV4_HC_FUSED mode 2) — one kernel
+(block per token, [hc,hc] in smem, serial per-lane sums matching the CPU ref
+order) replaces the whole chain incl softmax. CPU ref + CUDA + tests 10/10
+(incl nt=2048 prefill width). Fixed supports_op null-src[1] segv (mode 2 has
+a single src). HC fused now DEFAULT ON (LLAMA_DSV4_HC_FUSED=0 disables).
+
+Decode graph: 21183 -> 5439 nodes (-74%); SUM_ROWS 3439->85, DIV 3397->43,
+ADD 5780->703. Coherent output. Payoff battery running: pp d65k/d131k refs +
+tg64 d131k + tg64 d524288 (the >=10 gate that sat at 9.64 with scalar HC).
