@@ -8887,6 +8887,56 @@ void ggml_compute_forward_dsv4_qat_set_rows(
     }
 }
 
+// ggml_compute_forward_dsv4_fa_merge
+//
+// merge two flash_attn_ext_with_lse results computed over disjoint KV subsets:
+// out = (ea*a + eb*b) / (ea + eb) per row, ea = exp(lse_a - max(lse_a, lse_b)).
+// srcs are [DV, H, Q, S+1] with the LSE tail at element offset DV*H*Q*S,
+// tail idx = (s*Q + iq)*H + h == the row index; dst is [DV, H, Q, S].
+
+void ggml_compute_forward_dsv4_fa_merge(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+
+    const int64_t DV     = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3]; // H*Q*S
+
+    const float * a_data = (const float *) a->data;
+    const float * b_data = (const float *) b->data;
+    const float * lse_a  = a_data + DV*n_rows;
+    const float * lse_b  = b_data + DV*n_rows;
+    float       * d_data = (float *) dst->data;
+
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const float la = lse_a[r];
+        const float lb = lse_b[r];
+        const float m  = MAX(la, lb);
+
+        const float * ar = a_data + r*DV;
+        const float * br = b_data + r*DV;
+        float       * dr = d_data + r*DV;
+
+        if (m == -INFINITY) { // both halves fully masked
+            memset(dr, 0, DV*sizeof(float));
+            continue;
+        }
+
+        const float ea  = expf(la - m);
+        const float eb  = expf(lb - m);
+        const float wa  = ea / (ea + eb);
+        const float wb  = eb / (ea + eb);
+
+        for (int64_t d = 0; d < DV; ++d) {
+            dr[d] = wa*ar[d] + wb*br[d];
+        }
+    }
+}
+
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {

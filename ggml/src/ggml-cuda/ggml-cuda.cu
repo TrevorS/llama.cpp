@@ -2245,6 +2245,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_QAT_SET_ROWS:
             ggml_cuda_op_dsv4_qat_set_rows(ctx, dst);
             break;
+        case GGML_OP_DSV4_FA_MERGE:
+            ggml_cuda_op_dsv4_fa_merge(ctx, dst);
+            break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -4987,6 +4990,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->type == GGML_TYPE_F32 &&
                    (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
                    op->src[0]->ne[0] % 32 == 0 && op->src[0]->ne[0] <= 1024;
+        case GGML_OP_DSV4_FA_MERGE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_FUSED:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&

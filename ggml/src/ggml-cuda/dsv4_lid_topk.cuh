@@ -11,3 +11,4 @@ void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * 
 void ggml_cuda_op_dsv4_fp4_rt(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_lid_memb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_qat_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_dsv4_fa_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

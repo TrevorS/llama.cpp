@@ -1103,9 +1103,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_FUSED",
     "DSV4_FP4_RT",
     "DSV4_QAT_SET_ROWS",
+    "DSV4_FA_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1223,9 +1224,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_fused(x,a,b,c)",
     "dsv4_fp4_rt(x)",
     "dsv4_qat_set_rows(a,b,c)",
+    "dsv4_fa_merge(a,b)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5648,6 +5650,30 @@ struct ggml_tensor * ggml_dsv4_qat_set_rows(
     result->src[0] = b;
     result->src[1] = c;
     result->src[2] = a;
+
+    return result;
+}
+
+// ggml_dsv4_fa_merge
+
+struct ggml_tensor * ggml_dsv4_fa_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    // inputs carry the FA LSE tail: [DV, n_head, n_batch, ne3+1] with DV >= ne3
+    GGML_ASSERT(a->ne[3] >= 2);
+    GGML_ASSERT(a->ne[0] >= a->ne[3] - 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3] - 1);
+
+    result->op     = GGML_OP_DSV4_FA_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }

@@ -661,6 +661,56 @@ void ggml_cuda_op_dsv4_qat_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor
             dst->nb[1], b->nb[1] / sizeof(float), (int) ne0);
 }
 
+// merge two flash_attn_ext_with_lse results computed over disjoint KV subsets
+// (GGML_OP_DSV4_FA_MERGE): out = (ea*a + eb*b)/(ea+eb) per row,
+// ea = exp(lse_a - max(lse_a, lse_b)). srcs [DV, H, Q, S+1] with LSE tail at
+// element offset DV*H*Q*S, tail idx == row idx; dst [DV, H, Q, S].
+static __global__ void dsv4_fa_merge_kernel(
+        const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst,
+        const int DV, const int64_t n_rows) {
+    const int64_t r = blockIdx.x;
+
+    const float la = a[DV*n_rows + r];
+    const float lb = b[DV*n_rows + r];
+    const float m  = fmaxf(la, lb);
+
+    float wa = 0.0f;
+    float wb = 0.0f;
+    if (m != -INFINITY) { // else both halves fully masked -> zeros
+        const float ea = expf(la - m);
+        const float eb = expf(lb - m);
+        wa = ea / (ea + eb);
+        wb = eb / (ea + eb);
+    }
+
+    const float * ar = a   + r*DV;
+    const float * br = b   + r*DV;
+    float       * dr = dst + r*DV;
+
+    for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+        dr[d] = wa*ar[d] + wb*br[d];
+    }
+}
+
+void ggml_cuda_op_dsv4_fa_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+
+    const int64_t DV     = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    if (n_rows == 0) {
+        return;
+    }
+
+    const int n_threads = DV >= 256 ? 256 : 128;
+    dsv4_fa_merge_kernel<<<n_rows, n_threads, 0, ctx.stream()>>>(
+            (const float *) a->data, (const float *) b->data, (float *) dst->data,
+            (int) DV, n_rows);
+}
+
 void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * top_k = dst->src[0];
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);

@@ -5978,6 +5978,33 @@ struct test_dsv4_qat_set_rows : public test_case {
     }
 };
 
+// GGML_OP_DSV4_FA_MERGE (LSE merge of two FA-with-LSE halves)
+struct test_dsv4_fa_merge : public test_case {
+    const int64_t dv, nh, nq, ns;
+
+    std::string vars() override {
+        return "dv=" + std::to_string(dv) + ",nh=" + std::to_string(nh) +
+               ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns)
+        : dv(dv), nh(nh), nq(nq), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // srcs carry the LSE tail slice: [DV, H, Q, S+1]; uniform init doubles
+        // as both attention values and plausible LSE magnitudes.
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_dsv4_fa_merge(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9655,6 +9682,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
     // P3b packed MXFP4 lid container
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8));    // DSV4 tile geometry
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1));  // prefill width
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3));     // odd sizes
+
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row
     test_cases.emplace_back(new test_dsv4_qat_set_rows(256, 32, 1));    // multi-block single row

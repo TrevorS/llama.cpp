@@ -594,6 +594,7 @@ extern "C" {
         GGML_OP_DSV4_HC_FUSED,
         GGML_OP_DSV4_FP4_RT,
         GGML_OP_DSV4_QAT_SET_ROWS,
+        GGML_OP_DSV4_FA_MERGE,
 
         GGML_OP_COUNT,
     };
@@ -2551,6 +2552,16 @@ extern "C" {
             float                 logit_softcap);
 
     GGML_API bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a);
+
+    // merge two ggml_flash_attn_ext_with_lse results computed over disjoint KV
+    // subsets of the same queries: out = (ea*a + eb*b) / (ea + eb) per row,
+    // ea = exp(lse_a - max(lse_a, lse_b)), eb likewise. a, b:
+    // [n_embd_v, n_head, n_batch, ne3+1] with the LSE tail; res:
+    // [n_embd_v, n_head, n_batch, ne3] normalized, no tail.
+    GGML_API struct ggml_tensor * ggml_dsv4_fa_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
