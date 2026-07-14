@@ -1,8 +1,8 @@
 /
 
-// TODO: remove GGML_TENSOR_SIZE and GGML_OBJECT_SIZE
-
 struct ggml_context * ggml_init(struct ggml_init_params params) {
     // make sure to always align to 64 bytes
-    params.mem_size = GGML_PAD(params.mem_size, GGML_M
+    params.mem_size = GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+
+    struct ggml_context * ctx = GGML_MALL
 

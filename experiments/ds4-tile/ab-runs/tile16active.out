@@ -1,0 +1,7 @@
+/
+
+struct ggml_context * ggml_init(struct ggml_init_params params) {
+    // make sure to always align mem_size to GGML_MEM_ALIGN
+    size_t mem_size = GGML_PAD(params.mem_size, GGML_MEM_ALIGN);
+    void * mem_buffer =
+

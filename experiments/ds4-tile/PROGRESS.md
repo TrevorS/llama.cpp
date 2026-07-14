@@ -885,3 +885,28 @@ still truncate at d65k+). Committed. Tile path remains opt-in
 Running: IQ3 ab.sh re-bank + tile A/B, IQ3 d131k dense/4096 pair.
 Next gates: passkey-at-depth (plant beyond raw window, the dropped-cell victim
 region) + PPL at safe ctx, both IQ3.
+
+## Iteration 19f — IQ3 decision legs COMPLETE; A/B false alarm root-caused
+
+pp2048 IQ3 (fused lid): d65536 dense 225.3 | cap2048 263.2 (+16.8%) | cap4096
+252.7 (+12.2%). d131072 dense 163.1 | cap4096 215.4 (+32.1%) — matches IQ2's
++32.3% at the same depth. Union stats match IQ2. No stability issues at 96GB.
+
+A/B false alarm: IQ3 tile16-vs-baseline "DIVERGES" was NOT the tile path —
+UNION_STATS proved the gate never opened (padded n_csa <= 4096 == default
+u_cap on the 15k prompt; ne[0] is the PADDED mask width, cells pad to 2048
+multiples). Cross-diffing exposed the real cause: baseline != baseline2 —
+DENSE ITSELF varies across process launches (first run right after a bench
+cycle; kernel/algorithm selection shifts with free-memory state). Runs in
+similar machine state agree (baseline2 == tile16 == tile16c).
+=> GATE POLICY: cross-process transcript identity is NOT a valid gate on this
+box. Valid gates: within-config determinism (proven IQ2+IQ3), coherence,
+PPL/KL, passkey-at-depth. ab.sh prompt (15k) needs UCAP=2048 override or a
+>16k prompt to exercise the tile path at the 4096 default.
+Tile-ACTIVE IQ3 A/B (cap2048+stats): 63 US lines, coherent output. Banked.
+
+STATE: B2 per-tile SHIPS opt-in (LLAMA_DSV4_CSA_TILE=16, u_cap 4096,
+TILE_MIN 12288): IQ3 +12.2% @d65k, +32.1% @d131k, correct-construction.
+REMAINING gates to default-on: passkey-at-depth + PPL (safe ctx), both IQ3.
+NEXT LEVER: fattn small-nb column config (12->41 TFLOPS headroom) -> exact
+u_cap affordable everywhere + bigger wins; then 256k/512k depth points.
