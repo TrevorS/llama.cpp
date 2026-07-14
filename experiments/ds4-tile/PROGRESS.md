@@ -1015,3 +1015,20 @@ VERDICT: task-#6 pp gates PASS at 512k; tg gate MARGINAL FAIL. Lever 3
 every merge level; worst at deep decode) is sized right to close the tg gap
 (~+80/-40 LOC, 1 file, model-free gates). Lever 1 (fattn ne3-broadcast)
 remains the pp prize (+32 -> ~+65% @d131k).
+
+## Iteration 20c — streaming chunk-topk: NEGATIVE RESULT (reverted)
+
+Built the (score,idx)-pair candidate tree (chunk emits pairs, merges become
+pure-smem, no score re-gathers; 48/48 backend-ops across default/int8/dec/fp4).
+Perf: NO measurable change at ANY shape —
+  n_lid=8704  nt=2048: 34.96 -> 34.94 ms
+  n_lid=33280 nt=2048: 125.85 -> 125.77 ms
+  n_lid=33280 nt=1:    926.0 -> 923.8 us
+The iter-13 "carry pairs through the merge tree" hypothesis was wrong about
+the bottleneck: the merge tree is BITONIC-COMPUTE-bound (4096-wide sorts),
+not gather-bound — at decode the gathers are only ~chunks*top_k ~ 4.6k random
+loads, trivial. Reverted (2x scratch for zero gain; int4 precedent).
+IMPLICATION for tg@512k (9.64 vs >=10): the 3.6% gap will NOT come from topk.
+Next candidates: profile tg at d524288 (nsys) for the real decode breakdown;
+DEC score kernel headroom (470us @33k n_lid vs ~30us memory-ideal, scales
+~4x at 512k -> ~1.8% of the 103.7ms token budget); FA-decode/B1 path share.
