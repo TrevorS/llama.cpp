@@ -1111,3 +1111,54 @@ ENDGAME (composition): mxfp4 storage + int8 first-pass + QAT-numeric rescore
 = official-graph-EXACT selection (class A vs the model's trained semantics)
 at int8 speed with 3.76x smaller LID cache. Build order: oracle displacement
 measurement -> rescore (small) -> mxfp4 storage (medium).
+
+## Iteration 21c — composition scout (official-exact selection) + promotion sweep
+
+THE COMPOSITION (env LLAMA_DSV4_LID_EXACT=1, one coherent pipeline):
+  write:  indexer K (post-hadamard f32) --[OUR QAT quantizer]--> MXFP4 blocks
+          in kv_lid (ctor type arg). CRITICAL: ggml's quantize_row_mxfp4 does
+          NOT match QAT (scale floor(log2 amax)-2 vs QAT ceil(log2(amax/6));
+          first-wins vs even-index tie-break) -> custom set_rows write kernel
+          (we already own the exact e2m1+ue8m0 quantizer from A1 / ds4.c
+          parity). ggml MXFP4 is used as a CONTAINER only (same block layout:
+          1 e8m0 byte + 16 nibble bytes per 32).
+  q side: A1 QAT fake-quant on q (exists).
+  pass 1: int8 ranking for speed —
+          prefill: per-ubatch dequant-to-f16 staging (~8MB, ~0.03ms) then the
+          UNCHANGED wmma/int8 kernels (sidesteps iter-15 unpack tax);
+          decode: DEC kernel reads packed rows directly (68B vs 256B -> the
+          18.9%-of-decode, 9x-off-ideal score_decode gets a ~3.8x byte cut;
+          kernel is latency-bound so nibble ALU is free).
+          Output: top-(512+m) candidates.
+  pass 2: fp32 rescore of candidates on EXACT QAT values (dequant matches
+          ds4.c bit-for-bit) + mask; exact top-512, lower-index tie-break
+          (matches ds4.c indexed_topk). ~60-LOC kernel + dsv4_topk_single.
+  m:      measured via oracle rank-displacement (LID_DUMP data), ship 2x
+          margin; optional debug runtime violation counter.
+  CLAIM SCOPE: SELECTION becomes class A vs the official DeepSeek graph
+  (the only official-mandated low-precision numeric). Attention over the
+  selected set stays llama.cpp numerics (as does ds4.c's own f16 comp cache).
+  Perf: decode score 2-3x -> ~+10-14% tg @512k; prefill ~neutral (+rescore
+  ~4% of score, -bytes); lid cache 704MB -> 188MB @512k.
+  Scope: set_rows-mxfp4 write (+50), DEC packed reader (+60), staging pass
+  (+30), rescore kernel (+60), oracle ext (+40), plumbing/env (+30), tests
+  (+40). All in dsv4_lid_topk.cu / llama-kv-cache-dsv4.cpp / deepseek4.cpp.
+
+PROMOTION SWEEP (other B/C -> A candidates):
+1. HC sinkhorn C->A (CHEAP, DO with the composition): the fused kernel's
+   softmax sum is serial; the old graph's ggml soft_max used a warp-tree
+   order. Replicate that tree order in the fused kernel (+~20 LOC) ->
+   token-identical vs the pre-fusion graph; HC_FUSED returns to pure A.
+2. CSA_TILE tail-truncation B->pure-C (CONFIG ONLY): "exact profile"
+   UCAP >= measured max union (5376 @d65k, 256-aligned OK; deeper depths
+   need a bigger cap — p100 grows with n_csa, measure at 512k). Costs a few
+   % of the tile win; leaves only irreducible FA reassociation (C).
+3. CSA_GATHER C->A: NOT practical — would require an exact-order decode FA
+   matching the dense kernel's reduction order (infeasible) or defining a
+   new canonical order (changes dense too). ds4.c pays a dedicated
+   'deterministic' reference kernel for this; not worth it at 2.5% decode
+   share. Stays C with determinism gates.
+4. MoE activation quant (q8_1 vs official bf16): upstream-wide MMQ design,
+   shared by all models, ds4.c deviates equally (Q8_K). Out of scope.
+5. Already A: MTP_FUSED_DRAFT (ids-identical), spec decode (target-exact),
+   FUSED_LID, HC modes 0/1.
