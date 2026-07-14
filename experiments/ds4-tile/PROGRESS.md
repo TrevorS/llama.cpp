@@ -1200,3 +1200,18 @@ reference = official ds4.c order), 1024-wide bitonic, exact top-512
 order) across all three pass-1 variants. Selection is now class A vs the
 official QAT graph with int8 pass-1 speed. e2e determinism + d65536 perf
 spot running.
+
+## Iteration 22b — P2 e2e gates: deterministic + coherent; exact-mode price -28%
+
+e2e (15k prompt, EXACT+INT8): run1 == run2 bit-identical, output coherent.
+pp2048@d65536: 217.4 vs 303.3 default = -28.3%. Attribution: the A1 fp4 path
+re-materializes ALL of k as f32 QAT every layer-call (8.4MB writes @n_lid16k
++ score kernels forced onto f32 K reads, 2x the f16 bytes) — the documented
+"numerics-only" design, now priced at depth. P3a (QAT-at-write: quantize k
+once when the cache row is written, store F16-of-QAT, kernels keep the fast
+f16 path; needs a small e2m1 round-trip ggml op for the graph-side write)
+removes ~all of it — predicted residual: q-side QAT (tiny) + rescore (~4%
+of score). LID_EXACT stays OPT-IN until P3a lands.
+STATE: buildspec P0 done, P1 descoped, P2 landed+gated (class A, opt-in),
+P3a next (new op GGML_OP_DSV4_FP4_RT + graph insert at lid cache write),
+then P3b (mxfp4 container), P4 (default flips + gates.sh).
