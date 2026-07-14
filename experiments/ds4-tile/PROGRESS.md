@@ -847,7 +847,7 @@ Exactness at d65k needs u_cap ~5376 -> kv_tile 7680; at the 12-vs-41 TFLOPS
 small-nb FA penalty that erases the d65k win (survives only d131k+). The
 strategic lever is the fattn small-nb config gap (ncols1<=16 starves K-byte
 amortization): closing half of it makes EXACT per-tile B2 win from d32k up.
-Running: u_cap 3072/4096 @d65536 + dense/2048/4096 @d131072 frontier legs.
+Running: u_cap 3072/4096 @d65536 + dense/2048/4096 @d131072 sweep legs.
 
 NOTE (2026-07-13, Teej): quant of record is UD-IQ3_XXS (the serving quant),
 not the UD-IQ2_XXS the campaign targets were baselined on. Structural results
@@ -858,3 +858,15 @@ stats confirm, quality gates. ab.sh default switched to IQ3 (AB_MODEL to
 override). IQ3 is 96GB resident: d131k legs need a headroom check first
 (earlyoom line; see gb10 crash memory). A/B baselines must be re-banked on
 IQ3 before any variant comparison (old IQ2 outputs are not comparable).
+
+## Iteration 19d — u_cap/depth sweep complete (IQ2): honest caps keep the win; d131k +37/+32%
+
+pp2048 (IQ2, fused lid): u_cap curve is SHALLOW —
+  d65536:  dense 232.3 | 2048: 271.5 (+16.8%) | 3072: 265.9 (+14.5%) | 4096: 260.6 (+12.2%)
+  d131072: dense 166.4 | 2048: 228.3 (+37.2%) |                        4096: 220.2 (+32.3%)
+Doubling u_cap 2048->4096 costs ~1/4 of the win at both depths (FA is diluted
+in total pp; the backend-ops-probe pessimism priced FA as the whole pipeline).
+u_cap 4096 covers mean+tail at d65k (only ~5k-tail tiles truncate, few %) and
+keeps +12.2% @d65k / +32.3% @d131k. d131k pp stable with fused lid (no OOM).
+QUANT SWITCH: decision legs now on UD-IQ3_XXS (serving quant; Teej).
+Running: IQ3 dense/2048/4096 + stats sweep @d65536.
