@@ -10081,6 +10081,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 4352,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // W=64 variant (T=32): better Q-tile efficiency, weaker union cut (u_cap 3072)
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 32},  5376,  64,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // stall-attribution probes: separate short-kv amortization from ne3 batching
+    // (a) dense-style T=1 with tile-short kv: if ~12 TFLOPS, kv length is the cause
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   4352,  2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // (b) nb sweep at fixed total Q (2048) and fixed per-tile kv 4352
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 16},  4352,  128,  true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 4},   4352,  512,  true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

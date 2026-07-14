@@ -954,3 +954,49 @@ empirically harmless at these depths -> lever #4 (keep-newest) deprioritized.
 FLIPPED DEFAULT: LLAMA_DSV4_CSA_TILE now defaults to 16 (0 disables); u_cap
 4096, TILE_MIN 12288 (self-gates off shallow). Shallow default-path sanity OK.
 Net effect at defaults: pp unchanged <=d49k, +12.2% @d65k, +32.1% @d131k (IQ3).
+
+## Iteration 20 — three-lever scout: probes + ncu profiles (root causes found)
+
+LEVER 1 (fattn small-nb, 12->41 TFLOPS) — ROOT CAUSE FOUND: LPDDR latency
+wall, not config, not kv length, not bandwidth.
+- Discriminating probes (kv=4352, total Q=2048 fixed): T=1/nb=2048 43.8
+  TFLOPS | T=4/nb=512 35.9 | T=16/nb=128 12.2 | T=32..128 12.2-12.3.
+  Same kernel every case (nsys: flash_attn_ext_f16<512,512,8,8>, no combine
+  pass), same 2048 blocks, same per-block work. Collapse is keyed to the
+  NUMBER OF DISTINCT K STREAMS (ne3), cliff between T=4 and T=16.
+- ncu (application replay, model-free): both cases 8 warps/SM occupancy (1
+  block/SM, no latency-hiding headroom). Dense: SM 36%/L2 47%, scoreboard
+  6.1 cyc. Tiled: SM 11%/mem 15%/L2 20% — ALL idle — scoreboard 21.0 cyc
+  (49%) + CTA barrier 15.4 cyc (36%). Dense's 2048 blocks stream ONE K in
+  near-lockstep = L2-broadcast amortization; tiled has 16 blocks per K
+  stream (~3 streams interleaved across 48 SMs) = raw LPDDR5X latency,
+  nothing hides it. Bandwidth explicitly NOT the limit (640MB=2.3ms vs 96ms).
+- CEILING: tiled FA at dense TFLOPS -> d131k FA 85->25ms -> pp +32% becomes
+  ~+65%. Fix candidates: (a) K ne3-broadcast in FA (raw window = 53% of each
+  tile's kv is IDENTICAL across tiles; serving it from one shared ne3=1
+  tensor restores L2-broadcast for half the traffic; also an upstream-useful
+  feature = shared-prefix batched decode; needs ggml assert relax + mma
+  pointer math + LSE-combine story), (b) deeper K prefetch/2 CTAs per SM
+  (register-wall at DKQ=512, low odds).
+  Scope (a): ggml.c asserts (+10), fattn-mma-f16.cuh K/V ne3-broadcast
+  (+60/-10), fattn.cu plumbing (+20), backend-ops cases (+30); verification:
+  FA suite + tiled perf probes + e2e depth bench. Risk: upstream-facing
+  kernel, reversible, no data migration.
+
+LEVER 2 (512k run gate): battery RUNNING (bench_512k.log): d262144 tile
+(default) + dense pp2048 -r1, d524288 tile pp -r1, d524288 tg64 with
+GATHER+DEC+INT8. Memory budget ~105GB/121 at 512k. Gate: tg >= 10 t/s,
+pp continues the depth curve.
+
+LEVER 3 (streaming chunk-topk): READ COMPLETE. Current design: chunk kernel
+(SORT_N=4096 bitonic) emits INDEX-ONLY candidates; every merge level
+RE-READS scores via random 4B gathers (row[idx], uncoalesced) — LPDDR
+latency again, worst at decode (few blocks). Iter-13 item 3 = carry
+(score,idx) pairs through the candidate tree -> merges become pure-smem.
+Selection semantics identical (same values, same idx tie-break) -> existing
+backend-ops cases are the correctness gate; DSV4_LID_TOPK perf cases (deep
+shapes) are the perf gate, runnable model-free after the 512k battery.
+Scope: dsv4_lid_topk.cu chunk/merge/single kernels + scratch sizing (pairs
+= 8B, 2x scratch), ~+80/-40 LOC, 1 file. Ceiling: topk 5.8% of pp @d131k,
+bigger share of decode + at 512k (32 chunks, 2 merge levels of 4096-wide
+random gathers).
