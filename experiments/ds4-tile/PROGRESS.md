@@ -719,3 +719,40 @@ appears.
 
 Status: integration kept env-gated OFF (LLAMA_DSV4_CSA_UNION, default off);
 ops validated + committed. Do NOT enable until the cumulative bug is fixed.
+
+## Iteration 18d — B2 debug CRACKED (partial) + design reframe
+
+Two findings from deep bisection of the union garbage:
+
+1. CUMULATIVE BUG FIXED (memb rewrite). Root cause: the original memb kernel
+   REBUILT its own bitmap and computed rank independently of the union op's
+   emit order. Despite passing token-0 spot checks, the two bitmaps could
+   disagree on some patterns in deeper layers -> gather/mask misalignment that
+   compounded across 21 layers into garbage (single-layer was fine). Rewrote
+   memb to use union_idx DIRECTLY via binary search (parallel, TPB=8 grid) ->
+   gather order and mask are guaranteed consistent. Also ~10x faster. Backend-
+   ops 5/5. Cap-mode is now COHERENT (was garbage).
+
+2. DESIGN REFRAME (the real blocker). The CSA attention is called with
+   nt_s=2048 (the FULL ubatch), NOT nt_s<=16 as the shape-probe (iter 17b)
+   suggested. Instrumented union sizes: at nt_s=2048, union_cnt = 1881-2048 of
+   n_csa=2048 (92-100%). So the whole-ubatch union covers ~ALL cells -> ZERO
+   compaction. The +14.6% (iter 18) was from cap-TRUNCATION (drop cells beyond
+   cap by lowest-index) = a coarse, wrong approximation, not tight per-tile
+   union. B2's compaction only exists at small W (iter 17: W=16 -> 5x). So a
+   correct+fast B2 MUST sub-tile the nt_s=2048 call into W<=16 groups, each with
+   its own union + gathered K, via a BATCHED FA over nt_s/W tiles. That's the
+   harder design scoped in iter 17 (per-tile gather + batched flash_attn_ext).
+
+3. Residual exact-mode bug: full-union (u_max=n_csa) still garbage while cap
+   (u_max<union, no padding) is coherent. Isolated to the PADDING slots
+   (union_idx padded with n_csa-1 when u_max>union_cnt): masking those all-(-inf)
+   duplicate columns breaks FA (attending them via zeros mask is fine). Dense
+   has scattered all-(-inf) cells and works; the duplicate-contiguous padding
+   is the trigger. Unresolved; avoided in cap mode (padding-free by
+   construction since union>cap there).
+
+STATUS: memb rewrite is a real fix worth keeping (ops faster + cap-mode
+coherent). Integration stays env-gated OFF: it gives no compaction at nt_s=2048
+and cap-truncation is a poor approximation. Correct B2 = per-W-tile batched FA
+(next focused build). Ops (union_idx + memb) validated + reusable for it.
