@@ -756,3 +756,57 @@ STATUS: memb rewrite is a real fix worth keeping (ops faster + cap-mode
 coherent). Integration stays env-gated OFF: it gives no compaction at nt_s=2048
 and cap-truncation is a poor approximation. Correct B2 = per-W-tile batched FA
 (next focused build). Ops (union_idx + memb) validated + reusable for it.
+
+## Iteration 19 — B2 PER-TILE built end-to-end (tiles = virtual streams)
+
+Probes first (all model-free, test-backend-ops):
+- FA EXONERATED: test_fa_pad (trailing fully-masked duplicate KV columns = the
+  union padding pattern; mid-tile start, nb=2048, sinks, batched nr3=128) —
+  18/18 OK on CUDA. The iter-18d "padding breaks FA" attribution was wrong;
+  the residual full-union bug is in the (now superseded) whole-batch model
+  path, NOT the FA kernel. Learned: CUDA FA requires total kv 256-aligned
+  (n_raw 2304 + u_cap 2048 = 4352 OK).
+- PERF GO/NO-GO (hsk=hsv=512, nh=1, nr2=64, sinks, real geometry):
+    d32k  dense kv=10496 nb=2048: 69.0ms 40.8 TFLOPS
+    d32k  tiled kv=3328  T=128  : 74.1ms 12.1 TFLOPS  -> 0.93x LOSES
+    d131k dense kv=35072 nb=2048: 230.0ms 40.9 TFLOPS
+    d131k tiled kv=3840  T=128  : 85.1ms  12.1 TFLOPS -> 2.70x
+    d131k tiled kv=4352  T=128  : 95.9ms             -> 2.40x
+    d131k tiled kv=5376  T=32 (W=64): 117.7ms        -> 1.95x
+  Tiled FA runs at ~12 TFLOPS vs 41 dense (small-nb mma config; flat across
+  W=16/64) -> depth-gate required; break-even ~n_csa 16k. FUTURE LEVER:
+  close the 12->41 TFLOPS gap (fattn ncols config for small nb) => tiled
+  would win everywhere and ~9x at d131k.
+- PRECEDENT (../quartile attn.rs): attend_var_m_shared = the SAME design
+  (shared gathered KV union + per-row additive mask into it, sinks in the
+  softmax max), validated there; pads with finite -1e30 (not -inf); its docs
+  note tiled-online reassociation is NOT bit-exact — expected, matches A/B.
+
+Build (per-tile union via dim-3 "virtual streams" — build_attn_mha derives
+n_stream from k->ne[3] and splits Q/reassembles out for free; token order is
+already tile-major):
+- ggml_dsv4_lid_union(+W): per-tile unions [u_max, T, 1, ns], T=ceil(nt_s/W),
+  partial last tile OK; memb reads W from uni op_params -> per-tile membership
+  (same out shape; reshape to [u_max, W, 1, T] is free). CUDA grid (T, ns);
+  memb reloads smem union on tile crossing (never for W%8==0). CPU refs match.
+  backend-ops 20/20 (W=0 back-compat + W=16/8, partial, overflow, streams, deep).
+- graph (LLAMA_DSV4_CSA_TILE=W, default off): flat-ids get_rows gather of all
+  per-tile unions, repeat_4d raw window across tiles, concat dim2 ->
+  k_all [hd,1,n_raw+u_cap,T]; mask = reshape(raw_mask)||memb [.,W,1,T].
+  Gates: n_stream==1, nt_s%W==0, n_csa>=LLAMA_DSV4_CSA_TILE_MIN (default
+  12288), u_cap(LLAMA_DSV4_CSA_TILE_UCAP, default 2048) <n_csa, 256-alignment,
+  raw_mask ne1==nt_s. Replaces the whole-batch union branch (cap-truncation
+  mode retired).
+- tooling: experiments/ds4-tile/ab.sh — greedy prefill-path A/B vs banked
+  baseline (prompt-cache would skip prefill; full reprocess ~50s/leg).
+
+Gates so far:
+- ab.sh tile16 (TILE_MIN=2048, 15388-tok prompt): output COHERENT, first
+  stretch token-identical then plausible divergence; rerun == rerun
+  (DETERMINISTIC). Divergence = fp reassociation of the reduced/reordered
+  KV set (quartile precedent) — bit-exactness not expected for per-tile.
+- perf @ shallow (n_csa<=3847, forced on): 281.8 vs 292.0 t/s dense — the
+  expected below-gate loss; real gate is d65536+.
+PENDING: pp2048@d65536 dense vs tile (running), d131k leg (-r 1, OOM-careful),
+union overflow stats at depth (u_cap 2048 headroom), PPL quality gate at safe
+depth.

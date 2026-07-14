@@ -5419,16 +5419,22 @@ struct ggml_tensor * ggml_dsv4_lid_union(
         struct ggml_context * ctx,
         struct ggml_tensor  * top_k,
         int                   n_csa,
-        int                   u_max) {
+        int                   u_max,
+        int                   W) {
     GGML_ASSERT(top_k);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
     GGML_ASSERT(u_max > 0 && n_csa > 0);
+    GGML_ASSERT(W >= 0);
 
+    const int64_t nt_s     = top_k->ne[1];
     const int64_t n_stream = top_k->ne[3];
 
-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u_max, 1, 1, n_stream);
+    const int64_t n_tiles = (W <= 0 || W >= nt_s) ? 1 : (nt_s + W - 1)/W;
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u_max, n_tiles, 1, n_stream);
     ggml_set_op_params_i32(result, 0, (int32_t) n_csa);
     ggml_set_op_params_i32(result, 1, (int32_t) u_max);
+    ggml_set_op_params_i32(result, 2, (int32_t) W);
 
     result->op     = GGML_OP_DSV4_LID_UNION;
     result->src[0] = top_k;

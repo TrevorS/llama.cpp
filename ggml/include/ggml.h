@@ -2416,24 +2416,29 @@ extern "C" {
             struct ggml_tensor  * mask,
             int                   n_top_k);
 
-    // DeepSeek-V4 B2 sparse-CSA: per-call (nt_s tokens = one union tile) union of
-    // the tokens' top-k CSA selections, so main attention runs over the compact
-    // union instead of the full n_csa.
+    // DeepSeek-V4 B2 sparse-CSA: per-tile (W consecutive tokens) union of the
+    // tokens' top-k CSA selections, so main attention runs over the compact
+    // per-tile union instead of the full n_csa.
     //   top_k : [n_top_k, nt_s, 1, n_stream] I32 (from ggml_dsv4_lid_topk)
-    // union : [u_max, 1, 1, n_stream] I32 — sorted unique union per stream,
+    //   W     : tokens per union tile; 0 (or >= nt_s) = one tile for the whole
+    //           batch. T = ceil(nt_s/W) tiles; the last tile may be partial.
+    // union : [u_max, T, 1, n_stream] I32 — sorted unique union per tile,
     //         padded with (n_csa-1). u_max caps the union (overflow drops the
     //         highest-index cells; size it >= expected union).
     GGML_API struct ggml_tensor * ggml_dsv4_lid_union(
             struct ggml_context * ctx,
             struct ggml_tensor  * top_k,
             int                   n_csa,
-            int                   u_max);
+            int                   u_max,
+            int                   W);
 
     // Membership mask for the union: memb[u, t] = 0 if token t selected
-    // union[u], -INFINITY otherwise (and -INFINITY for padded union slots).
+    // union[u] of ITS tile (tile = t/W from uni), -INFINITY otherwise (and
+    // -INFINITY for padded union slots).
     //   top_k : [n_top_k, nt_s, 1, n_stream] I32
-    //   uni   : [u_max, 1, 1, n_stream]      I32 (from ggml_dsv4_lid_union)
-    // out : [u_max, nt_s, 1, n_stream] F32
+    //   uni   : [u_max, T, 1, n_stream]      I32 (from ggml_dsv4_lid_union)
+    // out : [u_max, nt_s, 1, n_stream] F32 — reshapeable to [u_max, W, 1, T]
+    //       when n_stream == 1 and nt_s == W*T.
     GGML_API struct ggml_tensor * ggml_dsv4_lid_memb(
             struct ggml_context * ctx,
             struct ggml_tensor  * top_k,

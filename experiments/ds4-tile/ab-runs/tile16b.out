@@ -1,0 +1,12 @@
+/
+// tensor creation
+
+static struct ggml_tensor * ggml_alloc_tensor(
+        struct ggml_context * ctx,
+        enum ggml_type       type,
+        const int64_t      * ne,
+        const size_t         nb_alloc,
+        const bool           is_view) {
+
+    // assert
+

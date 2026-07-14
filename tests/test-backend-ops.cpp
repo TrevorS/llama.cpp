@@ -5845,16 +5845,18 @@ struct test_dsv4_lid_topk : public test_case {
 // GGML_OP_DSV4_LID_UNION / GGML_OP_DSV4_LID_MEMB
 struct test_dsv4_lid_union : public test_case {
     const int64_t n_top_k, nt_s, n_stream, n_csa, u_max;
-    const bool memb; // false: test union_idx; true: test membership mask
+    const int64_t W;  // tokens per union tile (0 = whole batch)
+    const bool memb;  // false: test union_idx; true: test membership mask
 
     std::string op_desc(ggml_tensor *) override { return memb ? "DSV4_LID_MEMB" : "DSV4_LID_UNION"; }
     std::string vars() override {
         return "n_top_k=" + std::to_string(n_top_k) + ",nt_s=" + std::to_string(nt_s) +
                ",n_stream=" + std::to_string(n_stream) + ",n_csa=" + std::to_string(n_csa) +
-               ",u_max=" + std::to_string(u_max) + ",memb=" + std::to_string(memb);
+               ",u_max=" + std::to_string(u_max) + ",W=" + std::to_string(W) +
+               ",memb=" + std::to_string(memb);
     }
-    test_dsv4_lid_union(int64_t n_top_k, int64_t nt_s, int64_t n_stream, int64_t n_csa, int64_t u_max, bool memb)
-        : n_top_k(n_top_k), nt_s(nt_s), n_stream(n_stream), n_csa(n_csa), u_max(u_max), memb(memb) {}
+    test_dsv4_lid_union(int64_t n_top_k, int64_t nt_s, int64_t n_stream, int64_t n_csa, int64_t u_max, int64_t W, bool memb)
+        : n_top_k(n_top_k), nt_s(nt_s), n_stream(n_stream), n_csa(n_csa), u_max(u_max), W(W), memb(memb) {}
 
     // both ops are exact vs the CPU reference (deterministic union order); -inf
     // in the membership mask must compare equal.
@@ -5872,7 +5874,7 @@ struct test_dsv4_lid_union : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nt_s, 1, n_stream);
         ggml_set_name(top_k, "top_k");
-        ggml_tensor * uni = ggml_dsv4_lid_union(ctx, top_k, n_csa, u_max);
+        ggml_tensor * uni = ggml_dsv4_lid_union(ctx, top_k, n_csa, u_max, W);
         ggml_set_name(uni, "uni");
         ggml_tensor * out = memb ? ggml_dsv4_lid_memb(ctx, top_k, uni, n_csa) : uni;
         ggml_set_name(out, "out");
@@ -9469,11 +9471,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // B2 union + membership (top_k -> union_idx / membership mask)
     for (bool memb : { false, true }) {
-        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  8192, 4096, memb)); // realistic: union < u_max
-        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  4096, 2048, memb)); // overflow: union may exceed u_max
-        test_cases.emplace_back(new test_dsv4_lid_union(512,  1, 1,  8192, 2048, memb)); // decode-like: nt_s=1
-        test_cases.emplace_back(new test_dsv4_lid_union(256,  8, 2,  3000, 1500, memb)); // n_stream=2, odd n_csa
-        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1, 32768, 2048, memb)); // deep: n_csa=32768
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  8192, 4096, 0, memb)); // realistic: union < u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  4096, 2048, 0, memb)); // overflow: union may exceed u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  1, 1,  8192, 2048, 0, memb)); // decode-like: nt_s=1
+        test_cases.emplace_back(new test_dsv4_lid_union(256,  8, 2,  3000, 1500, 0, memb)); // n_stream=2, odd n_csa
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1, 32768, 2048, 0, memb)); // deep: n_csa=32768
+        // per-tile (W>0): T = ceil(nt_s/W) unions, memb per tile
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 128, 1,  8192, 2048, 16, memb)); // prefill-like: 8 tiles
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 100, 1,  8192, 2048, 16, memb)); // partial last tile
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  64, 1,  2048, 1024, 16, memb)); // per-tile overflow
+        test_cases.emplace_back(new test_dsv4_lid_union(256,  48, 2,  3000, 1500,  8, memb)); // tiles x streams
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  32, 1, 32768, 1024, 16, memb)); // deep per-tile
     }
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
 
