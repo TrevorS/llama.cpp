@@ -637,12 +637,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
     cb(indexer_k, "lid_k", il);
 
-    // Fused lightning-indexer score+top-k (env-gated). Replaces the 8-op chain
-    // below with a single op whose working set is O(chunk x n_tokens) instead of
-    // O(n_ctx x n_tokens x n_head), so long contexts stay allocatable.
+    // Fused lightning-indexer score+top-k (default ON; LLAMA_DSV4_FUSED_LID=0
+    // disables). Replaces the 8-op chain below with a single op whose working
+    // set is O(chunk x n_tokens) instead of O(n_ctx x n_tokens x n_head), so
+    // long contexts stay allocatable — the unfused chain OOMs >= d65536 ub2048.
     static const bool dsv4_fused_lid = []() {
         const char * e = getenv("LLAMA_DSV4_FUSED_LID");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     // Decode (nt==1): at shallow depth the unfused chain's top-k is faster at
     // batch 1, so it stays unfused. But its launch count scales with context
@@ -789,8 +790,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // attention (cost ~ n_top_k, not n_csa). Only for nt_s==1 (one query per
     // stream) — per-token index divergence within a tile needs the union path.
     static const bool dsv4_csa_gather = []() {
+        // Default ON; LLAMA_DSV4_CSA_GATHER=0 disables.
         const char * e = getenv("LLAMA_DSV4_CSA_GATHER");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     const int64_t nt_s     = top_k->ne[1];
     const int64_t n_top_k  = top_k->ne[0];

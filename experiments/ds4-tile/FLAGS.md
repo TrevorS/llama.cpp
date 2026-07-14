@@ -16,15 +16,15 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
 
 | Flag | Default | ON does | OFF does | Notes / validation |
 | --- | --- | --- | --- | --- |
-| `LLAMA_DSV4_FUSED_LID` | **OFF** (`=1` enables) | fused score+top-k op; O(chunk×nt) working set | unfused 8-op chain; O(n_ctx×nt×n_head) relu intermediate | **MANDATORY at depth** — unfused OOMs ≥ d65536 ub2048 (~8.6 GB relu). Token-identical (index-set + greedy gates). DEFAULT-ON CANDIDATE. |
+| `LLAMA_DSV4_FUSED_LID` | **ON** (`=0` disables, since 2026-07-14 P4a) | fused score+top-k op; O(chunk×nt) working set | unfused 8-op chain; O(n_ctx×nt×n_head) relu intermediate | **MANDATORY at depth** — unfused OOMs ≥ d65536 ub2048 (~8.6 GB relu). Token-identical (index-set + greedy gates). |
 | `LLAMA_DSV4_FUSED_LID_TG_DEPTH` | 4096 | — | — | decode (nt=1) uses unfused below this n_lid (faster at bs1 shallow); 0 = always fuse, huge = never |
 | `LLAMA_DSV4_HC_FUSED` | **ON** (`=0` disables, since 2026-07-14) | fused HC weighted_sum/post/sinkhorn kernels | scalar per-stream/unrolled chains (~16k-node decode graphs) | weighted_sum/post token-identical (gate 2); sinkhorn mode 21183→5439 nodes. Campaign refs always ran ON. |
 | `LLAMA_DSV4_CSA_TILE` | **ON, W=16** (`=0` disables) | B2 per-tile union-gather CSA attention (prefill) | dense masked CSA FA | all gates passed (PPL, passkey 5/5, determinism). +12.2% pp@d65k → +61.9% @d262k IQ3. Self-gated: nt_s>W, n_stream==1, nt_s%W==0, n_csa≥TILE_MIN, 256-alignment |
 | `LLAMA_DSV4_CSA_TILE_UCAP` | 4096 | — | — | per-tile union cap; keep n_raw+u_cap 256-aligned; tail few % tiles truncate at d65k+ (passkey/PPL clean) |
 | `LLAMA_DSV4_CSA_TILE_MIN` | 12288 | — | — | min n_csa to activate (~d49k); below it tiled FA loses (12 vs 41 TFLOPS small-nb latency wall) |
-| `LLAMA_DSV4_CSA_GATHER` | **OFF** (`=1` enables) | B1 decode gather: attend raw window + 512 selected rows only | dense masked CSA FA at decode | +8.3% tg@d65k, grows with depth; decode FA share 2.5% @512k with it ON. First ~25 greedy tokens identical then fp-reassociation. DEFAULT-ON CANDIDATE. |
-| `LLAMA_DSV4_LID_INT8` | **OFF** (`=1` enables) | int8 dp4a score kernel (prefill/batch) | wmma/fp16 score path | 1.36x kernel, +3.2% pp; 0.5% score error, PPL-neutral. Selection-set class. DEFAULT-ON CANDIDATE. |
-| `LLAMA_DSV4_LID_DEC` | **OFF** (`=1` enables) | dedicated nt=1 decode score kernel (warp-per-comp, int8) | 16-token-tile kernel with 15/16 padding waste at decode | 2.0x kernel, +5.2% tg (+10.8% with GATHER). Same int8 numerics class. DEFAULT-ON CANDIDATE. |
+| `LLAMA_DSV4_CSA_GATHER` | **ON** (`=0` disables, since 2026-07-14 P4a) | B1 decode gather: attend raw window + 512 selected rows only | dense masked CSA FA at decode | +8.3% tg@d65k, grows with depth; decode FA share 2.5% @512k with it ON. First ~25 greedy tokens identical then fp-reassociation. |
+| `LLAMA_DSV4_LID_INT8` | **ON** (`=0` disables, since 2026-07-14 P4a) | int8 dp4a score kernel (prefill/batch) | wmma/fp16 score path | 1.36x kernel, +3.2% pp; 0.5% score error, PPL-neutral. Selection-set class B (pass-1 only when LID_EXACT). |
+| `LLAMA_DSV4_LID_DEC` | **ON** (`=0` disables, since 2026-07-14 P4a) | dedicated nt=1 decode score kernel (warp-per-comp, int8) | 16-token-tile kernel with 15/16 padding waste at decode | 2.0x kernel, +5.2% tg (+10.8% with GATHER). Same int8 numerics class. |
 | `LLAMA_DSV4_LID_FP4` | OFF | e2m1 block-32 QAT fake-quant of indexer q/k (numerics only, no speedup) | fp16/fp32 indexer numerics | the model's official QAT indexer numeric; 0.93 top-512 overlap, deep PPL statistically identical. Keep opt-in until fp4 STORAGE lands. |
 | `LLAMA_DSV4_LID_EXACT` | OFF (`=1` enables) | two-pass selection: fast pass-1 (int8/dec allowed) to top-(512+m), exact QAT-fp32 rescore + bitonic select | single-pass selection in the pass-1 numeric class | **class A** — selection bit-exact vs official QAT graph; 36/36 zero-tolerance backend-ops. Implies QAT q/k numerics. Price with QAT_WRITE: −7.1% pp@d65536, +200 µs/layer decode (512k tg gate holds). P2/P3a, commits 2a947edec + 749dfde85. |
 | `LLAMA_DSV4_LID_RESCORE_M` | 64 | — | — | rescore margin m (candidates = top_k + m, cap 1024−512). Oracle p100 displacement = 26 on real dumps → 2.5× headroom. |
@@ -75,16 +75,19 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
   — whole-batch union path, replaced by `LLAMA_DSV4_CSA_TILE` (iter 18d/19).
 - `LLAMA_DSV4_LID_INT4` — negative result (compute-bound on nibble→int8 expansion, 1.6x slower than int8), reverted (iter 15).
 
-## Canonical bench/serving env (until the default-on candidates land)
+## Canonical bench/serving env
 
-```
-LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_CSA_GATHER=1 LLAMA_DSV4_LID_DEC=1 LLAMA_DSV4_LID_INT8=1
-```
-(tile + HC-fused already default-on; add `LLAMA_DSV4_LID_FP4=1` for QAT-numerics runs)
+As of P4a (2026-07-14) the fast profile IS the default — no env needed:
+FUSED_LID, CSA_GATHER, LID_INT8, LID_DEC, CSA_TILE, HC_FUSED all ON.
 
 Official-exact validation/reference profile (P2+P3a):
 
 ```
-LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_CSA_GATHER=1 LLAMA_DSV4_LID_DEC=1 LLAMA_DSV4_LID_INT8=1 \
 LLAMA_DSV4_LID_EXACT=1 LLAMA_DSV4_LID_QAT_WRITE=1
+```
+
+Pre-P4a baseline reproduction (all four legacy flags off):
+
+```
+LLAMA_DSV4_FUSED_LID=0 LLAMA_DSV4_CSA_GATHER=0 LLAMA_DSV4_LID_DEC=0 LLAMA_DSV4_LID_INT8=0
 ```

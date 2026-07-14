@@ -5834,9 +5834,12 @@ struct test_dsv4_lid_topk : public test_case {
         // LLAMA_DSV4_LID_INT8 scores via int8 dp4a vs the fp32 CPU reference;
         // per-row int8 quant flips a small fraction of near-tie selections
         // (observed <= 0.7%). Loosen the set-mismatch gate for that path.
+        // Both int8 and dec default ON (mirror dsv4_lid_topk.cu gates).
         const char * i8 = getenv("LLAMA_DSV4_LID_INT8");
         const char * dec = getenv("LLAMA_DSV4_LID_DEC");
-        if (((i8 && i8[0] == '1') || (dec && dec[0] == '1')) && d_idx == 128) return 1.2e-2;
+        const bool i8_on  = !i8  || i8[0]  != '0';
+        const bool dec_on = !dec || dec[0] != '0';
+        if ((i8_on || dec_on) && d_idx == 128) return 1.2e-2;
         return d_idx == 128 ? 3e-3 : 0.0;
     }
     double err(const float * a, const float * b, size_t n) override {

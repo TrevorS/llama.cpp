@@ -1289,3 +1289,24 @@ the zero-tolerance suite (the stronger gate).
 P3a DONE: official-exact selection at -7.1% pp / +4%-ish decode at 512k.
 Residual trims for P3b era: packed mxfp4 reads (bandwidth), possibly reusing
 pass-1 candidate scores in phase B. Next: P4 default flips + gates.sh, P3b.
+
+## Iteration 24 — P4a: four defaults flipped ON + gates.sh battery
+
+FLIPPED (one commit, FLAGS.md same commit): FUSED_LID, CSA_GATHER, LID_INT8,
+LID_DEC — all now `=0` disables. The fast serving profile IS the default;
+no env needed. test-backend-ops tolerance selection mirrors the new
+defaults (unset => int8-class 1.2e-2 gate on d_idx==128 topk cases).
+
+gates.sh (experiments/ds4-tile): one-command battery. quick = backend-ops
+sweep (6 DSV4 ops + EXACT zero-tolerance leg) + coherence + determinism;
+std adds PPL c32768 trio (defaults/exact/conservative, 2-sigma gate) +
+passkey 5-depth battery; full adds soft-gated depth legs (pp@d65536 >= 285,
+tg@d131072 >= 13.5). Corpus/prompts derive from immutable base-commit blobs
+(git show e3546c794:...) so the battery does not drift with the tree.
+Determinism stage: one retry on split, settled-pair rule per the
+machine-state variance findings.
+
+GATES (quick, post-flip): 7/7 ops PASS (incl EXACT zero-tolerance over the
+now-default int8 pass-1), coherence PASS (ggml.c continuation, clean),
+determinism PASS (run1 == run2, no retry needed). std/full battery deferred
+to P4b where it gates the EXACT-default decision on post-P3b numbers.

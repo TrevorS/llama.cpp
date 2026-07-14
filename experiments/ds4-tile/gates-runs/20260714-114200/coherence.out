@@ -1,0 +1,12 @@
+_time_init();
+
+        // initialize GELU, Softmax, etc. tables
+        ggml_fp16_tables_init();
+
+        is_first_call = false;
+    }
+
+    struct ggml_context * ctx = GGML_MALLOC(sizeof(struct ggml_context));
+
+    ctx->mem_size      = params.m
+

@@ -1021,16 +1021,18 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const float * k_f32_d = k_fp4_alloc.get();
     const bool k_is_f16 = (k->type == GGML_TYPE_F16) && !k_force_f32;
 
-    // int8 dp4a path (LLAMA_DSV4_LID_INT8): halves K smem width to attack the
-    // L1-bandwidth bound of the wmma path. Same per-stream launch geometry.
+    // int8 dp4a path (default ON; LLAMA_DSV4_LID_INT8=0 disables): halves K
+    // smem width to attack the L1-bandwidth bound of the wmma path. Same
+    // per-stream launch geometry.
     static const bool dsv4_lid_int8 = []() {
         const char * e = getenv("LLAMA_DSV4_LID_INT8");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
-    // Dedicated decode kernel (nt_s==1): warp-per-comp, no 16-token tile padding.
+    // Dedicated decode kernel (nt_s==1): warp-per-comp, no 16-token tile
+    // padding. Default ON; LLAMA_DSV4_LID_DEC=0 disables.
     static const bool dsv4_lid_dec = []() {
         const char * e = getenv("LLAMA_DSV4_LID_DEC");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
 
     // Tensor-core path: requires head_dim == 128 (the wmma 16x16x16 k-tiling).
