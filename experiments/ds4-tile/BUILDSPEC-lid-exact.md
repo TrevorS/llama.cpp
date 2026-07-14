@@ -68,24 +68,61 @@ All inside `ggml/src/ggml-cuda/dsv4_lid_topk.cu`:
 - Zero reader changes; q-side QAT stays in the score path.
 - Gate: backend-ops + selection identical to Phase-2 output (same values).
 
-3b. Packed container (storage + decode bandwidth):
-- NEW op `GGML_OP_DSV4_QAT_SET_ROWS` (constructor mirrors ggml_set_rows;
-  ~15 registration touchpoints as usual): f32 rows → MXFP4-container view
-  with QAT rounding. CUDA kernel reuses the A1 quantizer math, packs
-  nibbles + e8m0 scale. CPU ref mirrors.
-- `llama-kv-cache-dsv4.cpp:1067`: kv_lid ctor type → GGML_TYPE_MXFP4 when
-  `LLAMA_DSV4_LID_CACHE_MXFP4=1`; lid cpy_k routed to the new op.
-- Readers:
-  - decode: `dsv4_score_decode_kernel` KT=packed path — warp loads 68B/row
-    (17 words lane-strided), LUT nibble→f32 × exp2(e−127), existing shuffle
-    dot (drop int8 sub-path in packed mode; kernel is latency-bound).
-  - prefill: per-layer-per-ubatch staging dequant kernel
-    `dsv4_mxfp4_dequant_f16` (cache → pool f16 buffer, ~8MB @32k); wmma/int8
-    kernels consume staging unchanged.
-  - rescore: packed-exact dequant (bit-identical to write rounding).
-- Gate: backend-ops (packed cases for topk + decode), selection set ==
-  Phase-3a output exactly; decode kernel µs before/after (expect 2–3x);
-  tg64@d131072 and @d524288 re-legs; PPL spot.
+3b. Packed container (storage + decode bandwidth).
+SCOUTED 2026-07-14 (full blast-radius inventory; refs on this branch):
+
+Two-step landing — correctness first, packed readers second:
+
+3b-i. MXFP4 container + QAT write + staged-dequant reads (correctness):
+- Decouple lid type: `llama-kv-cache-dsv4.cpp:1067` passes the SHARED
+  `type_k` to all 4 sub-caches (raw/csa/hca/lid) — flip ONLY the lid ctor
+  arg to GGML_TYPE_MXFP4 under `LLAMA_DSV4_LID_CACHE_MXFP4=1`; never touch
+  the shared type_k. d=128 → 4 block-32 → 68 B/row. clear() memset-zero
+  decodes to 0.0 (scale byte 0 + zero nibbles) — still deterministic.
+- NEW op `GGML_OP_DSV4_QAT_SET_ROWS`: stock set_rows CANNOT be used —
+  CUDA set-rows.cu:230-321 has no MXFP4 dst (GGML_ABORT) and all its
+  quantize funcs are stock rounding; CPU ops.cpp:5061 would silently use
+  ggml's from_float (wrong scale + tie-break). New op mirrors
+  set_rows_cuda_quant with OUR quantizer (dsv4_fp4_quant_kernel math,
+  scale exp2(ceil(log2(amax/6))), even-index tie-break). CPU ref mirrors
+  via dsv4_fp4_quant_row_cpu. Write site: cpy_k ends in ggml_set_rows at
+  llama-kv-cache.cpp:1327 and is SHARED by all caches — add a lid-only
+  write path in deepseek4.cpp (~:1203) instead of editing cpy_k. The
+  ggml_dsv4_fp4_rt insert (:1199) becomes redundant in packed mode
+  (rounding folds into the scatter).
+- Read side (ALL via existing staging, zero kernel changes): the
+  LID_FP4 path already stages K into a dense f32 pool buffer
+  (dsv4_lid_topk.cu:1007-1020, k_force_f32) — replace the fill with
+  dequantize_row_mxfp4_cuda (convert.cu:751/809 already maps MXFP4) or a
+  custom unpack; every kernel (wmma/int8/dec/rescore) takes its existing
+  float arm. Do NOT lean on ggml_get_rows/ggml_cpy (no MXFP4 in either).
+- Assert/dispatch fixes: dsv4_lid_topk.cu:892 + ops.cpp:8381 K-type
+  asserts (add MXFP4); :895 nb[0]==type_size assert (block semantics);
+  :960 nbk2/nbk3 element-stride division (packed = block strides — the
+  landmine; staging sidesteps it, native readers must index by block);
+  ggml-cuda.cu:4967 supports_op src[1] whitelist + new-op arm + CPU case.
+  CPU lid_topk K branch (ops.cpp:8432-8459): add MXFP4 unpack arm
+  (dequant-then-as-is; QAT already applied at write).
+- Session save/restore: dsv4_state_write/read_k_cache
+  (llama-kv-cache-dsv4.cpp:292/:319) is ggml_row_size byte-copy —
+  type-agnostic, works unchanged; bump DSV4_K_CACHE_STATE_VER (:336) so
+  F16 snapshots don't cross-load.
+- Non-fused paths: ggml_lightning_indexer (:682, CPU-only) and manual
+  mul_mat (:691) — mul_mat dequants MXFP4 natively; guard or document
+  (not the resident GPU path).
+- Gate: backend-ops packed cases (topk all variants + qat_set_rows,
+  zero-tolerance under EXACT), selection set == P3a output exactly,
+  --prompt-cache save/load round-trip, PPL spot.
+
+3b-ii. Native packed readers (perf, after 3b-i gates):
+- decode: dsv4_score_decode_kernel KT=packed — warp loads 68B/row
+  (17 words lane-strided), LUT nibble→f32 × exp2(e−127), existing shuffle
+  dot. Expect 2–3× on the latency-bound decode kernel; this is where the
+  exact-mode +200µs/layer decode price gets clawed back.
+- int8 prefill kernel packed stage; rescore packed-exact dequant
+  (bit-identical to write rounding).
+- Gate: decode kernel µs before/after; tg64@d131072/@d524288 re-legs;
+  selection unchanged vs 3b-i.
 
 ## Phase 4 — profiles, defaults, docs
 
