@@ -5940,6 +5940,44 @@ struct test_dsv4_fp4_rt : public test_case {
     }
 };
 
+// GGML_OP_DSV4_QAT_SET_ROWS (QAT-rounded scatter into a packed MXFP4 container)
+struct test_dsv4_qat_set_rows : public test_case {
+    const int64_t ne0, kv_size, r;
+
+    std::string vars() override {
+        return "ne0=" + std::to_string(ne0) + ",kv_size=" + std::to_string(kv_size) +
+               ",r=" + std::to_string(r);
+    }
+    // CPU and CUDA implement the identical QAT pack (same scale, same
+    // tie-break, same nibble layout) -> containers must match exactly.
+    double max_err(ggml_backend_t) override { return 0.0; }
+
+    test_dsv4_qat_set_rows(int64_t ne0, int64_t kv_size, int64_t r)
+        : ne0(ne0), kv_size(kv_size), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, ne0, kv_size);
+        ggml_set_name(dst, "dst");
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, r);
+        ggml_set_name(row_idxs, "row_idxs");
+        ggml_tensor * out = ggml_dsv4_qat_set_rows(ctx, dst, src, row_idxs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, kv_size);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9540,6 +9578,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_fp4_rt({128, 1, 1, 1}));    // single row
     test_cases.emplace_back(new test_dsv4_fp4_rt({256, 7, 1, 2}));    // multi-block rows
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // wmma: F32 k, partial tile
+
+    // P3b packed MXFP4 lid container
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(256, 32, 1));    // multi-block single row
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  2048,    4, 1, 512)); // packed K, wmma dims
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  4096,    1, 1, 512)); // packed K, decode kernel
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4,  64,  8,  1024,    8, 1, 256)); // packed K, scalar path
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  1500,   20, 2, 128)); // packed K, n_stream=2
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

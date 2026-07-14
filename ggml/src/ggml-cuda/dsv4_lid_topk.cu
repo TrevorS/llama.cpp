@@ -78,6 +78,74 @@ static __global__ void dsv4_fp4_quant_kernel(
     out[(int64_t) row * d_idx + tid] = dsv4_e2m1_dequant(q) * scale;
 }
 
+// ---------------------------------------------------------------------------
+// P3b packed MXFP4 lid container: 17B block-32 (e8m0 scale byte + 16 nibble
+// bytes, ggml block_mxfp4 element order: low nibble -> j, high -> j+16).
+// Rounding is the DSV4 QAT search above, NOT ggml's stock quantizer. With
+// level values stored at TRUE e2m1 magnitudes, e = s + 127 makes the dequant
+// scale 2^(e-127) == the QAT scale, so dequant(pack(x)) == dsv4_fp4_rt(x)
+// exactly (pure power-of-two products).
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ int dsv4_e2m1_index(float x) {
+    const int sgn = x < 0.0f ? 8 : 0;
+    const float ax = fminf(fabsf(x), 6.0f);
+    const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    int   best = 0;
+    float bd   = fabsf(ax - lv[0]);
+#pragma unroll
+    for (int i = 1; i < 8; i++) {
+        const float d = fabsf(ax - lv[i]);
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) { best = i; bd = d; }
+    }
+    return best | sgn;
+}
+
+// One block per source row (blockDim.x == ne0, multiple of 32); QAT-quantizes
+// and packs the row into the MXFP4 container at row idxs[blockIdx.x].
+static __global__ void dsv4_qat_set_rows_kernel(
+        uint8_t * __restrict__ dst, const float * __restrict__ src,
+        const void * __restrict__ idxs, const int idx_i64,
+        int64_t nb1_dst, int64_t nb1_src, int ne0) {
+    const int row  = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int64_t idx = idx_i64 ? ((const int64_t *) idxs)[row]
+                                : (int64_t) ((const int32_t *) idxs)[row];
+    const float v = src[(int64_t) row * nb1_src + tid];
+    float a = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    a = fmaxf(a, 7.052966104933725e-38f);
+    const int   sc    = (int) ceilf(log2f(a / 6.0f));
+    const float scale = exp2f((float) sc);
+    const int ni = dsv4_e2m1_index(fminf(6.0f, fmaxf(-6.0f, v / scale)));
+    const int hi = __shfl_down_sync(0xffffffffu, ni, 16);
+    uint8_t * blk = dst + idx*nb1_dst + (int64_t) (tid >> 5) * 17;
+    if (lane == 0)  blk[0] = (uint8_t) (sc + 127);
+    if (lane < 16)  blk[1 + lane] = (uint8_t) (ni | (hi << 4));
+}
+
+// Staging dequant: packed [d_idx, n_lid, n_stream] cache view -> dense f32
+// buffer, one block per row (blockDim.x == d_idx). Strides in BYTES (block
+// rows; element strides are meaningless for packed types).
+static __global__ void dsv4_mxfp4_dequant_rows_kernel(
+        float * __restrict__ out, const uint8_t * __restrict__ in,
+        int64_t nb2, int64_t nb3, int rows_per_group, int ne0) {
+    const float lv[16] = {  0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+    const int row  = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int64_t g = row / rows_per_group;
+    const int64_t r = row % rows_per_group;
+    const uint8_t * blk = in + g*nb3 + r*nb2 + (int64_t) (tid >> 5) * 17;
+    const float d = exp2f((float) ((int) blk[0] - 127));
+    const uint8_t byte = blk[1 + (lane & 15)];
+    const int ni = lane < 16 ? (byte & 0x0F) : (byte >> 4);
+    out[(int64_t) row * ne0 + tid] = lv[ni] * d;
+}
+
 template <typename KT>
 static __global__ void dsv4_score_kernel(
         float       * __restrict__ scores,   // [nt, n_lid]
@@ -540,6 +608,26 @@ void ggml_cuda_op_dsv4_fp4_rt(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             (float *) dst->data, (const float *) x->data, ne0, 0, nrows, ne0);
 }
 
+// QAT-rounded scatter into the packed MXFP4 lid container
+// (GGML_OP_DSV4_QAT_SET_ROWS). dst is a view of the container; src0 = f32
+// rows, src1 = row indices.
+void ggml_cuda_op_dsv4_qat_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * b = dst->src[0];
+    const ggml_tensor * c = dst->src[1];
+    GGML_ASSERT(dst->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    const int64_t ne0 = b->ne[0];
+    GGML_ASSERT(ne0 % 32 == 0 && ne0 <= 1024);
+    const int64_t n_rows = b->ne[1];
+    if (n_rows == 0) {
+        return;
+    }
+    dsv4_qat_set_rows_kernel<<<n_rows, ne0, 0, ctx.stream()>>>(
+            (uint8_t *) dst->data, (const float *) b->data, c->data,
+            c->type == GGML_TYPE_I64 ? 1 : 0,
+            dst->nb[1], b->nb[1] / sizeof(float), (int) ne0);
+}
+
 void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * top_k = dst->src[0];
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
@@ -889,10 +977,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(mask->type    == GGML_TYPE_F32);
     GGML_ASSERT(dst->type     == GGML_TYPE_I32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_MXFP4);
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(weights));
     GGML_ASSERT(k->nb[0] == ggml_type_size(k->type)); // head dim contiguous
+    GGML_ASSERT(k->type != GGML_TYPE_MXFP4 || q->ne[0] % 32 == 0);
 
     const int d_idx    = q->ne[0];
     const int n_head   = q->ne[1];
@@ -915,7 +1004,13 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     static const int dump_nlid = getenv("LLAMA_DSV4_LID_DUMP_NLID")
         ? atoi(getenv("LLAMA_DSV4_LID_DUMP_NLID")) : 0;
     static bool dumped = false;
-    if (dump_dir && !dumped && nt > 1 && n_lid >= dump_nlid) {
+    if (dump_dir && !dumped && k->type == GGML_TYPE_MXFP4) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "\ndsv4_lid_topk: LID_DUMP not supported with packed MXFP4 cache — skipping\n");
+        }
+    } else if (dump_dir && !dumped && nt > 1 && n_lid >= dump_nlid) {
         dumped = true;
         const int nt_dump = nt < 256 ? nt : 256;
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -957,8 +1052,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     ggml_cuda_pool_alloc<float> scores_alloc(pool, (size_t) nt * n_lid);
     float * scores = scores_alloc.get();
 
-    int64_t nbk2 = k->nb[2] / ggml_type_size(k->type);
-    int64_t nbk3 = k->nb[3] / ggml_type_size(k->type);
+    // element strides are meaningless for the packed MXFP4 container; its
+    // staging path below overwrites these with dense-buffer strides
+    const bool k_is_mxfp4 = k->type == GGML_TYPE_MXFP4;
+    int64_t nbk2 = k_is_mxfp4 ? 0 : k->nb[2] / ggml_type_size(k->type);
+    int64_t nbk3 = k_is_mxfp4 ? 0 : k->nb[3] / ggml_type_size(k->type);
     const int64_t nbm1 = mask->nb[1] / sizeof(float);
     const int64_t nbm3 = mask->nb[3] / sizeof(float);
 
@@ -1004,7 +1102,18 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 q_fp4, q_d, d_idx, 0, n_head * nt, d_idx);
         q_d = q_fp4;
     }
-    if (dsv4_lid_fp4 && !dsv4_lid_qat_write) {
+    if (k_is_mxfp4) {
+        // packed container: stage-dequant the whole strided cache view into a
+        // dense f32 buffer. Rows hold QAT values by construction (written via
+        // DSV4_QAT_SET_ROWS), so no re-simulation regardless of env — every
+        // downstream kernel takes its existing float dispatch.
+        float * k_deq = k_fp4_alloc.alloc((size_t) n_stream * n_lid * d_idx);
+        dsv4_mxfp4_dequant_rows_kernel<<<n_stream * n_lid, d_idx, 0, stream>>>(
+                k_deq, (const uint8_t *) k->data, k->nb[2], k->nb[3], n_lid, d_idx);
+        k_force_f32 = true;
+        nbk2 = d_idx;
+        nbk3 = (int64_t) d_idx * n_lid;
+    } else if (dsv4_lid_fp4 && !dsv4_lid_qat_write) {
         float * k_fp4 = k_fp4_alloc.alloc((size_t) n_stream * n_lid * d_idx);
         // k: strided view, group = stream (stride nbk3), row = j (stride nbk2).
         if (k->type == GGML_TYPE_F16) {
@@ -1125,7 +1234,10 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     cand_val_alloc.get(), cand_alloc.get(),
                     q_d, w_d, (const half *) k->data, m_d, nbk2, nbk3, nbm1, nbm3,
                     n_cand, n_lid, n_head, d_idx, nt_s);
-        } else if (dsv4_lid_qat_write) {
+        } else if (dsv4_lid_qat_write && !k_force_f32) {
+            // qat_write with an F32 cache: rows already QAT, read in place.
+            // MUST NOT trigger when a staged buffer exists (packed MXFP4
+            // cache) — k->data would be reinterpreted block bytes.
             dsv4_lid_rescore_score_kernel<float><<<grid_rs, 128, 0, stream>>>(
                     cand_val_alloc.get(), cand_alloc.get(),
                     q_d, w_d, (const float *) k->data, m_d, nbk2, nbk3, nbm1, nbm3,

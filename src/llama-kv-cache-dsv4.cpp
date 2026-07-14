@@ -22,7 +22,9 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 2;   // v2: partial save now includes base + block caches
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
-static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 1;
+// v2: lid cache may be a packed MXFP4 container (LLAMA_DSV4_LID_CACHE_MXFP4);
+// row byte counts differ from f16/f32 snapshots, so old states must not load
+static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
@@ -1061,11 +1063,21 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
-    LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
+    // Packed MXFP4 lid container (P3b, LLAMA_DSV4_LID_CACHE_MXFP4=1): rows
+    // hold official QAT values in 68 B (d=128) instead of 256 B f16 — written
+    // via GGML_OP_DSV4_QAT_SET_ROWS, staged-dequant on read. Only the lid
+    // sub-cache decouples from type_k; raw/csa/hca keep the shared type.
+    static const bool dsv4_lid_cache_mxfp4 = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_CACHE_MXFP4");
+        return e && e[0] == '1';
+    }();
+    const ggml_type type_lid = dsv4_lid_cache_mxfp4 ? GGML_TYPE_MXFP4 : type_k;
+
+    LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells, type = %s\n",
+            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO), ggml_type_name(type_lid));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, type_lid, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1701,6 +1713,10 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_qat(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

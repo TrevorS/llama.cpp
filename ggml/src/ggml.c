@@ -1102,9 +1102,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_MOE_GATE_UP",
     "DSV4_HC_FUSED",
     "DSV4_FP4_RT",
+    "DSV4_QAT_SET_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,9 +1222,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_moe_gate_up(gate,up,x,ids)",
     "dsv4_hc_fused(x,a,b,c)",
     "dsv4_fp4_rt(x)",
+    "dsv4_qat_set_rows(a,b,c)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5615,6 +5617,37 @@ struct ggml_tensor * ggml_dsv4_fp4_rt(
 
     result->op     = GGML_OP_DSV4_FP4_RT;
     result->src[0] = x;
+
+    return result;
+}
+
+// ggml_dsv4_qat_set_rows
+
+struct ggml_tensor * ggml_dsv4_qat_set_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(a->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[0] % 32 == 0);
+    GGML_ASSERT(b->ne[1] == c->ne[0]);
+    // 2D only (the lid cpy path merges dims 0/1 before scattering)
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+
+    // same src layout as GGML_OP_SET_ROWS: result views the container
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op     = GGML_OP_DSV4_QAT_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;
 
     return result;
 }

@@ -2005,6 +2005,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_fp4_rt(params, tensor);
             } break;
+        case GGML_OP_DSV4_QAT_SET_ROWS:
+            {
+                ggml_compute_forward_dsv4_qat_set_rows(params, tensor);
+            } break;
         case GGML_OP_TOP_K:
             {
                 ggml_compute_forward_top_k(params, tensor);
@@ -2409,6 +2413,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_MOE_GATE_UP:
         case GGML_OP_DSV4_HC_FUSED:
         case GGML_OP_DSV4_FP4_RT:
+        case GGML_OP_DSV4_QAT_SET_ROWS:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:

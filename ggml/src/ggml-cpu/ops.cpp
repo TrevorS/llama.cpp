@@ -8367,6 +8367,57 @@ static void dsv4_fp4_quant_row_cpu(float * dst, const float * src, int64_t d_idx
     }
 }
 
+// MXFP4 packed container (P3b): 17B blocks — e8m0 scale byte + 16 nibble
+// bytes in ggml's block_mxfp4 element order (low nibble -> j, high -> j+16).
+// The packer uses the DSV4 QAT rounding (same search as the fake-quant
+// above), NOT ggml's stock quantizer; encode e = s + 127 with the level
+// table at TRUE e2m1 values so dequant d = 2^(e-127) == the QAT scale and
+// dequant(pack(x)) == dsv4_fp4_quant_row_cpu(x) exactly.
+
+static uint8_t dsv4_e2m1_index_cpu(float x) {
+    static const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const int sgn = x < 0.0f ? 8 : 0;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int   best = 0;
+    float bd   = fabsf(ax - lv[0]);
+    for (int i = 1; i < 8; i++) {
+        const float d = fabsf(ax - lv[i]);
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) { best = i; bd = d; }
+    }
+    return (uint8_t) (best | sgn);
+}
+
+static void dsv4_qat_pack_row_cpu(uint8_t * dst, const float * src, int64_t ne0) {
+    for (int64_t off = 0; off < ne0; off += 32) {
+        float amax = 0.0f;
+        for (int64_t i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(src[off + i]));
+        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
+        const int   s     = (int) ceilf(log2f(amax / 6.0f));
+        const float scale = ldexpf(1.0f, s);
+        dst[0] = (uint8_t) (s + 127);
+        for (int i = 0; i < 16; i++) {
+            const float v0 = fminf(6.0f, fmaxf(-6.0f, src[off + i]      / scale));
+            const float v1 = fminf(6.0f, fmaxf(-6.0f, src[off + i + 16] / scale));
+            dst[1 + i] = (uint8_t) (dsv4_e2m1_index_cpu(v0) | (dsv4_e2m1_index_cpu(v1) << 4));
+        }
+        dst += 17;
+    }
+}
+
+static void dsv4_mxfp4_dequant_row_cpu(float * dst, const void * src, int64_t ne0) {
+    static const float lv[16] = {  0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+    const uint8_t * p = (const uint8_t *) src;
+    for (int64_t off = 0; off < ne0; off += 32) {
+        const float d = ldexpf(1.0f, (int) p[0] - 127);
+        for (int i = 0; i < 16; i++) {
+            dst[off + i]      = lv[p[1 + i] & 0x0F] * d;
+            dst[off + i + 16] = lv[p[1 + i] >>   4] * d;
+        }
+        p += 17;
+    }
+}
+
 void ggml_compute_forward_dsv4_lid_topk(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -8378,7 +8429,7 @@ void ggml_compute_forward_dsv4_lid_topk(
     GGML_ASSERT(q->type       == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(mask->type    == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_MXFP4);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
 
     const int64_t d_idx    = q->ne[0];
@@ -8430,18 +8481,30 @@ void ggml_compute_forward_dsv4_lid_topk(
 
         for (int64_t j = 0; j < n_lid; j++) {
             const char * k_j = (const char *) k->data + s*k->nb[3] + j*k->nb[2];
+            float kd[128];
+            const float * k_deq = nullptr; // set when the cache row is packed MXFP4
+            if (k->type == GGML_TYPE_MXFP4) {
+                // packed rows hold QAT values by construction (written via
+                // DSV4_QAT_SET_ROWS) -> dequant is exact, no re-simulation
+                dsv4_mxfp4_dequant_row_cpu(kd, k_j, d_idx);
+                k_deq = kd;
+            }
             if (fp4) {
-                float tmp[128];
-                if (k->type == GGML_TYPE_F32) {
-                    for (int64_t d = 0; d < d_idx; d++) tmp[d] = ((const float *) k_j)[d];
+                if (k_deq) {
+                    for (int64_t d = 0; d < d_idx; d++) kq[d] = k_deq[d];
                 } else {
-                    for (int64_t d = 0; d < d_idx; d++) tmp[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *) k_j)[d]);
-                }
-                if (qat_write) {
-                    // cache already QAT -> use values as-is
-                    for (int64_t d = 0; d < d_idx; d++) kq[d] = tmp[d];
-                } else {
-                    dsv4_fp4_quant_row_cpu(kq.data(), tmp, d_idx);
+                    float tmp[128];
+                    if (k->type == GGML_TYPE_F32) {
+                        for (int64_t d = 0; d < d_idx; d++) tmp[d] = ((const float *) k_j)[d];
+                    } else {
+                        for (int64_t d = 0; d < d_idx; d++) tmp[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *) k_j)[d]);
+                    }
+                    if (qat_write) {
+                        // cache already QAT -> use values as-is
+                        for (int64_t d = 0; d < d_idx; d++) kq[d] = tmp[d];
+                    } else {
+                        dsv4_fp4_quant_row_cpu(kq.data(), tmp, d_idx);
+                    }
                 }
             }
             float acc = 0.0f;
@@ -8451,6 +8514,8 @@ void ggml_compute_forward_dsv4_lid_topk(
                 if (fp4) {
                     const float * kh = kq.data();
                     for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
+                } else if (k_deq) {
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * k_deq[d];
                 } else if (k->type == GGML_TYPE_F32) {
                     const float * kh = (const float *) k_j;
                     for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
@@ -8789,6 +8854,35 @@ void ggml_compute_forward_dsv4_fp4_rt(
         dsv4_fp4_quant_row_cpu(
                 (float *)((char *) dst->data + r*dst->nb[1]),
                 (const float *)((const char *) x->data + r*x->nb[1]),
+                ne0);
+    }
+}
+
+// ggml_compute_forward_dsv4_qat_set_rows
+//
+// set_rows into an MXFP4 container with the DSV4 QAT rounding (P3b packed
+// lid cache). dst is a view of the container; src0 = f32 rows, src1 = idxs.
+
+void ggml_compute_forward_dsv4_qat_set_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * b = dst->src[0]; // [ne0, n_rows] F32
+    const ggml_tensor * c = dst->src[1]; // [n_rows] I64/I32
+
+    GGML_ASSERT(dst->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->ne[0] % 32 == 0);
+
+    const int64_t ne0    = b->ne[0];
+    const int64_t n_rows = b->ne[1];
+
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t idx = c->type == GGML_TYPE_I64 ?
+                ((const int64_t *) c->data)[r] : (int64_t) ((const int32_t *) c->data)[r];
+        GGML_ASSERT(idx >= 0 && idx < dst->ne[1]);
+        dsv4_qat_pack_row_cpu(
+                (uint8_t *) dst->data + idx*dst->nb[1],
+                (const float *)((const char *) b->data + r*b->nb[1]),
                 ne0);
     }
 }

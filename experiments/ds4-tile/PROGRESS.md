@@ -1310,3 +1310,34 @@ GATES (quick, post-flip): 7/7 ops PASS (incl EXACT zero-tolerance over the
 now-default int8 pass-1), coherence PASS (ggml.c continuation, clean),
 determinism PASS (run1 == run2, no retry needed). std/full battery deferred
 to P4b where it gates the EXACT-default decision on post-P3b numbers.
+
+## Iteration 25 — P3b-i LANDED: packed MXFP4 lid container
+
+NEW OP GGML_OP_DSV4_QAT_SET_ROWS (COUNT 104->105): set_rows into an MXFP4
+container with OUR QAT rounding folded into the scatter (stock set_rows has
+no MXFP4 dst on CUDA and stock rounding on CPU). Packing: e = s+127 with
+TRUE-level nibble table makes dequant d = 2^(e-127) == the QAT scale, so
+dequant(pack(x)) == dsv4_fp4_rt(x) bit-exact.
+
+Container: LLAMA_DSV4_LID_CACHE_MXFP4=1 flips ONLY the lid ctor type
+(llama-kv-cache-dsv4.cpp — type_k is shared by all 4 sub-caches, lid
+decoupled); write path cpy_k_qat (kv-cache + both context wrappers);
+DSV4_K_CACHE_STATE_VER 1->2. Read side: staged dequant into the existing
+k_force_f32 pool buffer — ALL score kernels keep their float dispatch,
+zero kernel changes. Unfused decode shortcut blocked under packed cache.
+
+ZERO-TOLERANCE CATCH: rescore dispatch's `qat_write && !f16` arm read
+k->data as raw f32 — under packed cache that reinterprets 17B blocks as
+floats. Op suite flagged 11%/19% selection mismatch before any model run;
+fix = staged buffer wins whenever it exists (k_force_f32 guard).
+
+GATES (all PASS): QAT_SET_ROWS 3/3 zero-tolerance; lid_topk packed cases
+x4 default + EXACT profile zero-tolerance; gates.sh quick under packed
+profile (7/7 ops, coherence, determinism); engagement verified in logs
+(type = mxfp4, lid KV buffer 2.79 MiB @c8192 vs ~10.5 f16 = the predicted
+3.76x); prompt-cache save/restore round-trip "exact match" + identical
+continuation. PPL spot folds into the P4b std battery.
+
+NEXT (P3b-ii): native packed readers — decode kernel 68B/row (claws back
+the exact-mode +200us/layer decode price), then exact-price re-leg for the
+P4b default decision.

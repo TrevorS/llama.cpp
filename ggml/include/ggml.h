@@ -593,6 +593,7 @@ extern "C" {
         GGML_OP_DSV4_MOE_GATE_UP,
         GGML_OP_DSV4_HC_FUSED,
         GGML_OP_DSV4_FP4_RT,
+        GGML_OP_DSV4_QAT_SET_ROWS,
 
         GGML_OP_COUNT,
     };
@@ -2484,6 +2485,18 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dsv4_fp4_rt(
             struct ggml_context * ctx,
             struct ggml_tensor  * x);
+
+    // set_rows variant that scatters f32 rows b into MXFP4 container a at row
+    // indices c, quantizing with the DSV4 QAT rounding (scale
+    // exp2(ceil(log2(amax/6))), even-index tie-break) — NOT ggml's stock
+    // mxfp4 quantizer. dequant(pack(x)) == ggml_dsv4_fp4_rt(x) bit-exactly.
+    // a: [ne0, kv_size] MXFP4 (ne0 % 32 == 0); b: [ne0, n_rows] F32;
+    // c: [n_rows] I64/I32. 2D only.
+    GGML_API struct ggml_tensor * ggml_dsv4_qat_set_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
 
     // sinkhorn: softmax along ne0, +eps per element, then column normalization
     // followed by (n_iters-1) x (row, column) normalizations — the whole

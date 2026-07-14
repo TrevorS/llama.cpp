@@ -655,7 +655,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const char * e = getenv("LLAMA_DSV4_FUSED_LID_TG_DEPTH");
         return e ? atoll(e) : (long long) 4096;
     }();
-    if (dsv4_fused_lid && (nt > 1 || n_lid >= dsv4_lid_tg_depth)) {
+    // Packed MXFP4 lid cache (P3b): only the fused op has the staged-dequant
+    // reader, so the shallow-decode unfused shortcut must not engage.
+    static const bool dsv4_lid_cache_mxfp4 = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_CACHE_MXFP4");
+        return e && e[0] == '1';
+    }();
+    if (dsv4_lid_cache_mxfp4) {
+        GGML_ASSERT(dsv4_fused_lid && "LLAMA_DSV4_LID_CACHE_MXFP4 requires the fused lid path (unset LLAMA_DSV4_FUSED_LID=0)");
+    }
+    if (dsv4_fused_lid && (nt > 1 || n_lid >= dsv4_lid_tg_depth || dsv4_lid_cache_mxfp4)) {
         ggml_tensor * fq = ggml_cont(ctx0, indexer_q);       // [d_idx, n_head, nt]
         ggml_tensor * fw = ggml_cont(ctx0, indexer_weights); // [n_head, nt]
         // Our fused lid_topk op requires an F32 mask. Since upstream's fused
@@ -1197,13 +1206,24 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
             const char * e = getenv("LLAMA_DSV4_LID_QAT_WRITE");
             return e && e[0] == '1';
         }();
-        if (dsv4_lid_qat_write) {
-            kv_comp_lid_state = ggml_dsv4_fp4_rt(ctx0, kv_comp_lid_state);
-            cb(kv_comp_lid_state, "lid_state_compress_qat", il);
-        }
+        static const bool dsv4_lid_cache_mxfp4_w = []() {
+            const char * e = getenv("LLAMA_DSV4_LID_CACHE_MXFP4");
+            return e && e[0] == '1';
+        }();
+        if (dsv4_lid_cache_mxfp4_w) {
+            // packed container: QAT rounding folds into the scatter itself
+            // (GGML_OP_DSV4_QAT_SET_ROWS) — the FP4_RT round-trip is subsumed
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k_qat(ctx0,
+                        kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
+        } else {
+            if (dsv4_lid_qat_write) {
+                kv_comp_lid_state = ggml_dsv4_fp4_rt(ctx0, kv_comp_lid_state);
+                cb(kv_comp_lid_state, "lid_state_compress_qat", il);
+            }
 
-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
-                    kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
+                        kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
+        }
 
         lid_state_kv    = dsv4_with_zero_dep(ctx0, lid_state_kv,    kv_comp_lid_state);
         lid_state_score = dsv4_with_zero_dep(ctx0, lid_state_score, kv_comp_lid_state);
