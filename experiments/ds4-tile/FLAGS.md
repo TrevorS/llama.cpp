@@ -26,6 +26,9 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
 | `LLAMA_DSV4_LID_INT8` | **OFF** (`=1` enables) | int8 dp4a score kernel (prefill/batch) | wmma/fp16 score path | 1.36x kernel, +3.2% pp; 0.5% score error, PPL-neutral. Selection-set class. DEFAULT-ON CANDIDATE. |
 | `LLAMA_DSV4_LID_DEC` | **OFF** (`=1` enables) | dedicated nt=1 decode score kernel (warp-per-comp, int8) | 16-token-tile kernel with 15/16 padding waste at decode | 2.0x kernel, +5.2% tg (+10.8% with GATHER). Same int8 numerics class. DEFAULT-ON CANDIDATE. |
 | `LLAMA_DSV4_LID_FP4` | OFF | e2m1 block-32 QAT fake-quant of indexer q/k (numerics only, no speedup) | fp16/fp32 indexer numerics | the model's official QAT indexer numeric; 0.93 top-512 overlap, deep PPL statistically identical. Keep opt-in until fp4 STORAGE lands. |
+| `LLAMA_DSV4_LID_EXACT` | OFF (`=1` enables) | two-pass selection: fast pass-1 (int8/dec allowed) to top-(512+m), exact QAT-fp32 rescore + bitonic select | single-pass selection in the pass-1 numeric class | **class A** — selection bit-exact vs official QAT graph; 36/36 zero-tolerance backend-ops. Implies QAT q/k numerics. Price with QAT_WRITE: −7.1% pp@d65536, +200 µs/layer decode (512k tg gate holds). P2/P3a, commits 2a947edec + 749dfde85. |
+| `LLAMA_DSV4_LID_RESCORE_M` | 64 | — | — | rescore margin m (candidates = top_k + m, cap 1024−512). Oracle p100 displacement = 26 on real dumps → 2.5× headroom. |
+| `LLAMA_DSV4_LID_QAT_WRITE` | OFF (`=1` enables) | e2m1 QAT round-trip ONCE at lid-cache write (`GGML_OP_DSV4_FP4_RT`); score kernels skip k-side re-sim | k-side QAT re-simulated per score call (EXACT still correct, −28.3% pp) | f16-of-QAT is bit-exact (2-bit mantissa × pow2 scale), so cache values ARE official post-QAT values. Companion to EXACT; prerequisite for P3b packed storage. |
 | `LLAMA_DSV4_MOE_TILE` | OFF | MoE expert-tile bridge kernels in the graph | standard MoE path | NEGATIVE RESULT (tile bridge regresses; hc-batch memory). Leave OFF. |
 
 ## Speculative decoding / MTP (server + common)
@@ -78,3 +81,10 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
 LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_CSA_GATHER=1 LLAMA_DSV4_LID_DEC=1 LLAMA_DSV4_LID_INT8=1
 ```
 (tile + HC-fused already default-on; add `LLAMA_DSV4_LID_FP4=1` for QAT-numerics runs)
+
+Official-exact validation/reference profile (P2+P3a):
+
+```
+LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_CSA_GATHER=1 LLAMA_DSV4_LID_DEC=1 LLAMA_DSV4_LID_INT8=1 \
+LLAMA_DSV4_LID_EXACT=1 LLAMA_DSV4_LID_QAT_WRITE=1
+```
