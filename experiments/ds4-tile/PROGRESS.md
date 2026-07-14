@@ -1000,3 +1000,18 @@ Scope: dsv4_lid_topk.cu chunk/merge/single kernels + scratch sizing (pairs
 = 8B, 2x scratch), ~+80/-40 LOC, 1 file. Ceiling: topk 5.8% of pp @d131k,
 bigger share of decode + at 512k (32 chunks, 2 merge levels of 4096-wide
 random gathers).
+
+## Iteration 20b — 512k battery: pp gates PASS (+62% @262k), tg 9.64 vs >=10
+
+IQ3, fused lid, tile default-on:
+  pp2048 @ d262144: dense 103.1 -> tile 166.9 (+61.9%; FA share grows with
+  depth exactly as the d131k->d262k projection said)
+  pp2048 @ d524288: 115.7 t/s — allocates, runs, no OOM (peak fits ~110GB
+  free after); ~2x the iter-13 projection (63). Depth curve tile-on:
+  252.7 @65k / 215.4 @131k / 166.9 @262k / 115.7 @512k — graceful.
+  tg64 @ d524288 (GATHER+DEC+INT8): 9.64 vs the >=10 gate — 3.6% short.
+VERDICT: task-#6 pp gates PASS at 512k; tg gate MARGINAL FAIL. Lever 3
+(streaming chunk-topk: index-only candidates force random score gathers in
+every merge level; worst at deep decode) is sized right to close the tg gap
+(~+80/-40 LOC, 1 file, model-free gates). Lever 1 (fattn ne3-broadcast)
+remains the pp prize (+32 -> ~+65% @d131k).
