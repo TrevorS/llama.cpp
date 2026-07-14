@@ -810,3 +810,17 @@ Gates so far:
 PENDING: pp2048@d65536 dense vs tile (running), d131k leg (-r 1, OOM-careful),
 union overflow stats at depth (u_cap 2048 headroom), PPL quality gate at safe
 depth.
+
+## Iteration 19b — bench crash post-mortem + union stats instrumentation
+
+- First d65536 bench pair CRASHED (both legs, incl pure dense): CUDA abort at
+  a relu launch during the first fill. Cause: bench legs launched WITHOUT
+  LLAMA_DSV4_FUSED_LID=1 -> the unfused indexer chain's O(n_ctx x nt x n_head)
+  relu intermediate (~8.6GB @d65536) OOMed the pool. Operator error, not a
+  regression; all depth benches MUST carry LLAMA_DSV4_FUSED_LID=1.
+- Added LLAMA_DSV4_UNION_STATS=1: union kernel optionally popcounts the FULL
+  bitmap per tile (exact union size incl cells beyond u_max) into a pool
+  buffer; host prints per-call "US n_csa W T u_max cnt min/mean/max over".
+  Measures true overflow magnitude, not just at-capacity. Zero cost when off
+  (nullptr stats arg). Smoke-tested via backend-ops (random-index test unions
+  sit near max, as expected for uniform data).

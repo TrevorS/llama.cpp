@@ -441,7 +441,8 @@ static __global__ void dsv4_score_decode_kernel(
 static __global__ void dsv4_union_kernel(
         int32_t * __restrict__ out, const int32_t * __restrict__ top_k,
         int64_t nb1_tk, int64_t nb3_tk, int64_t nb1_out, int64_t nb3_out,
-        int n_top_k, int nt_s, int n_csa, int u_max, int W) {
+        int n_top_k, int nt_s, int n_csa, int u_max, int W,
+        int32_t * __restrict__ stats /* optional [n_tiles*n_stream] exact union sizes */) {
     const int tile = blockIdx.x;
     const int s    = blockIdx.y;
     const int t0   = tile * W;
@@ -457,6 +458,16 @@ static __global__ void dsv4_union_kernel(
         if (c >= 0 && c < n_csa) atomicOr(&bm[c >> 5], 1u << (c & 31));
     }
     __syncthreads();
+    if (stats) {
+        __shared__ int total_cnt;
+        if (threadIdx.x == 0) total_cnt = 0;
+        __syncthreads();
+        int c = 0;
+        for (int i = threadIdx.x; i < n_words; i += blockDim.x) c += __popc(bm[i]);
+        atomicAdd(&total_cnt, c);
+        __syncthreads();
+        if (threadIdx.x == 0) stats[(int64_t) s * gridDim.x + tile] = total_cnt;
+    }
     if (threadIdx.x == 0) {
         int32_t * o = out + (int64_t) tile * nb1_out + (int64_t) s * nb3_out;
         int pos = 0;
@@ -532,9 +543,35 @@ void ggml_cuda_op_dsv4_lid_union(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t nb3_out = dst->nb[3] / sizeof(int32_t);
     const size_t smem = (size_t) ((n_csa + 31) / 32) * sizeof(uint32_t);
     const dim3 grid(n_tiles, n_stream, 1);
+
+    // LLAMA_DSV4_UNION_STATS=1: report exact per-tile union sizes (popcount of
+    // the full bitmap, i.e. including cells dropped by the u_max cap)
+    static const bool union_stats = getenv("LLAMA_DSV4_UNION_STATS") != nullptr;
+    if (union_stats && n_tiles > 1) {
+        ggml_cuda_pool_alloc<int32_t> stats_buf(ctx.pool(), (size_t) n_tiles * n_stream);
+        dsv4_union_kernel<<<grid, 256, smem, ctx.stream()>>>(
+            (int32_t *) dst->data, (const int32_t *) top_k->data,
+            nb1_tk, nb3_tk, nb1_out, nb3_out, n_top_k, nt_s, n_csa, u_max, W, stats_buf.get());
+        std::vector<int32_t> h((size_t) n_tiles * n_stream);
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), stats_buf.get(), h.size()*sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        int cmin = INT32_MAX, cmax = 0, nover = 0;
+        int64_t csum = 0;
+        for (int32_t v : h) {
+            cmin = v < cmin ? v : cmin;
+            cmax = v > cmax ? v : cmax;
+            csum += v;
+            nover += v > u_max;
+        }
+        fprintf(stderr, "US n_csa=%d W=%d T=%d u_max=%d cnt min=%d mean=%d max=%d over=%d/%zu\n",
+                n_csa, W, n_tiles, u_max, cmin, (int)(csum/(int64_t)h.size()), cmax, nover, h.size());
+        return;
+    }
+
     dsv4_union_kernel<<<grid, 256, smem, ctx.stream()>>>(
         (int32_t *) dst->data, (const int32_t *) top_k->data,
-        nb1_tk, nb3_tk, nb1_out, nb3_out, n_top_k, nt_s, n_csa, u_max, W);
+        nb1_tk, nb3_tk, nb1_out, nb3_out, n_top_k, nt_s, n_csa, u_max, W, nullptr);
 }
 
 void ggml_cuda_op_dsv4_lid_memb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
