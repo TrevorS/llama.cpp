@@ -848,3 +848,13 @@ small-nb FA penalty that erases the d65k win (survives only d131k+). The
 strategic lever is the fattn small-nb config gap (ncols1<=16 starves K-byte
 amortization): closing half of it makes EXACT per-tile B2 win from d32k up.
 Running: u_cap 3072/4096 @d65536 + dense/2048/4096 @d131072 frontier legs.
+
+NOTE (2026-07-13, Teej): quant of record is UD-IQ3_XXS (the serving quant),
+not the UD-IQ2_XXS the campaign targets were baselined on. Structural results
+(ops, union stats, FA ms deltas, the small-nb fattn lever) transfer; headline
+% gains do NOT (IQ3's slower MoE shrinks FA's share -> smaller % for the same
+FA savings). All DECISION gates from here run on IQ3: dense-vs-tile d65536,
+stats confirm, quality gates. ab.sh default switched to IQ3 (AB_MODEL to
+override). IQ3 is 96GB resident: d131k legs need a headroom check first
+(earlyoom line; see gb10 crash memory). A/B baselines must be re-banked on
+IQ3 before any variant comparison (old IQ2 outputs are not comparable).

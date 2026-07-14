@@ -13,7 +13,8 @@
 set -e
 cd "$(dirname "$0")/../.."
 
-MODEL=~/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ2_XXS/DeepSeek-V4-Flash-UD-IQ2_XXS-00001-of-00003.gguf
+# IQ3 is the serving quant of record (override with AB_MODEL for IQ2 comparisons)
+MODEL=${AB_MODEL:-~/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf}
 OUTDIR=experiments/ds4-tile/ab-runs
 mkdir -p $OUTDIR
 
