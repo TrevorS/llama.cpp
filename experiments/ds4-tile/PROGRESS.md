@@ -1032,3 +1032,24 @@ IMPLICATION for tg@512k (9.64 vs >=10): the 3.6% gap will NOT come from topk.
 Next candidates: profile tg at d524288 (nsys) for the real decode breakdown;
 DEC score kernel headroom (470us @33k n_lid vs ~30us memory-ideal, scales
 ~4x at 512k -> ~1.8% of the 103.7ms token budget); FA-decode/B1 path share.
+
+## Iteration 20d — tg@512k decode breakdown (nsys, 2 tokens before CUPTI drop)
+
+Composition of GPU-busy at d524288 decode (gate envs GATHER+DEC+INT8):
+  q8_0 matvecs 20.6% | dsv4_score_decode 18.9% (1.13ms x21 = 23.7ms/tok;
+  linear-ish from 470us@33k n_lid) | ELEMENTWISE STORM ~30% (bin_bcast
+  add 10.5% + mul 8.2% + div 3.4% + reduce_rows 3.6% + tiny cpys; ~16k
+  launches/token at 1-2us) | MoE IQ matvecs ~17% | FA decode 2.5% (B1
+  depth-flat, working) | topk <2.5% (20c negative result confirmed in situ).
+
+Two tg levers, quantified:
+1. score_decode kernel: 18.9% share, ~9x from memory-ideal (~120us vs
+   1.13ms at n_lid=131072); realistic 2x -> ~9% tg. Iter-16 noted the
+   headroom; at 512k it's now the top custom kernel.
+2. decode micro-kernel storm: ~30% share across ~5k graph ops/token —
+   attribution needed (graph node dump at decode: what emits ~257 adds
+   /layer/token? suspects: top-k mask add chain remnants, HC scalar chain,
+   B1 gather mask build). If it's a fusable chain, this is the bigger lever.
+Either alone likely covers the 3.6% gap to the >=10 t/s gate.
+Trace: scratchpad tg_d524288.nsys-rep (CUPTI drops decode events ~2 tokens
+in — known GB10 limitation, shares valid).
