@@ -43,12 +43,26 @@ fattn-common.cuh:916-969 for the vec path; `flash_attn_ext_f16_fixup`
 `[DV, n_head, n_tokens, ne3]` result; per-row (max, sum) is discarded.
 Merge of two independent calls is impossible without it.
 
-Plan: opt-in LSE output — `ggml_flash_attn_ext_with_lse(dst)` flag (mirrors
-the existing add_sinks-style op mutators): dst ne[0] = DV+1, kernel writes
-the per-row log-sum-exp in the extra slot at the same place the fixup
-already has (max_val, rowsum) live. Opt-in ⇒ zero change for every other
-FA consumer; upstream-worthy on its own (sequence-parallel / tree
-attention both want FA-with-LSE).
+Plan (SETTLED 2026-07-14 after launch_fattn read): opt-in LSE output via
+`ggml_flash_attn_ext_with_lse(...)` constructor variant.
+- LAYOUT: result ne3 = q->ne[3] + 1 (tail slice), NOT ne0 = DV+1. CUDA
+  kernels derive ALL dst offsets from Q/K dims (launch_fattn passes Q dims,
+  never KQV->ne) so the tail is invisible to every existing kernel — zero
+  hot-path dst-stride changes. LSE lives in the tail at
+  [n_head, n_q, ne3] contiguous: idx = (s*n_q + iq)*n_head + h, byte offset
+  DV*n_head*n_q*ne3*4. Constraint DV >= ne3 (tail must fit; T<=128 tiles at
+  ub2048 vs DV 512 — assert in constructor).
+- FLAG: op_params i32 index 4 (0-2 floats scale/bias/softcap, 3 = prec).
+- CUDA: (1) mma epilogue emits per-row meta (max,rowsum) unconditionally
+  when LSE flag (predicated store, epilogue-only); (2) stream-K fixup
+  writes back combined meta; (3) tiny finalize kernel meta -> tail
+  (lse = max + logf(rowsum)); (4) non-stream-K parallel_blocks>1 path:
+  combine_results also writes tail; (5) supports_op: LSE flag only on the
+  mma path (D=512 config), else reject -> CPU fallback.
+- CPU ops.cpp FA: write tail directly from the row's (max, sum) — the
+  test reference.
+Opt-in ⇒ zero change for every other FA consumer; upstream-worthy on its
+own (sequence-parallel / tree attention both want FA-with-LSE).
 
 New op `ggml_dsv4_fa_merge(a, b)`: out = (ea*va + eb*vb)/(ea+eb) with
 ea = exp(lse_a - max(lse_a,lse_b)) etc., per row. Trivially parallel;

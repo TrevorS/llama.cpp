@@ -5720,6 +5720,40 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+// FA with per-row log-sum-exp output (DSV4 split-attention merge): result
+// gains one tail ne3-slice holding lse[h, iq, s] contiguous at element
+// offset DV*n_head*n_q*ne3 — idx = (s*n_q + iq)*n_head + h. The attention
+// output itself is the plain [DV, n_head, n_q, ne3] prefix. Flag lives in
+// op_params i32[4]. Tail must fit: requires DV >= ne3.
+struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(v->ne[0] >= q->ne[3]); // tail slice must hold n_head*n_q*ne3 lse floats
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
+
+    // re-shape in place: one extra ne3 slice for the lse tail
+    result->ne[3] += 1;
+    result->nb[0] = ggml_type_size(result->type);
+    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(result->type));
+    result->nb[2] = result->nb[1]*result->ne[1];
+    result->nb[3] = result->nb[2]*result->ne[2];
+
+    ggml_set_op_params_i32(result, 4, 1); // LSE flag
+
+    return result;
+}
+
+bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

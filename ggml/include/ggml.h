@@ -2535,6 +2535,23 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // like ggml_flash_attn_ext, but the result carries a per-row log-sum-exp
+    // tail: res ne3 = q ne3 + 1; the extra slice holds lse[h, iq, s] at
+    // element offset n_embd_v*n_head*n_batch*ne3, idx = (s*n_batch + iq)*n_head + h.
+    // View the [.., ne3] prefix as the attention output. Requires
+    // n_embd_v >= ne3. Used by the DSV4 split-attention LSE merge.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    GGML_API bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

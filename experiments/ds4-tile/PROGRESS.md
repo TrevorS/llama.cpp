@@ -1375,3 +1375,25 @@ stays opt-in (prefill -2~3.6% for 3.76x memory; add it to the 512k
 serving profile where memory is the binding constraint). Defaults remain
 the P4a fast profile. gates.sh quick PASS on the final build (packed
 exact profile: 7/7 ops zero-tolerance, coherence, determinism).
+
+## Iteration 27 (OPEN) — FA-with-LSE step 1: op flag + tail layout + CPU reference
+
+Toward BUILDSPEC-fattn-lse-merge (split-attention: dense raw-window FA +
+remainder-only tiled FA + LSE merge; kills the repeat_4d raw replication
+at deepseek4.cpp:850; ceiling +65% pp @d131k).
+
+LANDED (this commit): ggml_flash_attn_ext_with_lse — result gains one
+tail ne3-slice holding lse[h, iq, s] = M + log(S) at element offset
+DV*n_head*n_q*ne3, idx (s*n_q + iq)*n_head + h; flag = op_params i32[4];
+requires DV >= ne3 (T<=128 tiles at ub2048 vs DV 512). KEY DESIGN FACT:
+CUDA kernels compute ALL dst offsets from Q/K dims (launch_fattn never
+passes KQV->ne), so the tail is invisible to existing kernels — zero
+hot-path dst-stride changes. CPU: one-chunk path writes the tail;
+split-kv and tiled paths force-disabled under the flag (loud, not
+silent). Gate: full FLASH_ATTN_EXT backend-ops sweep with flag unset —
+green (no behavior change).
+
+REMAINING: CUDA meta plumbing (mma epilogue emission + stream-K fixup
+writeback + finalize kernel + supports_op mma-only), dsv4_fa_merge op,
+deepseek4 graph split, merged-halves==dense reference tests, depth legs
+(single-test per process — crash rule #7).

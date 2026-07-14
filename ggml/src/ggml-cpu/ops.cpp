@@ -9187,6 +9187,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+
+            // LSE tail (ggml_flash_attn_ext_with_lse): dst carries one extra
+            // ne3 slice; lse[h, iq, s] = M + log(S) at (s*n_q + iq)*n_head + h
+            if (ggml_get_op_params_i32(dst, 4) != 0) {
+                float * lse = (float *) dst->data + (int64_t) ne0*ne1*ne2*neq3;
+                lse[((int64_t) i3*ne2 + i1)*ne1 + i2] = S == 0.0f ? -INFINITY : M + logf(S);
+            }
         }
     }
 }
@@ -9599,8 +9606,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
+    // LSE tail (ggml_flash_attn_ext_with_lse): only the one-chunk full-row
+    // path writes it — force that path so the tail is never silently skipped
+    const bool has_lse = ggml_get_op_params_i32(dst, 4) != 0;
+
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !has_lse && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9657,7 +9668,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !has_lse && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
