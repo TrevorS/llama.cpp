@@ -1073,3 +1073,41 @@ a single src). HC fused now DEFAULT ON (LLAMA_DSV4_HC_FUSED=0 disables).
 Decode graph: 21183 -> 5439 nodes (-74%); SUM_ROWS 3439->85, DIV 3397->43,
 ADD 5780->703. Coherent output. Payoff battery running: pp d65k/d131k refs +
 tg64 d131k + tg64 d524288 (the >=10 gate that sat at 9.64 with scalar HC).
+
+## Iteration 21b — scouts: two-pass rescore, mxfp4 LID storage, MMQ-DS4 (false lead)
+
+SCOUT 1 — two-pass margin rescore (B -> A for LID_INT8/DEC):
+- Pass 1: int8 scores (current kernels) -> top-(512+m) candidates (SORT_N 4096
+  handles 576+ fine, merge_group stays >= 2).
+- Pass 2: fp32 rescore of ONLY the candidates (warp per candidate, ~60-LOC
+  kernel; 576 cells x 64 heads x 128 dims — ~4% of pass-1 flops at prefill,
+  trivial at decode) -> exact top-512 via dsv4_topk_single.
+- m from measurement: extend the fp4 oracle to rank-displacement of true
+  top-512 under int8 ranking (LID_DUMP data); expect m<=32 at 0.5% score err;
+  use 64 with safety. Optional debug-mode runtime violation check.
+- Result: selection set == fp32 set provably (given bound) -> class A;
+  unlocks default-on for both int8 flags with no selection caveat.
+
+SCOUT 2 — mxfp4 LID storage (numerics + storage + decode bandwidth):
+- KEY SIMPLIFIER: GGML_TYPE_MXFP4 already exists (e2m1 block-32 + e8m0
+  scale = EXACTLY the QAT format), and kv_lid is an ordinary llama_kv_cache
+  taking type_k at ctor (llama-kv-cache-dsv4.cpp:1067) -> storage flip is a
+  ctor arg + env, NOT a new type. Hadamard is already applied pre-cache in
+  the graph, so quantize-on-write == the official QAT numeric.
+- Missing pieces: (a) f32->MXFP4 set_rows/cpy CUDA (+~50 LOC; we already
+  have the e2m1 quantizer in dsv4_lid_topk.cu, just pack instead of
+  fake-quant); (b) score-kernel input: DECODE (DEC kernel) reads packed
+  directly — 68B vs 256B per row attacks the 18.9%-of-decode, 9x-off-ideal
+  score_decode directly; PREFILL avoids the iter-15 unpack tax entirely via
+  a per-ubatch dequant-to-f16 staging pass (n_lid x 128 x 2B ~ 8MB @32k
+  ~0.03ms) — wmma/int8 kernels unchanged. NO regression path.
+- Cache: 3.76x smaller LID cache (68 vs 256B/row) — matters at 512k-1M.
+SCOUT 3 — MMQ_Q8_1_DS_LAYOUT_DS4: FALSE LEAD. "DS4"/"D4"/"D2S6" are q8_1
+scale-layout names (delta/sum variants picked per WEIGHT quant), nothing
+DeepSeek. No upstream DS4 activation quant exists. MoE activation numerics
+(ours MMQ q8_1 vs ds4.c Q8_K) remain a benign 8-bit-vs-8-bit difference.
+
+ENDGAME (composition): mxfp4 storage + int8 first-pass + QAT-numeric rescore
+= official-graph-EXACT selection (class A vs the model's trained semantics)
+at int8 speed with 3.76x smaller LID cache. Build order: oracle displacement
+measurement -> rescore (small) -> mxfp4 storage (medium).
