@@ -150,6 +150,7 @@ int main(int argc, char ** argv) {
     const char *qf = nullptr, *kf = nullptr, *wf = nullptr;
     int nlid_arg = 0;
     bool pre_rotated = false;
+    bool int8_disp   = false;
 
     for (int i = 1; i < argc; i++) {
         auto next = [&](int & i) { return atoi(argv[++i]); };
@@ -162,6 +163,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--k"))      kf = argv[++i];
         else if (!strcmp(argv[i], "--w"))      wf = argv[++i];
         else if (!strcmp(argv[i], "--pre-rotated")) pre_rotated = true;
+        else if (!strcmp(argv[i], "--int8-displacement")) int8_disp = true;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
 
@@ -222,6 +224,67 @@ int main(int argc, char ** argv) {
             const int low = (int) std::count_if(ovl.begin(), ovl.end(), [](double o) { return o < 0.98; });
             printf("%-8d %-6d %-10.4f %-10.4f %-10.4f %d/%d\n",
                    n_lid, seed, mean, ovl.front(), ovl[(size_t) (0.01 * nt)], low, nt);
+
+            // --int8-displacement: two-pass rescore design input. Pass 1 of the
+            // exact pipeline ranks with the int8 kernel numerics OVER THE QAT
+            // VALUES (path B); pass 2 rescores the top-(512+m) candidates
+            // exactly. m must cover the worst rank displacement of any true
+            // (path-B) top-512 member under the int8 ranking. Int8 scheme
+            // matches dsv4_score_int8_kernel: per-token symmetric q scale
+            // (amax/127 over all heads*dims), per-comp k scale, round-nearest,
+            // relu applied to the dequantized per-head dot.
+            if (int8_disp) {
+                std::vector<int> mneed(nt);
+                #pragma omp parallel for schedule(dynamic)
+                for (int t = 0; t < nt; t++) {
+                    const float * w_t = w.data() + (size_t) t * n_head;
+                    const float * qb_t = qb.data() + (size_t) t * n_head * D_IDX;
+                    // quantize q (per token) and k (per comp) to int8
+                    float qamax = 0.0f;
+                    for (int i = 0; i < n_head*D_IDX; i++) qamax = fmaxf(qamax, fabsf(qb_t[i]));
+                    const float qinv = qamax > 0.0f ? 127.0f/qamax : 0.0f;
+                    const float qsc  = qamax > 0.0f ? qamax/127.0f : 0.0f;
+                    std::vector<int8_t> q8(n_head*D_IDX);
+                    for (int i = 0; i < n_head*D_IDX; i++) q8[i] = (int8_t) lrintf(qb_t[i]*qinv);
+                    std::vector<float> sc(n_lid);
+                    for (int j = 0; j < n_lid; j++) {
+                        const float * kj = kb.data() + (size_t) j * D_IDX;
+                        float kamax = 0.0f;
+                        for (int d = 0; d < D_IDX; d++) kamax = fmaxf(kamax, fabsf(kj[d]));
+                        const float kinv = kamax > 0.0f ? 127.0f/kamax : 0.0f;
+                        const float ksc  = kamax > 0.0f ? kamax/127.0f : 0.0f;
+                        int8_t k8[D_IDX];
+                        for (int d = 0; d < D_IDX; d++) k8[d] = (int8_t) lrintf(kj[d]*kinv);
+                        float acc = 0.0f;
+                        for (int h = 0; h < n_head; h++) {
+                            int32_t dot = 0;
+                            const int8_t * qh = q8.data() + (size_t) h * D_IDX;
+                            for (int d = 0; d < D_IDX; d++) dot += (int32_t) qh[d] * k8[d];
+                            acc += fmaxf((float) dot * qsc * ksc, 0.0f) * w_t[h];
+                        }
+                        sc[j] = acc;
+                    }
+                    // full int8 ranking (desc, idx tie-break); find worst rank
+                    // of any true (path-B) top-512 member
+                    std::vector<float> sb(n_lid);
+                    scores_row(qb_t, w_t, kb.data(), n_lid, n_head, sb.data());
+                    std::vector<int> tb;
+                    top_k_set(sb.data(), n_lid, kk, tb);
+                    std::vector<int> rank(n_lid);
+                    std::iota(rank.begin(), rank.end(), 0);
+                    std::sort(rank.begin(), rank.end(), [&](int a, int b) {
+                        return sc[a] > sc[b] || (sc[a] == sc[b] && a < b);
+                    });
+                    std::vector<int> pos(n_lid);
+                    for (int r = 0; r < n_lid; r++) pos[rank[r]] = r;
+                    int worst = 0;
+                    for (int j : tb) worst = std::max(worst, pos[j]);
+                    mneed[t] = std::max(0, worst + 1 - kk);
+                }
+                std::sort(mneed.begin(), mneed.end());
+                printf("    int8-displacement: m p50=%d p99=%d p100=%d (over %d tokens)\n",
+                       mneed[nt/2], mneed[(size_t)(0.99*nt)], mneed.back(), nt);
+            }
 
             // Q-tile union stats (gathered sparse FA design input): for a tile
             // of W consecutive queries, the gathered-KV length is the union of

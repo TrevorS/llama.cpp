@@ -8392,8 +8392,11 @@ void ggml_compute_forward_dsv4_lid_topk(
     const int nth = params->nth;
 
     static const bool fp4 = []() {
+        // LLAMA_DSV4_LID_EXACT implies the QAT numerics (the CPU path is
+        // already the exact reference; only the input numerics change)
         const char * e = getenv("LLAMA_DSV4_LID_FP4");
-        return e && e[0] == '1';
+        const char * x = getenv("LLAMA_DSV4_LID_EXACT");
+        return (e && e[0] == '1') || (x && x[0] == '1');
     }();
     GGML_ASSERT(!fp4 || d_idx % 32 == 0);
 

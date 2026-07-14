@@ -1176,3 +1176,27 @@ higher now), tg PASS (11.08). Remaining formality: one long-completion
 coherence run at 512k. The iter-13 verdict ("BOTH gates FAIL without kernel
 work") is now fully reversed by B2 tile + B1 gather + DEC + HC/sinkhorn fusion.
 Next: BUILDSPEC-lid-exact.md phases 0-4.
+
+## Iteration 22 — BUILDSPEC phases 0-2: exact selection LANDED (class A, 36/36 @ zero tolerance)
+
+P0 (oracle m): --int8-displacement mode added to fp4_oracle. Synthetic
+(n_lid 33k): m p50=15 p99=36 p100=36. REAL DATA (fresh dump, 256 tokens,
+n_lid=16384 from a 127k-token prefill): m p50=7 p99=24 p100=26 — default
+m=64 (LLAMA_DSV4_LID_RESCORE_M) has 2.5x headroom over worst observed.
+Bonus real-data: fp16-vs-QAT overlap 0.9145 at depth; oracle union stats
+corroborate the W-tile design (W=16 mean 1412 max 1821 @n_lid 16k).
+
+P1 (sinkhorn C->A): DESCOPED deliberately — matching the legacy soft_max
+block-reduce tree is template-shape archaeology for transcript-compat with
+a graph that no longer runs. Fused sinkhorn's serial order is canonical
+(deterministic, CPU-ref-matched, full gate suite + 512k battery passed).
+
+P2 (two-pass rescore): LANDED. LLAMA_DSV4_LID_EXACT=1 implies the QAT path
+(q/k materialized as f32 QAT values — already the case under LID_FP4);
+pass 1 = any score kernel (wmma/int8/dec) to top-(512+m); pass 2 =
+dsv4_lid_rescore_kernel: serial-order fp32 rescore (bitwise the CPU
+reference = official ds4.c order), 1024-wide bitonic, exact top-512
+(desc, idx tie-break). backend-ops: 36/36 at ZERO tolerance (set AND
+order) across all three pass-1 variants. Selection is now class A vs the
+official QAT graph with int8 pass-1 speed. e2e determinism + d65536 perf
+spot running.

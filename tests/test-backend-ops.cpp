@@ -5826,6 +5826,11 @@ struct test_dsv4_lid_topk : public test_case {
     // differ from the fp32 CPU reference. Allow a small set-mismatch fraction
     // there; keep the scalar path (d_idx != 128) strict at exact set match.
     double max_err(ggml_backend_t) override {
+        // LLAMA_DSV4_LID_EXACT: two-pass rescore must reproduce the CPU
+        // reference selection EXACTLY (set AND order) — zero tolerance,
+        // regardless of which pass-1 kernel ran.
+        const char * ex = getenv("LLAMA_DSV4_LID_EXACT");
+        if (ex && ex[0] == '1') return 0.0;
         // LLAMA_DSV4_LID_INT8 scores via int8 dp4a vs the fp32 CPU reference;
         // per-row int8 quant flips a small fraction of near-tie selections
         // (observed <= 0.7%). Loosen the set-mismatch gate for that path.

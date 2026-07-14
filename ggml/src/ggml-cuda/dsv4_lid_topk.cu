@@ -712,6 +712,59 @@ static __global__ void dsv4_topk_merge_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// exact-selection pass 2 (LLAMA_DSV4_LID_EXACT): serial-order fp32 rescore of
+// the pass-1 candidates. One block per token; each thread owns candidates
+// block-strided and accumulates the score in the SAME serial order as the CPU
+// reference (d ascending within head, h ascending), so candidate scores are
+// bitwise equal to the reference and the final top-k selection (desc score,
+// asc index tie-break) is exact — pass-1 numerics only need to land the true
+// top-k inside the candidate window.
+// ---------------------------------------------------------------------------
+
+static __global__ void dsv4_lid_rescore_kernel(
+        int32_t * __restrict__ out, const uint32_t * __restrict__ cand,
+        const float * __restrict__ q,     // QAT f32 [d_idx, n_head, nt] contiguous
+        const float * __restrict__ w,     // [n_head, nt] contiguous
+        const float * __restrict__ k,     // QAT f32 [d_idx, n_lid, n_stream] contiguous
+        const float * __restrict__ mask,  // strided f32
+        int64_t nbm1, int64_t nbm3,
+        int n_cand, int top_k, int n_lid, int n_head, int d_idx, int nt_s) {
+    const int t       = blockIdx.x;
+    const int s       = t / nt_s;
+    const int t_local = t % nt_s;
+    __shared__ float    vals[1024];
+    __shared__ uint32_t idxs[1024];
+    const float    * q_t = q + (int64_t) t * n_head * d_idx;
+    const float    * w_t = w + (int64_t) t * n_head;
+    const uint32_t * c_t = cand + (int64_t) t * n_cand;
+    for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
+        float    sc = -INFINITY;
+        uint32_t j  = UINT32_MAX;
+        if (i < n_cand) {
+            j = c_t[i];
+            if (j < (uint32_t) n_lid) {
+                const float * kj = k + (int64_t) s * n_lid * d_idx + (int64_t) j * d_idx;
+                float acc = 0.0f;
+                for (int h = 0; h < n_head; h++) {
+                    const float * qh = q_t + (int64_t) h * d_idx;
+                    float dot = 0.0f;
+                    for (int d = 0; d < d_idx; d++) dot += qh[d] * kj[d];
+                    acc += fmaxf(dot, 0.0f) * w_t[h];
+                }
+                sc = acc + mask[(int64_t) s * nbm3 + (int64_t) t_local * nbm1 + (int64_t) j];
+            }
+        }
+        vals[i] = sc;
+        idxs[i] = j;
+    }
+    __syncthreads();
+    dsv4_bitonic_sort<1024u>(vals, idxs);
+    for (int i = threadIdx.x; i < top_k; i += blockDim.x) {
+        out[(int64_t) t * top_k + i] = (int32_t) idxs[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // host launcher
 // ---------------------------------------------------------------------------
 
@@ -863,9 +916,20 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // view into a dense [d_idx, n_lid, n_stream] buffer, so downstream always
     // takes the float dispatch. Numerics-only (no speedup) — validates the
     // device e2m1 path against the CPU reference and the resident model.
+    // Exact selection (LLAMA_DSV4_LID_EXACT): two-pass — implies the fp4/QAT
+    // path so pass-2 rescores the official numerics. m = candidate margin.
+    static const bool dsv4_lid_exact = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_EXACT");
+        return e && e[0] == '1';
+    }();
+    static const int dsv4_rescore_m = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_RESCORE_M");
+        return e ? atoi(e) : 64;
+    }();
     static const bool dsv4_lid_fp4 = []() {
         const char * e = getenv("LLAMA_DSV4_LID_FP4");
-        return e && e[0] == '1';
+        const char * x = getenv("LLAMA_DSV4_LID_EXACT");
+        return (e && e[0] == '1') || (x && x[0] == '1');
     }();
     ggml_cuda_pool_alloc<float> q_fp4_alloc(pool);
     ggml_cuda_pool_alloc<float> k_fp4_alloc(pool);
@@ -974,5 +1038,27 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
 
     // output is contiguous [n_top_k, nt_s, 1, n_stream] == flat [nt * n_top_k]
+    //
+    // Exact mode (LLAMA_DSV4_LID_EXACT): two-pass selection. Pass 1 (whatever
+    // score kernel ran above, int8/dec/wmma — all consuming the QAT-simulated
+    // q/k, since exact implies the fp4 path) ranks to top-(n_top_k + m);
+    // pass 2 rescores ONLY those candidates in serial-order fp32 (bitwise the
+    // CPU reference / ds4.c order) and emits the exact top-n_top_k. Selection
+    // becomes bit-exact vs the official QAT graph as long as m covers the
+    // pass-1 rank displacement (oracle: p100=36 synthetic @n_lid 33k; default
+    // m=64, override LLAMA_DSV4_LID_RESCORE_M).
+    if (dsv4_lid_exact) {
+        const int m      = dsv4_rescore_m;
+        const int n_cand = (n_top_k + m) < n_lid ? (n_top_k + m) : n_lid;
+        GGML_ASSERT(n_cand <= 1024); // rescore kernel smem/bitonic width
+        ggml_cuda_pool_alloc<uint32_t> cand_alloc(pool, (size_t) nt * n_cand);
+        dsv4_topk_launch(pool, cand_alloc.get(), scores, n_lid, nt, n_cand, stream);
+        dsv4_lid_rescore_kernel<<<nt, 256, 0, stream>>>(
+                (int32_t *) dst->data, cand_alloc.get(),
+                q_d, w_d, k_f32_d, m_d, nbm1, nbm3,
+                n_cand, n_top_k, n_lid, n_head, d_idx, nt_s);
+        return;
+    }
+
     dsv4_topk_launch(pool, (uint32_t *) dst->data, scores, n_lid, nt, n_top_k, stream);
 }
