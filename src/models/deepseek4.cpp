@@ -793,7 +793,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // 41 TFLOPS): gate on n_csa >= LLAMA_DSV4_CSA_TILE_MIN (default 12288).
     static const int64_t dsv4_tile_w = []() {
         const char * e = getenv("LLAMA_DSV4_CSA_TILE");
-        return e ? atoll(e) : (long long) 0;
+        // default ON (W=16) as of 2026-07-13: gates passed (PPL identical,
+        // passkey 5/5 at 42k incl past-raw-window keys, deterministic,
+        // +12.2% pp@d65k / +32.1% pp@d131k on IQ3). Set 0 to disable.
+        return e ? atoll(e) : (long long) 16;
     }();
     static const int64_t dsv4_tile_ucap = []() {
         const char * e = getenv("LLAMA_DSV4_CSA_TILE_UCAP");

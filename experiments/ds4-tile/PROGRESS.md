@@ -938,3 +938,19 @@ Scout results (follow-up levers, ordered by payoff):
    grows with depth.
 4. Overflow policy: truncation drops NEWEST cells; keep-newest variant is a
    ~3-line kernel change — decide from passkey v2 position sensitivity.
+
+## Iteration 19h — passkey gate PASSES; B2 per-tile DEFAULT ON
+
+Passkey v2 (42151-tok prompt, 5 keys at 10/40/70/90/97%, IQ3, greedy):
+- tile16 cap4096: 5/5 exact. tile16 cap2048: 5/5 exact — including delta@90%
+  (outside raw window, in the truncation-victim region at ~50% tile overflow).
+- dense first run emitted instant EOS (0 answer tokens); dense RERUN: 5/5.
+  Same cross-process greedy variance as 19f (one-ulp flip at token 1) — dense
+  scored as pass on the rerun; variance precedent now observed twice.
+ALL GATES PASS: PPL identical (both caps), passkey 5/5 (all configs),
+within-config determinism, coherence. Truncation direction (drop-newest)
+empirically harmless at these depths -> lever #4 (keep-newest) deprioritized.
+
+FLIPPED DEFAULT: LLAMA_DSV4_CSA_TILE now defaults to 16 (0 disables); u_cap
+4096, TILE_MIN 12288 (self-gates off shallow). Shallow default-path sanity OK.
+Net effect at defaults: pp unchanged <=d49k, +12.2% @d65k, +32.1% @d131k (IQ3).
