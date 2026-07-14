@@ -185,10 +185,10 @@ bench_metric() { # bench_metric <log> <pp|tg> -> t/s
 
 stage_depth() {
     print "== depth legs (SOFT gates; refs: pp2048@d65536 >= 285, tg64@d131072 >= 13.5) =="
-    $BIN/llama-bench -m $MODEL -fa 1 -ub 2048 -b 2048 --no-mmap -r 1 \
+    $BIN/llama-bench -m $MODEL -fa on -ub 2048 -b 2048 -mmp 0 -r 1 \
         -p 2048 -n 0 -d 65536 > $RUNDIR/depth-pp.log 2>&1
     local pp=$(bench_metric $RUNDIR/depth-pp.log pp)
-    $BIN/llama-bench -m $MODEL -fa 1 -ub 2048 -b 2048 --no-mmap -r 1 \
+    $BIN/llama-bench -m $MODEL -fa on -ub 2048 -b 2048 -mmp 0 -r 1 \
         -p 0 -n 64 -d 131072 > $RUNDIR/depth-tg.log 2>&1
     local tg=$(bench_metric $RUNDIR/depth-tg.log tg)
     print "  pp2048@d65536 = ${pp:-?} t/s   tg64@d131072 = ${tg:-?} t/s"

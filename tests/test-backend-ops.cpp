@@ -9587,6 +9587,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  4096,    1, 1, 512)); // packed K, decode kernel
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4,  64,  8,  1024,    8, 1, 256)); // packed K, scalar path
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  1500,   20, 2, 128)); // packed K, n_stream=2
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  4096,    1, 2, 512)); // packed-direct decode, n_stream=2
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

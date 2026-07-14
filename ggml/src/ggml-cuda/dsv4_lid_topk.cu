@@ -87,6 +87,20 @@ static __global__ void dsv4_fp4_quant_kernel(
 // exactly (pure power-of-two products).
 // ---------------------------------------------------------------------------
 
+// nibble -> TRUE e2m1 level (index 8 = -0 for sign fidelity with the
+// fake-quant path); dequant value = DSV4_LV16[ni] * 2^(e-127)
+static __constant__ float DSV4_LV16[16] = {  0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+
+// dequant element d (0..ne0) of a packed 17B-block row at byte pointer kb
+static __device__ __forceinline__ float dsv4_mxfp4_get(const uint8_t * kb, int d) {
+    const uint8_t * blk = kb + (d >> 5) * 17;
+    const int p = d & 31;
+    const uint8_t byte = blk[1 + (p & 15)];
+    const int ni = p < 16 ? (byte & 0x0F) : (byte >> 4);
+    return DSV4_LV16[ni] * exp2f((float) ((int) blk[0] - 127));
+}
+
 static __device__ __forceinline__ int dsv4_e2m1_index(float x) {
     const int sgn = x < 0.0f ? 8 : 0;
     const float ax = fminf(fabsf(x), 6.0f);
@@ -129,11 +143,12 @@ static __global__ void dsv4_qat_set_rows_kernel(
 // Staging dequant: packed [d_idx, n_lid, n_stream] cache view -> dense f32
 // buffer, one block per row (blockDim.x == d_idx). Strides in BYTES (block
 // rows; element strides are meaningless for packed types).
+// OT = half for the prefill staging buffer (f16-of-QAT is bit-exact — 2-bit
+// mantissa x pow2 scale — and halves staged-K read bandwidth vs f32).
+template <typename OT>
 static __global__ void dsv4_mxfp4_dequant_rows_kernel(
-        float * __restrict__ out, const uint8_t * __restrict__ in,
+        OT * __restrict__ out, const uint8_t * __restrict__ in,
         int64_t nb2, int64_t nb3, int rows_per_group, int ne0) {
-    const float lv[16] = {  0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
     const int row  = blockIdx.x;
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
@@ -143,7 +158,7 @@ static __global__ void dsv4_mxfp4_dequant_rows_kernel(
     const float d = exp2f((float) ((int) blk[0] - 127));
     const uint8_t byte = blk[1 + (lane & 15)];
     const int ni = lane < 16 ? (byte & 0x0F) : (byte >> 4);
-    out[(int64_t) row * ne0 + tid] = lv[ni] * d;
+    out[(int64_t) row * ne0 + tid] = (OT) (DSV4_LV16[ni] * d);
 }
 
 template <typename KT>
@@ -438,7 +453,9 @@ static __global__ void dsv4_score_int8_kernel(
 // block count. One stream-group per launch (pointers pre-offset).
 // ---------------------------------------------------------------------------
 
-template <typename KT>
+// PACKED: k points at 17B-block MXFP4 rows and nbk2 is a BYTE stride — the
+// warp reads 68B/row instead of 256B f16 (the P3b-ii decode bandwidth win).
+template <typename KT, bool PACKED = false>
 static __global__ void dsv4_score_decode_kernel(
         float       * __restrict__ scores,   // [n_lid]
         const float * __restrict__ q,        // [h*128 + d]  (single token)
@@ -474,12 +491,28 @@ static __global__ void dsv4_score_decode_kernel(
 
     // grid-stride over comps, one warp per comp
     for (int j = blockIdx.x * nwarps + warp; j < n_lid; j += gridDim.x * nwarps) {
-        const KT * kj = k + (int64_t) j * nbk2;
         int8_t kq[4];
         float amax = 0.0f;
         float kv[4];
+        if constexpr (PACKED) {
+            // 68B row: lane's 4 elements live in one block (b = lane>>3);
+            // dequant in place, values are QAT by construction
+            const uint8_t * kjb = (const uint8_t *) k + (int64_t) j * nbk2;
+            const uint8_t * blk = kjb + (lane >> 3) * 17;
+            const int j0 = (lane * 4) & 31;
+            const float d = exp2f((float) ((int) blk[0] - 127));
 #pragma unroll
-        for (int i = 0; i < 4; i++) { kv[i] = dsv4_ldk(kj + lane * 4 + i); amax = fmaxf(amax, fabsf(kv[i])); }
+            for (int i = 0; i < 4; i++) {
+                const uint8_t byte = blk[1 + ((j0 + i) & 15)];
+                const int ni = j0 < 16 ? (byte & 0x0F) : (byte >> 4);
+                kv[i] = DSV4_LV16[ni] * d;
+                amax = fmaxf(amax, fabsf(kv[i]));
+            }
+        } else {
+            const KT * kj = k + (int64_t) j * nbk2;
+#pragma unroll
+            for (int i = 0; i < 4; i++) { kv[i] = dsv4_ldk(kj + lane * 4 + i); amax = fmaxf(amax, fabsf(kv[i])); }
+        }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         const float ksc = amax > 0.0f ? amax / 127.0f : 0.0f;
@@ -828,7 +861,10 @@ static __global__ void dsv4_topk_merge_kernel(
 // one thread per candidate accumulates in the reference serial order (each
 // head's dot is its own ascending-d chain; 8 heads interleaved for ILP; heads
 // combined in ascending order) — bitwise the CPU/ds4.c result.
-template <typename KT>
+// PACKED: k points at 17B-block MXFP4 rows, nbk2/nbk3 are BYTE strides; the
+// smem stage dequants inline (KT must be float) — the compute loop below is
+// untouched, so candidate scores stay bitwise the CPU/ds4.c reference.
+template <typename KT, bool PACKED = false>
 static __global__ void dsv4_lid_rescore_score_kernel(
         float * __restrict__ cand_vals, const uint32_t * __restrict__ cand,
         const float * __restrict__ q,     // QAT f32 [d_idx, n_head, nt] contiguous
@@ -850,9 +886,15 @@ static __global__ void dsv4_lid_rescore_score_kernel(
     const uint32_t * c_t = cand + (int64_t) t * n_cand;
     for (int i = threadIdx.x; i < wn * d_idx; i += blockDim.x) {
         const uint32_t j = c_t[base + i / d_idx];
-        rows[i] = (j < (uint32_t) n_lid)
-                ? k[(int64_t) s * nbk3 + (int64_t) j * nbk2 + (i % d_idx)]
-                : (KT) 0.0f;
+        if constexpr (PACKED) {
+            rows[i] = (j < (uint32_t) n_lid)
+                    ? (KT) dsv4_mxfp4_get((const uint8_t *) k + (int64_t) s * nbk3 + (int64_t) j * nbk2, i % d_idx)
+                    : (KT) 0.0f;
+        } else {
+            rows[i] = (j < (uint32_t) n_lid)
+                    ? k[(int64_t) s * nbk3 + (int64_t) j * nbk2 + (i % d_idx)]
+                    : (KT) 0.0f;
+        }
     }
     __syncthreads();
     for (int ci = threadIdx.x; ci < wn; ci += blockDim.x) {
@@ -1093,6 +1135,7 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }();
     ggml_cuda_pool_alloc<float> q_fp4_alloc(pool);
     ggml_cuda_pool_alloc<float> k_fp4_alloc(pool);
+    ggml_cuda_pool_alloc<half>  k_f16_alloc(pool); // packed-prefill staging (f16-of-QAT, bit-exact)
     bool k_force_f32 = false;
     GGML_ASSERT(!dsv4_lid_fp4 || d_idx % 32 == 0);
     if (dsv4_lid_fp4) {
@@ -1102,17 +1145,39 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 q_fp4, q_d, d_idx, 0, n_head * nt, d_idx);
         q_d = q_fp4;
     }
-    if (k_is_mxfp4) {
+    // int8 dp4a path (default ON; LLAMA_DSV4_LID_INT8=0 disables): halves K
+    // smem width to attack the L1-bandwidth bound of the wmma path. Same
+    // per-stream launch geometry.
+    static const bool dsv4_lid_int8 = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_INT8");
+        return !e || e[0] != '0';
+    }();
+    // Dedicated decode kernel (nt_s==1): warp-per-comp, no 16-token tile
+    // padding. Default ON; LLAMA_DSV4_LID_DEC=0 disables.
+    static const bool dsv4_lid_dec = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_DEC");
+        return !e || e[0] != '0';
+    }();
+
+    // P3b-ii: at decode (nt_s==1) the packed rows are read directly by the
+    // 68B/row kernel variants — whole-cache staging there would cost more
+    // traffic than the f16 baseline it replaces. Prefill keeps staging
+    // (amortized over the ubatch; all wide kernels stay float-dispatch).
+    const bool k_packed_direct = k_is_mxfp4 && d_idx == 128 && dsv4_lid_dec && nt_s == 1;
+    if (k_is_mxfp4 && !k_packed_direct) {
         // packed container: stage-dequant the whole strided cache view into a
-        // dense f32 buffer. Rows hold QAT values by construction (written via
-        // DSV4_QAT_SET_ROWS), so no re-simulation regardless of env — every
-        // downstream kernel takes its existing float dispatch.
-        float * k_deq = k_fp4_alloc.alloc((size_t) n_stream * n_lid * d_idx);
-        dsv4_mxfp4_dequant_rows_kernel<<<n_stream * n_lid, d_idx, 0, stream>>>(
+        // dense F16 buffer. Rows hold QAT values by construction (written via
+        // DSV4_QAT_SET_ROWS) and f16-of-QAT is bit-exact, so every downstream
+        // kernel takes its (faster, half-width) f16 dispatch.
+        half * k_deq = k_f16_alloc.alloc((size_t) n_stream * n_lid * d_idx);
+        dsv4_mxfp4_dequant_rows_kernel<half><<<n_stream * n_lid, d_idx, 0, stream>>>(
                 k_deq, (const uint8_t *) k->data, k->nb[2], k->nb[3], n_lid, d_idx);
-        k_force_f32 = true;
         nbk2 = d_idx;
         nbk3 = (int64_t) d_idx * n_lid;
+    } else if (k_packed_direct) {
+        // byte strides for the packed-direct kernels
+        nbk2 = k->nb[2];
+        nbk3 = k->nb[3];
     } else if (dsv4_lid_fp4 && !dsv4_lid_qat_write) {
         float * k_fp4 = k_fp4_alloc.alloc((size_t) n_stream * n_lid * d_idx);
         // k: strided view, group = stream (stride nbk3), row = j (stride nbk2).
@@ -1128,21 +1193,10 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         nbk3 = (int64_t) d_idx * n_lid;
     }
     const float * k_f32_d = k_fp4_alloc.get();
-    const bool k_is_f16 = (k->type == GGML_TYPE_F16) && !k_force_f32;
-
-    // int8 dp4a path (default ON; LLAMA_DSV4_LID_INT8=0 disables): halves K
-    // smem width to attack the L1-bandwidth bound of the wmma path. Same
-    // per-stream launch geometry.
-    static const bool dsv4_lid_int8 = []() {
-        const char * e = getenv("LLAMA_DSV4_LID_INT8");
-        return !e || e[0] != '0';
-    }();
-    // Dedicated decode kernel (nt_s==1): warp-per-comp, no 16-token tile
-    // padding. Default ON; LLAMA_DSV4_LID_DEC=0 disables.
-    static const bool dsv4_lid_dec = []() {
-        const char * e = getenv("LLAMA_DSV4_LID_DEC");
-        return !e || e[0] != '0';
-    }();
+    const half  * k_f16_d = k_f16_alloc.get(); // non-null only for packed-prefill staging
+    const bool k_is_f16 = ((k->type == GGML_TYPE_F16) && !k_force_f32) || k_f16_d != nullptr;
+    // half-arm K pointer: staged buffer wins over the raw cache
+    const half * k_h_d = k_f16_d ? k_f16_d : (const half *) k->data;
 
     // Tensor-core path: requires head_dim == 128 (the wmma 16x16x16 k-tiling).
     // One launch per CUDA stream-group so a 16-token tile never straddles a
@@ -1158,9 +1212,12 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             const float * q_s  = q_d + (int64_t) s * nt_s * n_head * d_idx;
             const float * w_s  = w_d + (int64_t) s * nt_s * n_head;
             const float * m_s  = m_d + (int64_t) s * nbm3;
-            if (k_is_f16) {
+            if (k_packed_direct) {
+                dsv4_score_decode_kernel<float, true><<<gx, block, smem, stream>>>(
+                        sc_s, q_s, w_s, (const float *) ((const uint8_t *) k->data + (int64_t) s * nbk3), m_s, nbk2, n_lid, n_head);
+            } else if (k_is_f16) {
                 dsv4_score_decode_kernel<half><<<gx, block, smem, stream>>>(
-                        sc_s, q_s, w_s, (const half *) k->data + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
+                        sc_s, q_s, w_s, k_h_d + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
             } else {
                 dsv4_score_decode_kernel<float><<<gx, block, smem, stream>>>(
                         sc_s, q_s, w_s, (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
@@ -1176,7 +1233,7 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             const float * w_s   = w_d + t0 * n_head;
             const float * m_s   = m_d + (int64_t) s * nbm3;
             if (k_is_f16) {
-                const half * k_s = (const half *) k->data + (int64_t) s * nbk3;
+                const half * k_s = k_h_d + (int64_t) s * nbk3;
                 if (dsv4_lid_int8) {
                     dsv4_score_int8_kernel<half><<<grid, block, 0, stream>>>(
                             sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
@@ -1202,7 +1259,7 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         dim3 grid_score(nt, (n_lid + j_tile - 1) / j_tile, 1);
         if (k_is_f16) {
             dsv4_score_kernel<half><<<grid_score, block, smem, stream>>>(
-                    scores, q_d, w_d, (const half *) k->data, m_d,
+                    scores, q_d, w_d, k_h_d, m_d,
                     nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
         } else {
             dsv4_score_kernel<float><<<grid_score, block, smem, stream>>>(
@@ -1229,10 +1286,19 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         ggml_cuda_pool_alloc<float>    cand_val_alloc(pool, (size_t) nt * n_cand);
         dsv4_topk_launch(pool, cand_alloc.get(), scores, n_lid, nt, n_cand, stream);
         const dim3 grid_rs(nt, (n_cand + 127) / 128, 1);
-        if (dsv4_lid_qat_write && k_is_f16) {
+        if (k_packed_direct) {
+            // decode with packed cache: no staged buffer exists — dequant the
+            // candidates' 68B rows inline (byte strides in nbk2/nbk3)
+            dsv4_lid_rescore_score_kernel<float, true><<<grid_rs, 128, 0, stream>>>(
+                    cand_val_alloc.get(), cand_alloc.get(),
+                    q_d, w_d, (const float *) k->data, m_d, nbk2, nbk3, nbm1, nbm3,
+                    n_cand, n_lid, n_head, d_idx, nt_s);
+        } else if ((dsv4_lid_qat_write || k_f16_d != nullptr) && k_is_f16) {
+            // half arm: f16 cache under QAT_WRITE, or the packed-prefill
+            // staged-f16 buffer (QAT by construction) — both bit-exact
             dsv4_lid_rescore_score_kernel<half><<<grid_rs, 128, 0, stream>>>(
                     cand_val_alloc.get(), cand_alloc.get(),
-                    q_d, w_d, (const half *) k->data, m_d, nbk2, nbk3, nbm1, nbm3,
+                    q_d, w_d, k_h_d, m_d, nbk2, nbk3, nbm1, nbm3,
                     n_cand, n_lid, n_head, d_idx, nt_s);
         } else if (dsv4_lid_qat_write && !k_force_f32) {
             // qat_write with an F32 cache: rows already QAT, read in place.

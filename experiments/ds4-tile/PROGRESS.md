@@ -1341,3 +1341,37 @@ continuation. PPL spot folds into the P4b std battery.
 NEXT (P3b-ii): native packed readers — decode kernel 68B/row (claws back
 the exact-mode +200us/layer decode price), then exact-price re-leg for the
 P4b default decision.
+
+## Iteration 26 — P3b-ii: native packed readers + exact-price re-legs (+ box death #7)
+
+PACKED READERS: dsv4_score_decode_kernel + dsv4_lid_rescore_score_kernel
+gained PACKED template arms reading the 68B rows directly (byte strides;
+decode skips whole-cache staging entirely — at decode the staging would
+COST more traffic than f16). Prefill staging switched f32 -> F16
+(f16-of-QAT bit-exact) recovering +3.9% on the exact leg. 18/18 op cases,
+zero FAILs under default AND exact env.
+
+BOX DEATH #7 (12:42): the first legs run used ONE llama-bench with
+-p 2048 -n 64 -d 65536,131072 (4 tests). Journal shows avail 21->16.7G
+during fill then stops cold — no OOM-kill line (UMA spike outran earlyoom
+and the kernel logger; hard reset). Mechanism: context teardown/recreate
+between tests transiently overlaps two deep contexts. RULE (memory
+#7): one llama-bench test per process; single -p XOR -n, single -d.
+
+RE-LEGS (same boot, single-test processes, settle-waits):
+| profile        | pp2048@d65536      | tg64@d131072 |
+| default (f16)  | 315.1              | 14.31 (ref 14.29 ✓) |
+| packed         | 303.7-308.4 (-2~3.6%) | 14.33 (neutral) |
+| packed+EXACT   | 285.2 (-9.5%)      | 13.63 (-4.8%) |
+Packed+EXACT absolute BEATS P3a's f16+EXACT absolute (281.9, prior boot)
+while shrinking the lid cache 3.76x (2.79 MiB @c8192 confirmed in logs;
+~520MB saved at 512k). Packed decode reader is latency-neutral at d131k
+(decode dominated by FA/MoE there; win should grow at 512k n_lid=131072).
+
+P4b DECISION (per pre-agreed criteria: flip only if <=3% pp and
+tg-neutral): -9.5%/-4.8% is material -> LID_EXACT + QAT_WRITE stay OPT-IN
+as the official-exact validation/reference profile. LID_CACHE_MXFP4 also
+stays opt-in (prefill -2~3.6% for 3.76x memory; add it to the 512k
+serving profile where memory is the binding constraint). Defaults remain
+the P4a fast profile. gates.sh quick PASS on the final build (packed
+exact profile: 7/7 ops zero-tolerance, coherence, determinism).
