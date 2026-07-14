@@ -1275,3 +1275,17 @@ Two real bugs in my kernel, found by measurement not guessing:
 
 Final op-level (n_lid=33280): prefill 103.8 -> 126.7ms (+22%, ~+2.8% e2e);
 decode 774 -> 974us. Final e2e legs running.
+
+## Iteration 23b — P3a CLOSED: all gates pass; -7.1% e2e price; NONDET was environmental
+
+Final e2e: pp2048@d65536 exact+qat_write = 281.9 vs 303.3 default (-7.1%,
+from -28.3%; matches op math: 22ms x21 layers per 6.75s ubatch. NOTE the
+earlier "+2.8% e2e" prediction forgot the x21 — op deltas are PER LAYER).
+Determinism: initial back-to-back pair split at token 3 — attribution probe
+in settled memory: EXACT pair MATCH, DENSE pair MATCH -> the split was the
+documented GB10 cross-process machine-state variance (3rd observation; the
+NONDET run fired right after a bench exit). Op-level determinism stands on
+the zero-tolerance suite (the stronger gate).
+P3a DONE: official-exact selection at -7.1% pp / +4%-ish decode at 512k.
+Residual trims for P3b era: packed mxfp4 reads (bandwidth), possibly reusing
+pass-1 candidate scores in phase B. Next: P4 default flips + gates.sh, P3b.
