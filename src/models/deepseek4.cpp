@@ -797,7 +797,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     }();
     static const int64_t dsv4_tile_ucap = []() {
         const char * e = getenv("LLAMA_DSV4_CSA_TILE_UCAP");
-        return e ? atoll(e) : (long long) 2048; // must keep n_raw+u_cap 256-aligned for CUDA FA
+        // 4096 covers the measured W=16 union mean+tail at d65k-d131k (mean
+        // ~2400, max ~5200; only the tail few % of tiles truncate). Must keep
+        // n_raw+u_cap 256-aligned for CUDA FA.
+        return e ? atoll(e) : (long long) 4096;
     }();
     static const int64_t dsv4_tile_min = []() {
         const char * e = getenv("LLAMA_DSV4_CSA_TILE_MIN");
