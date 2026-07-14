@@ -7055,6 +7055,81 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with opt-in per-row log-sum-exp tail output.
+// The result tensor has ne3 = q->ne[3]+1; the tail slice holds lse[h, iq, s] at
+// element offset DV*n_head*n_q*ne3. Only the first n_head*n_q*ne3 elements of the
+// tail slice are defined, so the compared output is a contiguous 1D view covering
+// exactly the main result + the LSE values.
+struct test_flash_attn_ext_lse : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nh;  // num KV heads
+    const std::array<int64_t, 2> nr23; // repeat in dim 2 and 3
+    const int64_t kv;  // kv size
+    const int64_t nb;  // batch size
+
+    const bool mask;
+    const float logit_softcap;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    std::string vars() override {
+        return "LSE," + VARS_TO_STR8(hsk, hsv, nh, nr23, kv, nb, mask, logit_softcap);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_lse(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1},
+                            int64_t kv = 512, int64_t nb = 8, bool mask = true, float logit_softcap = 0.0f)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), logit_softcap(logit_softcap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv, nh, nr23[1]);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = nullptr;
+        if (hsv <= hsk && (hsk == 576 || hsk == 512)) {
+            // MLA/DSV4-style: the V tensor is a sub-view of the K tensor.
+            v = ggml_view_4d(ctx, k, hsv, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+        } else {
+            v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsv, kv, nh, nr23[1]);
+        }
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * fa = ggml_flash_attn_ext_with_lse(ctx, q, k, v, m, 1.0f/sqrtf(hsk), 0.0f, logit_softcap);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_set_name(fa, "fa");
+
+        const int64_t n_rows = fa->ne[1]*fa->ne[2]*(fa->ne[3] - 1); // n_head*n_q*ne3
+        const int64_t n_main = fa->ne[0]*n_rows;                    // regular FA output
+
+        ggml_tensor * out = ggml_cont(ctx, ggml_view_1d(ctx, fa, n_main + n_rows, 0));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT — DSV4 union-gather padding pattern:
 // the last n_pad KV columns are duplicates of the last real row and are fully
 // masked (-inf for EVERY query row). This is what per-tile union padding
@@ -9840,6 +9915,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // per-tile B2 geometry: W=16 queries per tile, tiles batched in dim 3, mid-tile padding
     test_cases.emplace_back(new test_fa_pad(512, 1017, 519, 16, 64, 8,   true));
     test_cases.emplace_back(new test_fa_pad(512, 3777, 63,  16, 64, 128, true));
+
+    // FA with opt-in per-row log-sum-exp tail output (CUDA: mma kernel only, CPU is the reference).
+    // Generic head size, small/odd batch (partial-tile guards), with and without mask + softcap:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,  35, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  256,   8, false,  0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,  10.0f));
+    // long KV, few output tiles -> stream-k seams -> fixup kernels write the tail:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 1, {1, 1}, 8192,   4, true,   0.0f));
+    // MLA shape (DSV4: V is a sub-view of K), GQA, multiple sequences (tail indexing across ne3):
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 2}, 1024, 32, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 1}, 4096,  1, true,   0.0f));
+    // DSV4 per-tile geometry: W=16 queries per tile, tiles batched in dim 3:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 8}, 1024, 16, true,   0.0f));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
