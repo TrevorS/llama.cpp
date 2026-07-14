@@ -1162,3 +1162,17 @@ PROMOTION SWEEP (other B/C -> A candidates):
    shared by all models, ds4.c deviates equally (Q8_K). Out of scope.
 5. Already A: MTP_FUSED_DRAFT (ids-identical), spec decode (target-exact),
    FUSED_LID, HC modes 0/1.
+
+## Iteration 21d — payoff battery complete: 512k tg GATE PASSES (11.08 >= 10)
+
+Full battery (IQ3, tile+HC-fused defaults, gather+dec+int8 for tg):
+  pp2048 @ d65536:  303.3 (campaign best; was 252.7 tile-only, 225.3 dense)
+  pp2048 @ d131072: 245.1 (+50.2% vs yesterday's dense 163.1)
+  tg64   @ d131072: 14.29 (iter-13 baseline was 9.29 -> +54%)
+  tg64   @ d524288: 11.08 >= 10 — TASK-#6 tg GATE PASSES (was 9.64 with
+  scalar HC; sinkhorn fusion + HC defaults = +15% decode at 512k).
+TASK-#6 (512k) STATUS: allocation PASS, pp PASS (115.7 pre-HC-flip, will be
+higher now), tg PASS (11.08). Remaining formality: one long-completion
+coherence run at 512k. The iter-13 verdict ("BOTH gates FAIL without kernel
+work") is now fully reversed by B2 tile + B1 gather + DEC + HC/sinkhorn fusion.
+Next: BUILDSPEC-lid-exact.md phases 0-4.
