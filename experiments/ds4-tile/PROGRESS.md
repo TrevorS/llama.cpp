@@ -824,3 +824,27 @@ depth.
   Measures true overflow magnitude, not just at-capacity. Zero cost when off
   (nullptr stats arg). Smoke-tested via backend-ops (random-index test unions
   sit near max, as expected for uniform data).
+
+## Iteration 19c — d65536 GATE + union overflow MEASURED (u_cap 2048 is not exact)
+
+pp2048@d65536 (fused lid, -r 2): dense 232.3 -> tile16(u_cap2048) 271.5 = +16.8%.
+First correct-construction B2 win at depth (v1/v2 bench crashes were missing
+LLAMA_DSV4_FUSED_LID=1 -> unfused relu OOM; plus zsh `VAR=1 eval` drops the env).
+
+UNION_STATS sweep (W=16, TILE_MIN=2048, n_csa 2560->16896, 21 calls x 128 tiles):
+  n_csa  mean  max   over(u_max=2048)
+  2560   1366  2180  1%
+  4096   1631  2916  27%
+  8192   2030  3892  48%
+  16384  2446  4942  60%
+Union mean grows ~ +250 per n_csa doubling (sublinear, as designed) but the
+u_cap=2048 overflow is SYSTEMATIC at depth, not rare: 60% of tiles drop cells
+at d65k. Drops are highest-index (most recent) selected cells — partially
+shadowed by the 2304 raw window, but semantic until proven otherwise
+(ds4.c contract comment: dropped selected rows = semantic loss class).
+=> +16.8% is PROVISIONAL pending a quality gate.
+Exactness at d65k needs u_cap ~5376 -> kv_tile 7680; at the 12-vs-41 TFLOPS
+small-nb FA penalty that erases the d65k win (survives only d131k+). The
+strategic lever is the fattn small-nb config gap (ncols1<=16 starves K-byte
+amortization): closing half of it makes EXACT per-tile B2 win from d32k up.
+Running: u_cap 3072/4096 @d65536 + dense/2048/4096 @d131072 frontier legs.
