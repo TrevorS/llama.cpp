@@ -1215,3 +1215,37 @@ of score). LID_EXACT stays OPT-IN until P3a lands.
 STATE: buildspec P0 done, P1 descoped, P2 landed+gated (class A, opt-in),
 P3a next (new op GGML_OP_DSV4_FP4_RT + graph insert at lid cache write),
 then P3b (mxfp4 container), P4 (default flips + gates.sh).
+
+## Iteration 22c — P3a scout (QAT-at-write): single write site, one small op
+
+WRITE SITE: exactly ONE (deepseek4.cpp ~1189): the lid state-compress output
+is hadamard-rotated then cpy_k'd into kv_lid with state_write_idxs — both
+prefill and decode flow through it. P3a insert is 3 lines between the
+hadamard and the cpy_k. ONE reader (deepseek4.cpp:630 -> the fused/unfused
+score path) — blast radius is the selection pipeline only.
+
+NEW OP: GGML_OP_DSV4_FP4_RT — unary f32->f32 e2m1 block-32 QAT round-trip.
+CUDA kernel already exists (dsv4_fp4_quant_kernel, reuse with identity
+strides); CPU helpers already in ops.cpp. ~15 registration touchpoints.
+
+NUMERICS (the important discovery): f16 storage of QAT values is EXACT —
+e2m1 has a 2-bit mantissa and power-of-2 scales, so f16(QAT(f32 x)) ==
+QAT(f32 x) bit-for-bit in range (subnormal edge only for amax<7e-38 rows,
+which are all-zero rows that never get selected). That makes at-write
+STRICTLY MORE official than the current A1 order (QAT(f16(x)) — quantizing
+from already-f16-rounded cache values). ds4.c stores QAT(f32 x) in fp32; we
+get the same values in half the bytes.
+
+ENV: LLAMA_DSV4_LID_QAT_WRITE=1, read by three places: the graph (insert the
+write op), the CUDA fused op (skip k-side re-quant, keep the f16 fast path,
+rescore gets an f16-strided-K variant), the CPU ref (skip k-side sim).
+Cache content changes => flag is process-lifetime + fresh context (statics
+make this automatic); session save/restore untouched (still F16 values).
+
+SCOPE: ggml.h/.c +30 (op), ops.cpp +27, dsv4_lid_topk.cu +60/-10 (host op
+skip logic + rescore f16-K template), ggml-cuda.cu +6, deepseek4.cpp +12,
+tests +30. Verification: FP4_RT backend-ops cases; LID_TOPK zero-tolerance
+under EXACT+QAT_WRITE; e2e determinism; pp2048@d65536 re-leg (predict
+~300 t/s, i.e. exact-mode cost collapses from -28.3% to ~1-2%).
+Risk: public API no · cache-content migration (flag=process-lifetime) ·
+cross-module no · reversible yes · external blocker no.
