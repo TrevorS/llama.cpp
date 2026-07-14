@@ -870,3 +870,18 @@ u_cap 4096 covers mean+tail at d65k (only ~5k-tail tiles truncate, few %) and
 keeps +12.2% @d65k / +32.3% @d131k. d131k pp stable with fused lid (no OOM).
 QUANT SWITCH: decision legs now on UD-IQ3_XXS (serving quant; Teej).
 Running: IQ3 dense/2048/4096 + stats sweep @d65536.
+
+## Iteration 19e — IQ3 decision legs: same story as IQ2; u_cap default -> 4096
+
+pp2048@d65536 (UD-IQ3_XXS 95.9GB, fused lid): dense 225.3 | tile16 u_cap2048
+263.2 (+16.8%) | u_cap4096 252.7 (+12.2%). Same percentages as IQ2 to a tenth:
+the FA savings and MoE slowdown scale together at this depth.
+IQ3 union stats == IQ2 within noise (mean 2410 vs 2446 @n_csa16384, over 59%
+vs 60%) -> indexer selection clustering barely changes with expert quant; all IQ2
+structural findings transfer.
+DECISION: u_cap default 4096 (covers mean+bulk of tail; tail few % of tiles
+still truncate at d65k+). Committed. Tile path remains opt-in
+(LLAMA_DSV4_CSA_TILE=16) until quality gates pass.
+Running: IQ3 ab.sh re-bank + tile A/B, IQ3 d131k dense/4096 pair.
+Next gates: passkey-at-depth (plant beyond raw window, the dropped-cell victim
+region) + PPL at safe ctx, both IQ3.
