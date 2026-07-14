@@ -1,9 +1,14 @@
-# DSV4 optimization flag inventory
+# DS4 flag inventory (everything we introduced on this branch)
 
-Single source of truth for every DSV4 env gate: default, what ON/OFF does,
-where it's gated, and validation status. Update this file in the SAME commit
-as any default change or new flag. (Motivation: HC_FUSED sat silently off for
-a full bench campaign; a missing FUSED_LID cost two crashed d65536 cycles.)
+Single source of truth for every env gate and CLI flag added since the
+upstream base (e3546c794): default, what ON/OFF does, where it's gated, and
+validation status. Update this file in the SAME commit as any default change
+or new flag. (Motivation: HC_FUSED sat silently off for a full bench
+campaign; a missing FUSED_LID cost two crashed d65536 cycles.)
+
+Audit method: `git diff e3546c794..HEAD | grep getenv` + added `add_opt`
+CLI args. `LLAMA_DSV4_COMPRESS_DEBUG` is upstream (#24162), not ours.
+`GGML_NO_BACKTRACE`/`GGML_BACKTRACE_LLDB` are upstream debug knobs.
 
 Last audit: 2026-07-14 (commit 210a22df3 era).
 
@@ -22,6 +27,35 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
 | `LLAMA_DSV4_LID_DEC` | **OFF** (`=1` enables) | dedicated nt=1 decode score kernel (warp-per-comp, int8) | 16-token-tile kernel with 15/16 padding waste at decode | 2.0x kernel, +5.2% tg (+10.8% with GATHER). Same int8 numerics class. DEFAULT-ON CANDIDATE. |
 | `LLAMA_DSV4_LID_FP4` | OFF | e2m1 block-32 QAT fake-quant of indexer q/k (numerics only, no speedup) | fp16/fp32 indexer numerics | the model's official QAT indexer numeric; 0.93 top-512 overlap, deep PPL statistically identical. Keep opt-in until fp4 STORAGE lands. |
 | `LLAMA_DSV4_MOE_TILE` | OFF | MoE expert-tile bridge kernels in the graph | standard MoE path | NEGATIVE RESULT (tile bridge regresses; hc-batch memory). Leave OFF. |
+
+## Speculative decoding / MTP (server + common)
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `LLAMA_DSV4_SPEC_FRONTIER` | **ON** (`=0` disables) | the "frontier rewind" spec-decode rollback (server; code's own name for it) | part of the mtp-21.6 t/s recipe (d29e3b6); `atoi`, any non-zero = on |
+| `LLAMA_MTP_FUSED_DRAFT` | OFF (set = on) | fused MTP draft chain (only when !chain_heads && !is_mem_shared) | opt-in; backend-sampling interaction untested — see speculative.cpp comment |
+| `LLAMA_SPEC_TRACE` | OFF (set = on) | per-round SPECTRACE acc/draft log lines (server) | debug only |
+| `LLAMA_DEBUG_NEXTN` | OFF (set = on) | MTP next-N debug prints (llama-context) | debug only |
+
+## Refusal ablation / control-vector (llama-adapter + deepseek4)
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `LLAMA_CVEC_ABLATE` | OFF (`=1` enables) | projection ablation `cur -= scale*<cur,dir>*dir` instead of additive steering | the working refusal recipe (bb2814b16): ablate + ffn-only + scale 2.0 |
+| `LLAMA_CVEC_ABLATE_SCALE` | 1.0 | ablation strength | float |
+| `LLAMA_CVEC_SCALE_FILE` | unset | live file re-read every graph build — runtime scale sweeps on one model load | added after the kill/relaunch hard-reset (crash memory #6) |
+| `LLAMA_CVEC_AT_FFN` | OFF (set = on) | apply cvec at FFN (and attn unless FFN_ONLY) | |
+| `LLAMA_CVEC_FFN_ONLY` | OFF (set = on) | restrict cvec to FFN — matches ds4.c exactly | required for the 100%-flip result |
+| `CAPTURE_PROMPTS` / `CAPTURE_OUT` / `CAPTURE_OUT_THINK` / `CAPTURE_TENSOR` | unset | refusal-capture example: prompt list, output paths, tensor to capture | examples/refusal-capture only |
+
+## Server CLI flags we added (pi-ds4-flash L2 KV tier, dcd503d94)
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--cache-disk DIR` | unset (tier off) | enables the disk KV-state tier in DIR |
+| `--cache-disk-mb` | 65536 | on-disk budget MiB (0 = unlimited) |
+| `--cache-disk-min-tokens` | 2048 | smallest prompt worth persisting |
+| `--cache-disk-max-entry-mb` | 4096 | largest single state diverted to disk |
 
 ## Debug/instrumentation flags (never in perf runs)
 
