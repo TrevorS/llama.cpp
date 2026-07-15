@@ -1017,6 +1017,188 @@ static __global__ void dsv4_topk_merge_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// radix top-k (LLAMA_DSV4_LID_RADIX, default ON) — d128/half prefill path.
+// One block per token replaces the whole chunk+merge bitonic tree: two 8-bit
+// MSB-first histogram passes over order-preserving 16-bit keys find the
+// threshold key T, an ordered prefix-scan compaction emits every key > T plus
+// the LOWEST-INDEX (top_k - count_gt) members of key == T, and one small
+// bitonic sorts the top_k selected pairs. Selection is bit-identical to the
+// bitonic path: key equality == f32 value equality of the stored halves
+// (after canonicalizing -0, which compares equal to +0 in f32 but has a
+// distinct bit pattern and IS reachable via __float2half of a tiny negative
+// score), so "all > T, then lowest index among == T" is exactly dsv4_better.
+// The compaction MUST be an ordered scan (tiles ascending, in-tile prefix
+// preserves index order) — an atomic append would be nondeterministic in
+// WHICH ==T members win. No NaN can appear (finite acc + {0, -INF} mask).
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ uint16_t dsv4_score_key16(const half h) {
+    uint16_t hb = __half_as_ushort(h);
+    if (hb == 0x8000u) hb = 0u; // -0 == +0 under f32 compare
+    return (hb & 0x8000u) ? (uint16_t) ~hb : (uint16_t) (hb | 0x8000u);
+}
+
+// runtime-width variant of dsv4_bitonic_sort (n = pow2 <= 4096); sorts the
+// selected candidates descending for the output contract
+static __device__ void dsv4_bitonic_sort_rt(float * vals, uint32_t * idxs, uint32_t n) {
+    for (uint32_t k = 2u; k <= n; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+                const uint32_t other = i ^ j;
+                if (other > i && other < n) {
+                    const float    av = vals[i],    bv = vals[other];
+                    const uint32_t ai = idxs[i],    bi = idxs[other];
+                    const bool desc_half = (i & k) == 0u;
+                    const bool swap = desc_half ? dsv4_better(bv, bi, av, ai)
+                                                : dsv4_better(av, ai, bv, bi);
+                    if (swap) {
+                        vals[i] = bv; idxs[i] = bi;
+                        vals[other] = av; idxs[other] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+static __global__ void dsv4_topk_radix_kernel(
+        uint32_t * __restrict__ selected, const half * __restrict__ scores,
+        int n_lid, int top_k, uint32_t K2) {
+    extern __shared__ uint8_t dsv4_radix_smem[];
+    float    * sel_v = (float *) dsv4_radix_smem;              // [K2]
+    uint32_t * sel_i = (uint32_t *) (sel_v + K2);              // [K2]
+    uint32_t * hist  = sel_i + K2;                             // [256]
+    uint32_t * wtot  = hist + 256;                             // [64] warp gt/eq totals -> offsets
+    __shared__ uint32_t sh_bhi, sh_cnt_gt_hi, sh_cnt_gt, sh_T, sh_tile_gt, sh_tile_eq;
+
+    const int t = blockIdx.x;
+    const half * row = scores + (int64_t) t * n_lid;
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+
+    // pass 1: high-byte histogram, suffix-scan for the threshold high byte
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) hist[i] = 0u;
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < (uint32_t) n_lid; i += blockDim.x) {
+        atomicAdd(&hist[dsv4_score_key16(row[i]) >> 8], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t suffix = 0u;
+        for (int b = 255; b >= 0; b--) {
+            if (suffix + hist[b] >= (uint32_t) top_k) { sh_bhi = (uint32_t) b; sh_cnt_gt_hi = suffix; break; }
+            suffix += hist[b];
+        }
+    }
+    __syncthreads();
+    const uint32_t bhi = sh_bhi;
+
+    // pass 2: low-byte histogram within the threshold high-byte group
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) hist[i] = 0u;
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < (uint32_t) n_lid; i += blockDim.x) {
+        const uint16_t key = dsv4_score_key16(row[i]);
+        if ((uint32_t) (key >> 8) == bhi) atomicAdd(&hist[key & 0xFFu], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t cgh = sh_cnt_gt_hi;
+        uint32_t suffix = 0u;
+        for (int b = 255; b >= 0; b--) {
+            if (cgh + suffix + hist[b] >= (uint32_t) top_k) {
+                sh_T      = (bhi << 8) | (uint32_t) b;
+                sh_cnt_gt = cgh + suffix;
+                break;
+            }
+            suffix += hist[b];
+        }
+    }
+    __syncthreads();
+    const uint32_t T      = sh_T;
+    const uint32_t cnt_gt = sh_cnt_gt;
+    const uint32_t need   = (uint32_t) top_k - cnt_gt;
+
+    // pass 3: ordered compaction — tiles ascending + in-tile prefix scan
+    // preserve index order, so the ==T fill takes the LOWEST indices
+    uint32_t running_gt = 0u, running_eq = 0u;
+    for (uint32_t start = 0u; start < (uint32_t) n_lid; start += blockDim.x) {
+        const uint32_t i = start + threadIdx.x;
+        half hv = __float2half(0.0f);
+        bool gt = false, eq = false;
+        if (i < (uint32_t) n_lid) {
+            hv = row[i];
+            const uint32_t key = dsv4_score_key16(hv);
+            gt = key > T;
+            eq = key == T;
+        }
+        const uint32_t bal_gt = __ballot_sync(0xffffffffu, gt);
+        const uint32_t bal_eq = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) { wtot[wid] = __popc(bal_gt); wtot[32 + wid] = __popc(bal_eq); }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            uint32_t sg = 0u, se = 0u;
+            for (int w = 0; w < 32; w++) {
+                const uint32_t g = wtot[w], e = wtot[32 + w];
+                wtot[w] = sg; wtot[32 + w] = se; // exclusive warp offsets
+                sg += g; se += e;
+            }
+            sh_tile_gt = sg; sh_tile_eq = se;
+        }
+        __syncthreads();
+        if (gt) {
+            const uint32_t slot = running_gt + wtot[wid] + __popc(bal_gt & ((1u << lane) - 1u));
+            sel_v[slot] = __half2float(hv); sel_i[slot] = i;
+        }
+        if (eq) {
+            const uint32_t e = running_eq + wtot[32 + wid] + __popc(bal_eq & ((1u << lane) - 1u));
+            if (e < need) { sel_v[cnt_gt + e] = __half2float(hv); sel_i[cnt_gt + e] = i; }
+        }
+        running_gt += sh_tile_gt;
+        running_eq += sh_tile_eq;
+        __syncthreads(); // wtot reused next tile
+    }
+
+    // pad to K2 and sort the selected top_k descending
+    for (uint32_t i = threadIdx.x; i < K2; i += blockDim.x) {
+        if (i >= (uint32_t) top_k) { sel_v[i] = -INFINITY; sel_i[i] = UINT32_MAX; }
+    }
+    __syncthreads();
+    dsv4_bitonic_sort_rt(sel_v, sel_i, K2);
+    for (uint32_t i = threadIdx.x; i < (uint32_t) top_k; i += blockDim.x) {
+        selected[(int64_t) t * top_k + i] = sel_i[i];
+    }
+}
+
+static void dsv4_topk_radix_launch(
+        uint32_t * selected, const half * scores,
+        int n_lid, int n_tokens, int top_k, cudaStream_t stream) {
+    uint32_t K2 = 1u;
+    while (K2 < (uint32_t) top_k) K2 <<= 1u;
+    const size_t smem = (size_t) K2 * 8 + 256 * 4 + 64 * 4;
+    dsv4_topk_radix_kernel<<<n_tokens, 1024, smem, stream>>>(
+            selected, scores, n_lid, top_k, K2);
+}
+
+// radix needs enough token-blocks to fill the GPU and a row wider than the
+// selection; everything else (f32 scores, decode/small-nt) keeps bitonic
+static bool dsv4_topk_try_radix(uint32_t *, const float *, int, int, int, cudaStream_t) {
+    return false;
+}
+static bool dsv4_topk_try_radix(uint32_t * selected, const half * scores,
+        int n_lid, int n_tokens, int top_k, cudaStream_t stream) {
+    static const bool radix_on = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_RADIX");
+        return !e || e[0] != '0';
+    }();
+    if (!radix_on || n_tokens < 16 || n_lid <= top_k) {
+        return false;
+    }
+    dsv4_topk_radix_launch(selected, scores, n_lid, n_tokens, top_k, stream);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // exact-selection pass 2 (LLAMA_DSV4_LID_EXACT): serial-order fp32 rescore of
 // the pass-1 candidates. One block per token; each thread owns candidates
 // block-strided and accumulates the score in the SAME serial order as the CPU
@@ -1129,8 +1311,12 @@ static void dsv4_topk_launch(
         int n_lid, int n_tokens, int top_k, cudaStream_t stream) {
     constexpr uint32_t SORT_N = DSV4_TOPK_SORT_N;
     GGML_ASSERT((uint32_t) top_k <= SORT_N);
+
+    if (dsv4_topk_try_radix(selected, scores, n_lid, n_tokens, top_k, stream)) {
+        return;
+    }
+
     const int block = 1024;
-    // 64KB vals+idxs at SORT_N=8192 — dynamic smem, limit raised per kernel
     const size_t smem = (size_t) SORT_N * (sizeof(float) + sizeof(uint32_t));
 
     if ((uint32_t) n_lid <= SORT_N) {

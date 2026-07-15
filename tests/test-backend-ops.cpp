@@ -9671,7 +9671,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  8193,    2, 1, 100));  // just over two chunk boundaries
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 17000,    2, 1, 128));  // multi-chunk, partial last chunk, chunk+final merge
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 70000,    2, 1, 960));  // tree merge: 18 chunks > merge_group 4 (top_k <= 960 keeps EXACT's n_cand <= 1024)
-    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,    4, 1, 512));  // d128 f16-scores multi-chunk topk
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,    4, 1, 512));  // d128 f16-scores multi-chunk topk (nt<16: bitonic)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,   20, 1, 512));  // d128 radix top-k (nt>=16, wide row, multi-pass)
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
     // wmma score path (d_idx == 128): multi-token-tile, non-128-divisible n_lid, streams
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // wmma: 3 token-tiles (partial), n_lid % 128 != 0

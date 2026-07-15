@@ -71,7 +71,7 @@ for depth in short 32k 65k 131k; do
         log "== completion $arm $depth (ctx ${CTX[$depth]}) =="
         $SNAP pre-$arm-$depth >> $RUN/clocks.log
         $BIN/llama-completion -m $MODEL -f $RUN/prompt-$depth.txt -n 256 \
-            --temp 0 -s 42 -fa on -mmp 0 -ub 2048 -b 2048 -c ${CTX[$depth]} \
+            --temp 0 -s 42 -fa on --no-mmap -ub 2048 -b 2048 -c ${CTX[$depth]} \
             $extra -no-cnv --simple-io --no-display-prompt \
             > $RUN/gen-$arm-$depth.out 2> $RUN/gen-$arm-$depth.log
         $SNAP post-$arm-$depth >> $RUN/clocks.log

@@ -1696,3 +1696,22 @@ Two design scouts against fe6043410/d89d2849b:
 Standing bench matrix (18 legs, cooldowns, base+mtp) running on
 fe6043410 — results in the matrix-p5b profile dir; first legs:
 pp2048@d0 518.7 (NEW RECORD, prior ~505), tg128@d0 17.9.
+
+## Iteration 35 — STEP 2c radix top-k LANDED (gates green pre-crash)
+
+dsv4_topk_radix_kernel: 2x8-bit MSB histogram threshold + ordered
+ballot/popc compaction (lowest-index fill at ==T, -0 canonicalized)
++ runtime bitonic on the top_k selected; routed via
+dsv4_topk_try_radix (half scores, nt>=16, n_lid>top_k), env
+LLAMA_DSV4_LID_RADIX default ON. Gates (all pre-crash, first
+compile): 6 op profiles green incl EXACT 0.0 (radix drives pass-1
+over tie-heavy e2m1 scores), FP4, and RADIX=0 revert. Op perf:
+33280x2048@2048 119.8 -> 75.0ms (-37.4%, scout predicted -37.5%);
+@512 95.0 -> 73.7 (-22%); decode unchanged (bitonic by design).
+Cumulative op vs campaign start: 121.7 -> 75.0 (-38.4%); topk chain
+50.4 -> ~3.9ms. Serving same-boot: pp@d65536 342.2 vs 334.3 (+2.4%).
+BOX HARD-HUNG during the pp@d131072 radix leg (22:14, journal stops,
+no OOM/Xid logged; avail steady 15.7G) — new crash signature, cause
+unattributed (radix weak suspect: d65k leg + 98 op-perf runs at the
+exact d131k shape were clean; sustained-load thermal/power lockup at
+least as likely). d131k A/B pending on the new boot.
