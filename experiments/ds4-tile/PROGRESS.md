@@ -1781,3 +1781,40 @@ every open question; STEP 3 in BUILDPLAN updated to ready-to-type:
 Next session: type the kernel (build order in BUILDPLAN; ~+185/-4
 one file + test tolerance branch + MXFP4 perf case). Server was
 resident all through — zero GPU touched.
+
+## Iteration 38 — STEP 3 fp4-mma LANDED, MEASURED WIN (op -47.8%)
+
+dsv4_score_fp4mma_kernel: register-resident-K block-scaled fp4
+tensor-core indexer scoring (mma.sync kind::mxf4 m16n8k64), env
+LLAMA_DSV4_LID_FP4_MMA default OFF, Blackwell+packed-container gated.
+Reads 68B block_mxfp4 rows direct (staging + int8 pre-quant bypassed);
+K resident in B-registers across the 64-head loop; q packed to e2m1
+per head into the block_mxfp4 layout; f16 score store -> radix.
+
+MEASURED @33280x2048x2048 (d131k serving shape), full op:
+- int8 F16-K reference: 73.9ms
+- int8 MXFP4-K (staged): 74.3ms
+- fp4-mma MXFP4-K: 38.8ms (stable 38.6-38.9 x3) = -47.8%
+Score kernel ~71 -> ~35ms: the register-resident-K bet CONVERTED the
+L1 bound the iter-14/15 negatives were stuck on (they only tested
+smem-resident K). Kill gate was >=71.1ms -> passed by ~2x, no ncu
+adjudication needed.
+
+Correctness: 5 gate profiles 22/22 incl fp4-mma+EXACT+CACHE_MXFP4 at
+ZERO tolerance (pass-1 lands true top-k in the m=64 window, oracle
+p100<=4; pass-2 packed-direct rescore is bit-exact). Standalone
+class-B smoke gate 1.1e-1 (observed 0.056 on the 2048x4 case).
+
+Debug: one bug caught by compute-sanitizer — launched a flat 256-thread
+block, but the ggml_cuda_mma ldmatrix/get_i/get_j primitives use
+threadIdx.x AS the warp lane (0-31). Fixed to dim3(32,8):
+threadIdx.x=lane, threadIdx.y=warp. Clean after that.
+
+Container flip: with fp4-mma the LID_CACHE_MXFP4 staging+prequant
+terms disappear; int8-on-container (74.3) ~= int8-on-f16 (73.9), so
+the container is ~free at prefill and fp4-mma is pure win on top.
+Cumulative lid op vs campaign start: 121.7 -> 38.8ms (-68%). Dtype:
+fp4-mma puts the indexer multiply on the OFFICIAL e2m1 grid — faster
+AND more canonical than the int8 default. Pending: on-model serving
+A/B (both arms CACHE_MXFP4=1), PPL/coherence, then default-flip
+decision for the 512k serving profile.

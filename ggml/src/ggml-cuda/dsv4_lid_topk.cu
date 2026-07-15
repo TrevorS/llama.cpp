@@ -7,6 +7,8 @@
 #include <vector>
 #include <mma.h>
 
+#include "mma.cuh" // ggml_cuda_mma block-scaled fp4 tensor-core (step 3 probe)
+
 // DSV4_TOPK_SORT_N is defined in dsv4_lid_topk.cuh (shared with supports_op).
 
 // ============================================================================
@@ -471,6 +473,220 @@ static __global__ void dsv4_score_int8_kernel(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// fp4-mma score kernel (head_dim==128, packed MXFP4 lid container) —
+// LLAMA_DSV4_LID_FP4_MMA probe (Blackwell only, step 3).
+//
+// Register-resident-K block-scaled fp4 tensor-core scoring. The MLA indexer
+// shares ONE K across all 64 heads, so K (the mma B operand) is loaded into
+// registers ONCE per 16-token x 128-comp block and reused across the head
+// loop — attacking the int8 kernel's L1 bound (it re-reads K from smem 64x).
+// K is read from the 68B block_mxfp4 container rows straight onto the e2m1
+// grid (transform-free: nibbles ARE hardware e2m1, scale byte is raw ue8m0);
+// q is packed to e2m1 per head at runtime. Numerics = LID_FP4 class; under
+// LID_EXACT the packed-direct rescore backstop makes selection bit-exact
+// (oracle: pass-1 displacement p100<=4 vs the m=64 window).
+//
+// smem tile format mirrors mmq's MXFP4 path (16 qs ints + 2 packed ue8m0
+// scale u32 per row, row stride padded to 16B) so load_ldmatrix / load_generic
+// and the block-scale lane maps are correct by construction.
+// ---------------------------------------------------------------------------
+
+#ifdef GGML_USE_HIP
+static __global__ void dsv4_score_fp4mma_kernel(
+        half *, const float *, const float *, const uint8_t *, const float *,
+        int64_t, int64_t, int, int, int) { NO_DEVICE_CODE; }
+#else
+using namespace ggml_cuda_mma;
+
+// per-row smem stride in ints: 16 qs (128 e2m1 nibbles) + 2 scale u32,
+// padded to a multiple of 4 so every row base and k64-frag base is 16B-aligned
+#define DSV4_FP4_ROW 20
+#define DSV4_FP4_QSC 16  // scale u32 offset within the row
+
+static __global__ void dsv4_score_fp4mma_kernel(
+        half         * __restrict__ scores,   // [n_tokens, n_lid] for this stream
+        const float  * __restrict__ q,        // [(t*n_head + h)*128 + d] f32
+        const float  * __restrict__ weights,  // [t*n_head + h]
+        const uint8_t * __restrict__ k,       // packed block_mxfp4 rows, BYTE strides
+        const float  * __restrict__ mask,     // [t*nbm1 + j]
+        int64_t nbk2, int64_t nbm1,
+        int n_tokens, int n_lid, int n_head) {
+#ifdef BLACKWELL_MMA_AVAILABLE
+    typedef tile<16, 8, int>   tile_A; // q: 16 tokens x k64
+    typedef tile<8,  8, int>   tile_B; // K:  8 comps  x k64
+    typedef tile<16, 8, float> tile_C; // out: 16 tokens x 8 comps
+
+    // launched as blockDim (32, nwarps): threadIdx.x = lane (the mma/ldmatrix
+    // primitives use it directly as the warp lane), threadIdx.y = warp.
+    const int tile_c = blockIdx.x * 128; // comp base for this block
+    const int tile_t = blockIdx.y * 16;  // token base
+    const int lane   = threadIdx.x;       // 0..31
+    const int warp   = threadIdx.y;       // 0..nwarps-1, owns comps [warp*16, +16)
+    const int nwarps = blockDim.y;
+
+    // scale-supply lanes (PTX warp block-scaling: 2 threads/quad), from mmq
+    const int tidx_A = lane / 4 + (lane % 2) * 8;
+    const int tidx_B = lane / 4;
+
+    __shared__ int q_sm[16 * DSV4_FP4_ROW];   // A tile: 16 tokens
+    __shared__ int k_sm[128 * DSV4_FP4_ROW];  // B tiles: 128 comps
+
+    // ---- pack this block's 128 K rows to smem ONCE (resident across heads) --
+    // one warp per 16 comps; lane owns 8 comps? No: cooperative over 128 rows.
+    for (int c = warp; c < 128; c += nwarps) {
+        const int comp = tile_c + c;
+        int * row_qs = k_sm + c * DSV4_FP4_ROW;
+        if (comp < n_lid) {
+            const uint8_t * krow = k + (int64_t) comp * nbk2; // 4 x 17B blocks
+            // lane l (0..15) copies block l>>2 's 4 qs bytes for k64-frag; use
+            // 16 lanes to memcpy the 4x16 qs bytes and set scales
+            for (int b = lane; b < 4; b += 32) {
+                const uint8_t * blk = krow + b * 17;
+                // 16 qs bytes -> 4 ints at row_qs[b*4 .. b*4+4)
+                int tmp[4];
+                #pragma unroll
+                for (int w = 0; w < 4; w++) {
+                    tmp[w] = (int) blk[1 + w*4 + 0]       | ((int) blk[1 + w*4 + 1] << 8)
+                           | ((int) blk[1 + w*4 + 2] << 16) | ((int) blk[1 + w*4 + 3] << 24);
+                }
+                #pragma unroll
+                for (int w = 0; w < 4; w++) row_qs[b*4 + w] = tmp[w];
+            }
+            // pack the 4 e8m0 scale bytes into 2 u32 (2 sub-blocks per k64 frag)
+            if (lane == 0) {
+                const uint32_t e0 = krow[0*17], e1 = krow[1*17], e2 = krow[2*17], e3 = krow[3*17];
+                row_qs[DSV4_FP4_QSC + 0] = (int) (e0 | (e1 << 8));
+                row_qs[DSV4_FP4_QSC + 1] = (int) (e2 | (e3 << 8));
+            }
+        } else if (lane == 0) {
+            #pragma unroll
+            for (int w = 0; w < 16; w++) row_qs[w] = 0;
+            row_qs[DSV4_FP4_QSC + 0] = 0;
+            row_qs[DSV4_FP4_QSC + 1] = 0;
+        }
+    }
+    __syncthreads();
+
+    // resident B (K) fragments for this warp's 2 comp-tiles x 2 k64 frags
+    tile_B    Bk[2][2];
+    uint32_t  scB[2][2];
+    #pragma unroll
+    for (int ct = 0; ct < 2; ct++) {
+        const int crow = warp * 16 + ct * 8; // comp-tile base within the block
+        #pragma unroll
+        for (int f = 0; f < 2; f++) {
+            load_generic(Bk[ct][f], k_sm + crow * DSV4_FP4_ROW + f * 8, DSV4_FP4_ROW);
+            scB[ct][f] = ((const uint32_t *) (k_sm + (crow + tidx_B) * DSV4_FP4_ROW + DSV4_FP4_QSC))[f];
+        }
+    }
+
+    float acc[2][4];
+    #pragma unroll
+    for (int ct = 0; ct < 2; ct++)
+        #pragma unroll
+        for (int l = 0; l < 4; l++) acc[ct][l] = 0.0f;
+
+    // ---- head loop: pack q per head, ldmatrix A, 2 mma/comp-tile, relu drain -
+    for (int h = 0; h < n_head; h++) {
+        __syncthreads();
+        // pack q[16 tokens][128 dims] for this head into the A smem tile, in the
+        // SAME block_mxfp4 layout K uses (byte m of a 32-dim block holds dim m
+        // low-nibble, dim m+16 high-nibble; int w of block b = bytes [w*4..+4)).
+        // One warp per token; lane owns 4 consecutive dims [lane*4, +4). Block
+        // b = lane/8; sub-lane s = lane%8. Sub-lanes s<4 hold the LOW dims of
+        // int w=s, sub-lanes s+4 hold the matching HIGH dims — combine via shfl.
+        for (int tk = warp; tk < 16; tk += nwarps) {
+            const int tokn = tile_t + tk;
+            int * row_qs = q_sm + tk * DSV4_FP4_ROW;
+            const float * qrow = (tokn < n_tokens)
+                    ? q + ((int64_t) tokn * n_head + h) * 128 : nullptr;
+            const int b = lane >> 3;   // 0..3 which 32-dim block
+            const int s = lane & 7;    // 0..7 sub-lane within block
+            float v[4];
+            float amax = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                v[i] = qrow ? qrow[lane * 4 + i] : 0.0f;
+                amax = fmaxf(amax, fabsf(v[i]));
+            }
+            // amax over each aligned 8-lane octet (= one 32-dim block)
+            #pragma unroll
+            for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            amax = fmaxf(amax, 7.052966104933725e-38f);
+            const int   sc    = (int) ceilf(log2f(amax / 6.0f));
+            const float scale = exp2f((float) sc);
+            // this lane's 4 e2m1 nibbles, packed one-per-byte (low positions)
+            int mynib = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int ni = dsv4_e2m1_index(fminf(6.0f, fmaxf(-6.0f, v[i] / scale)));
+                mynib |= (ni & 0xF) << (i * 8);
+            }
+            // sub-lane s<4 owns int w=s: its own nibbles are the low halves,
+            // the high halves come from sub-lane s+4 of the same block
+            const int hinib = __shfl_sync(0xffffffffu, mynib, (b << 3) + s + 4);
+            if (s < 4) {
+                row_qs[b * 4 + s] = mynib | (hinib << 4);
+            }
+            // block scale (biased ue8m0). amax is uniform across a block's 8
+            // lanes, so lane b*8 holds block b's scale; lane 0 gathers all four
+            // and writes the two u32 exactly as K packs them (e0|e1<<8, e2|e3<<8,
+            // high bytes zero).
+            const int e8 = sc + 127;
+            const int e0 = __shfl_sync(0xffffffffu, e8, 0);
+            const int e1 = __shfl_sync(0xffffffffu, e8, 8);
+            const int e2 = __shfl_sync(0xffffffffu, e8, 16);
+            const int e3 = __shfl_sync(0xffffffffu, e8, 24);
+            if (lane == 0) {
+                row_qs[DSV4_FP4_QSC + 0] = e0 | (e1 << 8);
+                row_qs[DSV4_FP4_QSC + 1] = e2 | (e3 << 8);
+            }
+        }
+        __syncthreads();
+
+        tile_A Aq[2];
+        uint32_t scA[2];
+        #pragma unroll
+        for (int f = 0; f < 2; f++) {
+            load_ldmatrix(Aq[f], q_sm + f * 8, DSV4_FP4_ROW);
+            scA[f] = ((const uint32_t *) (q_sm + tidx_A * DSV4_FP4_ROW + DSV4_FP4_QSC))[f];
+        }
+
+        #pragma unroll
+        for (int ct = 0; ct < 2; ct++) {
+            tile_C C = {};
+            mma_block_scaled_fp4<GGML_TYPE_MXFP4>(C, Aq[0], Bk[ct][0], scA[0], scB[ct][0]);
+            mma_block_scaled_fp4<GGML_TYPE_MXFP4>(C, Aq[1], Bk[ct][1], scA[1], scB[ct][1]);
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const int tok = tile_t + ((l / 2) * 8) + (lane / 4);
+                const float wl = tok < n_tokens ? weights[(int64_t) tok * n_head + h] : 0.0f;
+                acc[ct][l] += fmaxf(C.x[l], 0.0f) * wl;
+            }
+        }
+    }
+
+    // ---- epilogue: + mask, f16 store ---------------------------------------
+    #pragma unroll
+    for (int ct = 0; ct < 2; ct++) {
+        #pragma unroll
+        for (int l = 0; l < 4; l++) {
+            const int tok  = tile_t + ((l / 2) * 8) + (lane / 4);
+            const int comp = tile_c + warp * 16 + ct * 8 + ((lane % 4) * 2) + (l % 2);
+            if (tok < n_tokens && comp < n_lid) {
+                scores[(int64_t) tok * n_lid + comp] =
+                        __float2half(acc[ct][l] + mask[(int64_t) tok * nbm1 + comp]);
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(scores, q, weights, k, mask, nbk2, nbm1, n_tokens, n_lid, n_head);
+    NO_DEVICE_CODE;
+#endif // BLACKWELL_MMA_AVAILABLE
+}
+#endif // GGML_USE_HIP
 
 // ---------------------------------------------------------------------------
 // dedicated decode score kernel (nt==1, head_dim==128) — LLAMA_DSV4_LID_DEC
@@ -1527,13 +1743,33 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const char * e = getenv("LLAMA_DSV4_LID_DEC");
         return !e || e[0] != '0';
     }();
+    // fp4-mma probe (step 3): register-resident-K block-scaled fp4 tensor-core
+    // scoring. Prefill only, packed MXFP4 container, Blackwell only.
+    static const bool dsv4_lid_fp4_mma = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_FP4_MMA");
+        return e && e[0] == '1';
+    }();
+    bool fp4_mma_active = dsv4_lid_fp4_mma && k_is_mxfp4 && d_idx == 128 && nt_s > 1;
+    if (fp4_mma_active) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL)) {
+            static bool warned = false;
+            if (!warned) { warned = true;
+                fprintf(stderr, "\ndsv4_lid_topk: LID_FP4_MMA requested but device not Blackwell — using int8\n"); }
+            fp4_mma_active = false;
+        }
+    }
 
     // P3b-ii: at decode (nt_s==1) the packed rows are read directly by the
     // 68B/row kernel variants — whole-cache staging there would cost more
     // traffic than the f16 baseline it replaces. Prefill keeps staging
     // (amortized over the ubatch; all wide kernels stay float-dispatch).
     const bool k_packed_direct = k_is_mxfp4 && d_idx == 128 && dsv4_lid_dec && nt_s == 1;
-    if (k_is_mxfp4 && !k_packed_direct) {
+    if (fp4_mma_active) {
+        // read the 68B block_mxfp4 rows directly — no staging, no pre-quant
+        nbk2 = k->nb[2];
+        nbk3 = k->nb[3];
+    } else if (k_is_mxfp4 && !k_packed_direct) {
         // packed container: stage-dequant the whole strided cache view into a
         // dense F16 buffer. Rows hold QAT values by construction (written via
         // DSV4_QAT_SET_ROWS) and f16-of-QAT is bit-exact, so every downstream
@@ -1602,7 +1838,7 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         ggml_cuda_pool_alloc<float>  k_sc_alloc(pool);
         int8_t * k_i8 = nullptr;
         float  * k_sc = nullptr;
-        if (dsv4_lid_int8) {
+        if (dsv4_lid_int8 && !fp4_mma_active) {
             k_i8 = k_i8_alloc.alloc((size_t) n_stream * n_lid * 128);
             k_sc = k_sc_alloc.alloc((size_t) n_stream * n_lid);
             const int pq_block = 256; // 8 warps -> 8 comps/block
@@ -1625,7 +1861,13 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             const float * q_s   = q_d + t0 * n_head * d_idx;
             const float * w_s   = w_d + t0 * n_head;
             const float * m_s   = m_d + (int64_t) s * nbm3;
-            if (dsv4_lid_int8) {
+            if (fp4_mma_active) {
+                const dim3 block_mma(32, 8); // threadIdx.x=lane, threadIdx.y=warp
+                dsv4_score_fp4mma_kernel<<<grid, block_mma, 0, stream>>>(
+                        sc_s, q_s, w_s,
+                        (const uint8_t *) k->data + (int64_t) s * nbk3, m_s,
+                        nbk2, nbm1, nt_s, n_lid, n_head);
+            } else if (dsv4_lid_int8) {
                 dsv4_score_int8_kernel<<<grid, block, 0, stream>>>(
                         sc_s, q_s, w_s,
                         k_i8 + (int64_t) s * n_lid * 128, k_sc + (int64_t) s * n_lid,
@@ -1677,9 +1919,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             dsv4_topk_launch<float>(pool, cand_alloc.get(), scores, n_lid, nt, n_cand, stream);
         }
         const dim3 grid_rs(nt, (n_cand + 127) / 128, 1);
-        if (k_packed_direct) {
-            // decode with packed cache: no staged buffer exists — dequant the
-            // candidates' 68B rows inline (byte strides in nbk2/nbk3)
+        if (k_packed_direct || fp4_mma_active) {
+            // packed cache, no staged buffer (decode packed-direct OR fp4-mma
+            // prefill): dequant the candidates' 68B rows inline (byte strides).
+            // Bitwise the CPU/ds4.c reference — the fp4-mma pass-1 only needs to
+            // land the true top-k inside the m window (oracle p100<=4 << m=64).
             dsv4_lid_rescore_score_kernel<float, true><<<grid_rs, 128, 0, stream>>>(
                     cand_val_alloc.get(), cand_alloc.get(),
                     q_d, w_d, (const float *) k->data, m_d, nbk2, nbk3, nbm1, nbm3,

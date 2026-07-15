@@ -5831,6 +5831,13 @@ struct test_dsv4_lid_topk : public test_case {
         // regardless of which pass-1 kernel ran.
         const char * ex = getenv("LLAMA_DSV4_LID_EXACT");
         if (ex && ex[0] == '1') return 0.0;
+        // LLAMA_DSV4_LID_FP4_MMA: e2m1xe2m1 tensor-core scoring — class B
+        // (same grid the model was QAT'd on), a coarser 8-level quant than
+        // int8, so a larger set-mismatch on random test fill. Smoke gate only
+        // (~2x the ~0.056 observed on the 2048x4 case); the real correctness
+        // proof is the LID_FP4_MMA + LID_EXACT run at 0.0 above.
+        const char * fm = getenv("LLAMA_DSV4_LID_FP4_MMA");
+        if (fm && fm[0] == '1' && d_idx == 128) return 1.1e-1;
         // LLAMA_DSV4_LID_INT8 scores via int8 dp4a vs the fp32 CPU reference;
         // per-row int8 quant flips a small fraction of near-tie selections
         // (observed <= 0.7%). Loosen the set-mismatch gate for that path.
@@ -10485,6 +10492,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000, 2048, 1, 512));  // multi-chunk, n_lid % SORT_N != 0
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 512));
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 2048)); // production indexer_top_k (merge_group=2, deep tree)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64, 33280, 2048, 1, 2048)); // fp4-mma probe: d131k serving shape, packed K
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280,    1, 1, 512));
 
     return test_cases;
