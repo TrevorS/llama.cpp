@@ -1535,3 +1535,29 @@ scaling; score kernel is L1-bound per iter 14), not FA. Second-order:
 MoE mmq is the flat-share ceiling as before. Box caveat: power/thermal
 capping active during runs (clocksnap now records this; see
 83767ecd1) — shares are relative and robust, absolutes carry ±4%.
+
+## Iteration 30 — lid traffic campaign scout (4 levers ranked, 1 struck)
+
+Shallow legs (gates-runs artifacts local): pp2048 d8192 466.8 / d32768
+361.3 (nsys ~3% overhead). Attribution table + all four design-scout
+verdicts consolidated in BUILDSPEC-lid-traffic.md. Highlights:
+- shallow ctx is MoE-bound (~49% @d8192); lid only matters d65k+.
+- FA share PEAKS at d32768 (29.4%) — the dense-CSA gap below TILE_MIN;
+  TILE_MIN=4096 probe under split: +1.5% @d32768 (weak positive,
+  parked).
+- 4-bit-K-in-smem lever STRUCK before rebuild: scout traced it to the
+  iter-15 LLAMA_DSV4_LID_INT4 measured negative (1.6x slower; dp4a
+  demands int8 operands, unpack tax on the same int pipe).
+- SORT_N 8192 blocker found in advance: 64KB static smem exceeds the
+  48KB compile cap — needs the 3 topk kernels on dynamic extern shared
+  (fits the 99KB carveout).
+- Fusion scout: A-safe bit-identity achievable (verbatim bitonic +
+  quant + ascending-h accum); footprint is a WASH (cand-val tree
+  replaces scores); win is ~0.5GB/layer traffic; K L2-residency under
+  1-token blocks is the deciding risk (ncu gate).
+- fp4-mma scout: register-resident-K schedule is the ONE structure the
+  iter-14c/15 negatives never tested; MLA 1-K-per-64-heads makes
+  B-resident real (16x smem-read cut); numerics = LID_FP4's accepted
+  class; needs LID_CACHE_MXFP4; explicit ncu kill criterion.
+Build order: (SORT_N + f16 scores + int8-K pre-quant) -> fused
+chunk-topk prototype -> fp4-mma probe. Ceiling ~10-15% pp @d131k.
