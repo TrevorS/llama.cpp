@@ -5981,23 +5981,27 @@ struct test_dsv4_qat_set_rows : public test_case {
 // GGML_OP_DSV4_FA_MERGE (LSE merge of two FA-with-LSE halves)
 struct test_dsv4_fa_merge : public test_case {
     const int64_t dv, nh, nq, ns;
+    const int64_t wb, tb; // b-side tiling: b is [dv, nh, wb, tb+1] with nh*wb*tb == nh*nq*ns (0 = same shape as a)
 
     std::string vars() override {
         return "dv=" + std::to_string(dv) + ",nh=" + std::to_string(nh) +
-               ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns);
+               ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns) +
+               ",wb=" + std::to_string(wb) + ",tb=" + std::to_string(tb);
     }
 
     double max_nmse_err() override { return 1e-6; }
 
-    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns)
-        : dv(dv), nh(nh), nq(nq), ns(ns) {}
+    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0)
+        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // srcs carry the LSE tail slice: [DV, H, Q, S+1]; uniform init doubles
         // as both attention values and plausible LSE magnitudes.
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
         ggml_set_name(a, "a");
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+        ggml_tensor * b = wb > 0
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, wb, tb + 1)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
         ggml_set_name(b, "b");
         ggml_tensor * out = ggml_dsv4_fa_merge(ctx, a, b);
         ggml_set_name(out, "out");
@@ -7097,10 +7101,11 @@ struct test_flash_attn_ext_lse : public test_case {
 
     const bool mask;
     const float logit_softcap;
+    const bool sinks;
 
     std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
     std::string vars() override {
-        return "LSE," + VARS_TO_STR8(hsk, hsv, nh, nr23, kv, nb, mask, logit_softcap);
+        return "LSE," + VARS_TO_STR9(hsk, hsv, nh, nr23, kv, nb, mask, logit_softcap, sinks);
     }
 
     double max_nmse_err() override {
@@ -7108,8 +7113,8 @@ struct test_flash_attn_ext_lse : public test_case {
     }
 
     test_flash_attn_ext_lse(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1},
-                            int64_t kv = 512, int64_t nb = 8, bool mask = true, float logit_softcap = 0.0f)
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), logit_softcap(logit_softcap) {}
+                            int64_t kv = 512, int64_t nb = 8, bool mask = true, float logit_softcap = 0.0f, bool sinks = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), logit_softcap(logit_softcap), sinks(sinks) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
@@ -7133,7 +7138,14 @@ struct test_flash_attn_ext_lse : public test_case {
             ggml_set_name(m, "m");
         }
 
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            ggml_set_name(s, "s");
+        }
+
         ggml_tensor * fa = ggml_flash_attn_ext_with_lse(ctx, q, k, v, m, 1.0f/sqrtf(hsk), 0.0f, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(fa, s);
         ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
         ggml_set_name(fa, "fa");
 
@@ -7148,7 +7160,10 @@ struct test_flash_attn_ext_lse : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "s") == 0) {
+                // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
@@ -9685,6 +9700,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8));    // DSV4 tile geometry
     test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1));  // prefill width
     test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3));     // odd sizes
+    // mixed-shape halves (production: dense [DV,H,nt,1+1] vs tiled [DV,H,W,T+1]):
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 8, 64, 1, 16, 4));
 
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row
@@ -9960,6 +9978,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 1}, 4096,  1, true,   0.0f));
     // DSV4 per-tile geometry: W=16 queries per tile, tiles batched in dim 3:
     test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 8}, 1024, 16, true,   0.0f));
+    // sinks fold into the LSE (raw half of the DSV4 split carries the sink):
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,   0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 1, {1, 1}, 8192,   4, true,   0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 2}, 1024, 32, true,   0.0f, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

@@ -1376,7 +1376,7 @@ serving profile where memory is the binding constraint). Defaults remain
 the P4a fast profile. gates.sh quick PASS on the final build (packed
 exact profile: 7/7 ops zero-tolerance, coherence, determinism).
 
-## Iteration 27 (OPEN) — FA-with-LSE step 1: op flag + tail layout + CPU reference
+## Iteration 27, step 1 — FA-with-LSE: op flag + tail layout + CPU reference
 
 Toward BUILDSPEC-fattn-lse-merge (split-attention: dense raw-window FA +
 remainder-only tiled FA + LSE merge; kills the repeat_4d raw replication
@@ -1397,3 +1397,59 @@ REMAINING: CUDA meta plumbing (mma epilogue emission + stream-K fixup
 writeback + finalize kernel + supports_op mma-only), dsv4_fa_merge op,
 deepseek4 graph split, merged-halves==dense reference tests, depth legs
 (single-test per process — crash rule #7).
+
+## Iteration 27 (CLOSED) — split-attention + LSE merge LANDED, default ON
+
+Steps 2-4 of BUILDSPEC-fattn-lse-merge, on top of step 1 above.
+
+CUDA FA-with-LSE (3e4c79585): DESIGN SIMPLIFICATION vs buildspec — no
+finalize kernel, no forced meta alloc. Every output row is finalized in
+exactly one place already holding the combined (max, rowsum): fully-owned
+tiles write lse = max + log(rowsum) straight from the mma epilogue
+(np==1 both cols_per_warp variants + np>1 combine block, gated
+!needs_fixup && !is_fixup); seam tiles write it from the stream-k fixup
+kernels (uniform + general) next to their `*dst = dst_val/rowsum`.
+fattn_kernel_t grew a trailing write_lse i32 (vec/tile/wmma UNUSED).
+supports_op: LSE requires the mma kernel, else CPU fallback. SINKS FOLD
+INTO THE LSE for free — the kernel merges sinks into (max, rowsum)
+before the meta/tail writes on every path (epilogue, both fixups, CPU
+after its sink block), so the initial sinks-rejection gate was lifted.
+LSE is invariant to FATTN_KQ_MAX_OFFSET (stored pair is consistent).
+Gates: 11 LSE cases (incl kv=8192 stream-k seams, MLA 576/512 V-view,
+ne3=2 multi-seq, 3 sink cases) + full FA sweep 2908/2908 flag-unset.
+
+GGML_OP_DSV4_FA_MERGE (c16f6e91d + shape relax): out = (ea*a + eb*b)/
+(ea+eb), ea = exp(lse_a - max(lse_a, lse_b)); both-masked rows -> zeros.
+Halves may slice rows differently ([DV,H,nt,1+1] dense vs [DV,H,W,T+1]
+tiled share one memory layout) — constructor requires equal DV and equal
+row count only. BUG CAUGHT BY GATES: first battery aborted in
+graph_reserve because the constructor still had ggml_are_same_shape (the
+op-level tests only used same-shape halves). Fixed + 2 mixed-shape
+backend-ops cases (5/5).
+
+deepseek4 graph split (LLAMA_DSV4_FA_SPLIT, default ON): tile branch now
+runs (i) dense raw-window FA over all queries (ne3=1, full occupancy,
+sink attached here — its LSE carries the sink exactly once) + (ii)
+remainder-only tiled FA over per-tile unions (k_all shrinks to
+[hd,1,u_cap,T]) + (iii) dsv4_fa_merge. repeat_4d + concat GONE. Guard
+T <= hd (LSE tail must fit) falls back to concat path.
+
+GATES (fa-split battery, run dir gates-runs/fa-split-20260714-161213):
+smoke 12k ok; determinism @42k on1==on2 PASS; A/B split vs concat
+BYTE-IDENTICAL (64 greedy tokens @42k); passkey 5/5 @~42k; PPL c32768
+tile-forced ON 1.1884 +/- 0.00595 vs OFF 1.1873 +/- 0.00593 (well within
+2 sigma); tg64@d131072 14.27 (ref 14.29 — decode untouched, neutral).
+
+PERF (single-test benches, same boot):
+| leg            | split ON | split OFF | delta |
+| pp2048@d65536  | 321.14   | 299.91    | +7.1% |
+| pp2048@d131072 | 270.24   | 254.74    | +6.1% |
+Both are new absolute records for these legs (prior: 315.1 @d65k,
+245 @d131k in the B2 table). CEILING REVISIT: +65% (ncu union-overlap)
+did NOT materialize — the replication traffic is gone, but the
+remainder-only tiled call (u_cap=4096 KV x W=16 queries per tile) still
+sits on the small-nb latency wall and is now the binding FA constraint.
+Next lever if pursued: batch the remainder tiles wider (fold T into
+ncols) or KV_max-style skip inside the union call; the dense half is
+already at the fast 41-TFLOPS shape. FA-with-LSE + merge remain
+upstream-worthy standalone (sequence-parallel / tree attention).

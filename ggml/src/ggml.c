@@ -5662,12 +5662,18 @@ struct ggml_tensor * ggml_dsv4_fa_merge(
         struct ggml_tensor  * b) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(b->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(a, b));
     GGML_ASSERT(ggml_is_contiguous(a));
     GGML_ASSERT(ggml_is_contiguous(b));
-    // inputs carry the FA LSE tail: [DV, n_head, n_batch, ne3+1] with DV >= ne3
-    GGML_ASSERT(a->ne[3] >= 2);
+    // inputs carry the FA LSE tail: [DV, H, Q, S+1] with DV >= S. The halves may
+    // slice the same rows differently (e.g. [DV,H,nt,1+1] vs [DV,H,W,T+1] when
+    // one FA ran the tokens flat and the other tiled them over ne3) — the main
+    // data and the tail then still share one memory layout; only the row count
+    // (and order) must match.
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[3] >= 2 && b->ne[3] >= 2);
     GGML_ASSERT(a->ne[0] >= a->ne[3] - 1);
+    GGML_ASSERT(b->ne[0] >= b->ne[3] - 1);
+    GGML_ASSERT(a->ne[1]*a->ne[2]*(a->ne[3] - 1) == b->ne[1]*b->ne[2]*(b->ne[3] - 1));
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3] - 1);
 

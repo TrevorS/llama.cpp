@@ -831,8 +831,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const char * e = getenv("LLAMA_DSV4_CSA_TILE_MIN");
         return e ? atoll(e) : (long long) 12288;
     }();
-    ggml_tensor * k_all;
-    ggml_tensor * kq_mask;
+    ggml_tensor * k_all     = nullptr;
+    ggml_tensor * kq_mask   = nullptr;
+    ggml_tensor * split_out = nullptr; // set by the split-attention path (bypasses build_attn_mha)
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     const int64_t n_raw = raw_k->ne[2];
     if (dsv4_tile_w > 0 && nt_s > dsv4_tile_w && n_stream == 1 &&
@@ -857,19 +858,66 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, u_cap, T_t);
         cb(gathered, "csa_tile_k", il);
 
-        // raw window is shared by all tiles -> repeat along the tile dim
-        ggml_tensor * raw_rep = ggml_repeat_4d(ctx0, raw_k,
-                raw_k->ne[0], raw_k->ne[1], n_raw, T_t);
-        k_all = ggml_concat(ctx0, raw_rep, gathered, 2); // [hd, 1, n_raw+u_cap, T]
-
         ggml_tensor * memb = ggml_dsv4_lid_memb(ctx0, top_k, uni, n_csa); // [u_cap,nt_s,1,1] f32
         if (memb->type != raw_mask->type) {
             memb = ggml_cast(ctx0, memb, raw_mask->type);
         }
         memb = ggml_reshape_4d(ctx0, memb, u_cap, W_t, 1, T_t);
-        ggml_tensor * raw_mask_t = ggml_reshape_4d(ctx0, raw_mask,
-                raw_mask->ne[0], W_t, 1, T_t);
-        kq_mask = ggml_concat(ctx0, raw_mask_t, memb, 0); // [n_raw+u_cap, W, 1, T]
+
+        // Split-attention + LSE merge (LLAMA_DSV4_FA_SPLIT, default ON): the
+        // raw window is shared by all tiles, so instead of physically
+        // replicating it T times (repeat_4d defeats L2 and the tiled FA runs
+        // at small-nb occupancy), run (i) one dense FA over the raw window at
+        // full batch width (ne3=1) and (ii) a tiled FA over ONLY the per-tile
+        // unions, both emitting per-row LSE, then merge. Exact same math as
+        // the concat path (softmax over the disjoint KV union); the attention
+        // sink lives in the raw half's LSE. T <= hd keeps the LSE tail slice
+        // within the FA result (constructor constraint DV >= ne3).
+        static const bool dsv4_fa_split = []() {
+            const char * e = getenv("LLAMA_DSV4_FA_SPLIT");
+            return !e || e[0] != '0';
+        }();
+        if (dsv4_fa_split && cparams.flash_attn && T_t <= raw_k->ne[0]) {
+            // dense raw half: all queries vs the shared raw window, ne3 = 1
+            ggml_tensor * q_full = ggml_permute(ctx0, q, 0, 2, 1, 3);     // [hd, nt_s, n_head, 1]
+            ggml_tensor * k_raw  = ggml_permute(ctx0, raw_k, 0, 2, 1, 3); // [hd, n_raw, 1, 1]
+            ggml_tensor * v_raw  = ggml_permute(ctx0, raw_k, 0, 2, 1, 3);
+            ggml_tensor * fa_raw = ggml_flash_attn_ext_with_lse(ctx0, q_full, k_raw, v_raw,
+                    raw_mask, kq_scale, 0.0f, 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa_raw, il});
+            ggml_flash_attn_ext_add_sinks(fa_raw, sinks);
+            ggml_flash_attn_ext_set_prec (fa_raw, GGML_PREC_F32);
+            cb(fa_raw, "csa_fa_raw", il);
+
+            // union remainder half: per-tile disjoint unions, tiles ride ne3
+            ggml_tensor * q_tiles = ggml_view_4d(ctx0, q,
+                    q->ne[0], q->ne[1], W_t, T_t,
+                    q->nb[1], q->nb[2], q->nb[3]/T_t, 0);
+            q_tiles = ggml_permute(ctx0, q_tiles, 0, 2, 1, 3);               // [hd, W, n_head, T]
+            ggml_tensor * k_uni  = ggml_permute(ctx0, gathered, 0, 2, 1, 3); // [hd, u_cap, 1, T]
+            ggml_tensor * v_uni  = ggml_permute(ctx0, gathered, 0, 2, 1, 3);
+            ggml_tensor * fa_uni = ggml_flash_attn_ext_with_lse(ctx0, q_tiles, k_uni, v_uni,
+                    memb, kq_scale, 0.0f, 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa_uni, il});
+            ggml_flash_attn_ext_set_prec(fa_uni, GGML_PREC_F32);
+            cb(fa_uni, "csa_fa_uni", il);
+
+            // rows align between the halves (g = t*W + iq): [hd,n_head,nt_s,1+1]
+            // and [hd,n_head,W,T+1] share the same row order and tail offset
+            ggml_tensor * merged = ggml_dsv4_fa_merge(ctx0, fa_raw, fa_uni); // [hd, n_head, nt_s, 1]
+            cb(merged, "csa_fa_merge", il);
+
+            split_out = ggml_reshape_2d(ctx0, merged, merged->ne[0]*merged->ne[1], merged->ne[2]*merged->ne[3]);
+        } else {
+            // raw window is shared by all tiles -> repeat along the tile dim
+            ggml_tensor * raw_rep = ggml_repeat_4d(ctx0, raw_k,
+                    raw_k->ne[0], raw_k->ne[1], n_raw, T_t);
+            k_all = ggml_concat(ctx0, raw_rep, gathered, 2); // [hd, 1, n_raw+u_cap, T]
+
+            ggml_tensor * raw_mask_t = ggml_reshape_4d(ctx0, raw_mask,
+                    raw_mask->ne[0], W_t, 1, T_t);
+            kq_mask = ggml_concat(ctx0, raw_mask_t, memb, 0); // [n_raw+u_cap, W, 1, T]
+        }
     } else if (dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
         // present csa_k [hd,1,n_csa,n_stream] as [hd, n_csa, n_stream, 1] and
         // the indices [n_top_k,1,1,n_stream] as [n_top_k, n_stream, 1, 1].
@@ -901,10 +949,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
         kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     }
-    cb(k_all, "csa_k_all", il);
-    cb(kq_mask, "csa_lid_kq_mask", il);
+    ggml_tensor * out;
+    if (split_out) {
+        out = split_out;
+    } else {
+        cb(k_all, "csa_k_all", il);
+        cb(kq_mask, "csa_lid_kq_mask", il);
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+        out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+    }
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }

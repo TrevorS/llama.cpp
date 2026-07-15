@@ -1003,10 +1003,11 @@ void launch_fattn(
     ggml_tensor * KQV = dst;
 
     // Opt-in per-row log-sum-exp output, written to a tail slice past the regular result.
-    // Only supported on the stream-k (mma) path and incompatible with sinks; enforced by supports_op.
+    // Only supported on the stream-k (mma) path; enforced by supports_op. Sinks are included
+    // in the LSE (they are folded into the per-row (max, rowsum) before the meta/tail writes).
     const bool has_lse = ggml_get_op_params_i32(KQV, 4) != 0;
     float * lse_base = has_lse ? (float *) KQV->data + (int64_t) DV*Q->ne[1]*Q->ne[2]*Q->ne[3] : nullptr;
-    GGML_ASSERT(!has_lse || (stream_k && sinks == nullptr));
+    GGML_ASSERT(!has_lse || stream_k);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);

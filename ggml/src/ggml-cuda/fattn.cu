@@ -546,9 +546,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
 
-    // The opt-in per-row log-sum-exp tail output is only implemented for the stream-k path of the mma kernel
-    //     and is incompatible with attention sinks. Reject everything else so unsupported cases fall back to the CPU.
-    if (ggml_flash_attn_ext_has_lse(dst) && (kernel != BEST_FATTN_KERNEL_MMA_F16 || dst->src[4] != nullptr)) {
+    // The opt-in per-row log-sum-exp tail output is only implemented for the stream-k path of the
+    //     mma kernel. Reject everything else so unsupported cases fall back to the CPU.
+    if (ggml_flash_attn_ext_has_lse(dst) && kernel != BEST_FATTN_KERNEL_MMA_F16) {
         return BEST_FATTN_KERNEL_NONE;
     }
 
