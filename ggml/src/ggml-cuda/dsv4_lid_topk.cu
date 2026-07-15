@@ -845,6 +845,87 @@ static __device__ void dsv4_bitonic_sort(float * vals, uint32_t * idxs) {
     }
 }
 
+static __device__ __forceinline__ uint32_t dsv4_next_pow2(uint32_t x) {
+    return x <= 1u ? 1u : (1u << (32 - __clz((int) (x - 1u))));
+}
+
+// Partial bitonic top-K selection: leaves the top K elements of
+// vals/idxs[0..SORT_N) (dsv4_better order) in [0..K), sorted descending.
+// K must be a power of two <= SORT_N. Phase 1 sorts every K-block
+// descending (the k==K stage forces one direction for all blocks; their
+// input is bitonic from the alternating k<K stages, so the merge is valid
+// for either direction). Phase 2 halves the candidate blocks per round:
+// fold pairs of descending blocks (compare-exchange A[i] vs B[K-1-i] —
+// the winners are exactly the top K of the union and form a bitonic
+// sequence), then one descending bitonic merge re-sorts the winners.
+// dsv4_better is a strict total order (val desc, idx asc), so the top-K
+// SET is unique — output is identical to a full sort's first K.
+// Work ~ N/2*log^2 K + fold rounds, vs the full sort's N/2*log^2 N.
+template <uint32_t SORT_N>
+static __device__ void dsv4_bitonic_topk(float * vals, uint32_t * idxs, uint32_t K) {
+    if (K >= SORT_N) {
+        dsv4_bitonic_sort<SORT_N>(vals, idxs);
+        return;
+    }
+    // phase 1: sort each K-block descending
+    for (uint32_t k = 2u; k <= K; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = threadIdx.x; i < SORT_N; i += blockDim.x) {
+                const uint32_t other = i ^ j;
+                if (other > i && other < SORT_N) {
+                    const float    av = vals[i],    bv = vals[other];
+                    const uint32_t ai = idxs[i],    bi = idxs[other];
+                    const bool desc_half = (k == K) ? true : ((i & k) == 0u);
+                    const bool swap = desc_half ? dsv4_better(bv, bi, av, ai)
+                                                : dsv4_better(av, ai, bv, bi);
+                    if (swap) {
+                        vals[i] = bv; idxs[i] = bi;
+                        vals[other] = av; idxs[other] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // phase 2: fold + re-sort rounds; active blocks start at multiples of
+    // (step<<1), winners stay in the low block of each pair
+    uint32_t n_active = SORT_N / K;
+    uint32_t step     = K;
+    while (n_active > 1u) {
+        const uint32_t n_pairs = n_active >> 1u;
+        for (uint32_t t = threadIdx.x; t < n_pairs * K; t += blockDim.x) {
+            const uint32_t p = t / K, i = t % K;
+            const uint32_t a = p * (step << 1u) + i;
+            const uint32_t b = p * (step << 1u) + step + (K - 1u - i);
+            const float    av = vals[a], bv = vals[b];
+            const uint32_t ai = idxs[a], bi = idxs[b];
+            if (dsv4_better(bv, bi, av, ai)) {
+                vals[a] = bv; idxs[a] = bi;
+                vals[b] = av; idxs[b] = ai;
+            }
+        }
+        __syncthreads();
+        for (uint32_t j = K >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t t = threadIdx.x; t < n_pairs * K; t += blockDim.x) {
+                const uint32_t p = t / K, i = t % K;
+                const uint32_t x = p * (step << 1u) + i;
+                const uint32_t other = x ^ j; // stays in-block: j < K, block K-aligned
+                if (other > x) {
+                    const float    av = vals[x],    bv = vals[other];
+                    const uint32_t ai = idxs[x],    bi = idxs[other];
+                    if (dsv4_better(bv, bi, av, ai)) {
+                        vals[x] = bv; idxs[x] = bi;
+                        vals[other] = av; idxs[other] = ai;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        step <<= 1u;
+        n_active = n_pairs;
+    }
+}
+
 // single-block-per-token, n_lid <= SORT_N.
 // The three topk kernels carve one dynamic extern buffer (host raises the
 // limit via CUDA_SET_SHARED_MEMORY_LIMIT) so SORT_N is not capped by the
@@ -867,7 +948,7 @@ static __global__ void dsv4_topk_single_kernel(
         else                { vals[i] = -INFINITY; idxs[i] = UINT32_MAX; }
     }
     __syncthreads();
-    dsv4_bitonic_sort<SORT_N>(vals, idxs);
+    dsv4_bitonic_topk<SORT_N>(vals, idxs, dsv4_next_pow2((uint32_t) top_k));
     for (int i = threadIdx.x; i < top_k; i += blockDim.x) {
         selected[(int64_t)t*top_k + i] = idxs[i];
     }
@@ -893,7 +974,7 @@ static __global__ void dsv4_topk_chunk_kernel(
         else             { vals[i] = -INFINITY; idxs[i] = UINT32_MAX; }
     }
     __syncthreads();
-    dsv4_bitonic_sort<SORT_N>(vals, idxs);
+    dsv4_bitonic_topk<SORT_N>(vals, idxs, dsv4_next_pow2((uint32_t) top_k));
     uint32_t * out = candidates + (int64_t)t*candidate_stride + (int64_t)chunk*top_k;
     for (int i = threadIdx.x; i < top_k; i += blockDim.x) out[i] = idxs[i];
 }
@@ -929,7 +1010,7 @@ static __global__ void dsv4_topk_merge_kernel(
         vals[i] = v; idxs[i] = idx;
     }
     __syncthreads();
-    dsv4_bitonic_sort<SORT_N>(vals, idxs);
+    dsv4_bitonic_topk<SORT_N>(vals, idxs, dsv4_next_pow2((uint32_t) top_k));
     uint32_t * dst = final ? (out + (int64_t)t*top_k)
                            : (out + (int64_t)t*out_stride + (int64_t)group*top_k);
     for (int i = threadIdx.x; i < top_k; i += blockDim.x) dst[i] = idxs[i];

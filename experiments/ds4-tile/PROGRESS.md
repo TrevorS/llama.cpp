@@ -1659,3 +1659,16 @@ SORT_N=8192 REVISITED with partial-K (the earlier 8192 negative was
 FULL-sort N*log^2 N; partial pays N*log^2 K + folds, and bigger N
 cuts chunks 9->5 and merge launches 4->2 at K=2048). Both unscouted.
 Prize: topk 50.4ms is 41.5% of the lid op at serving shape.
+
+## Iteration 33 — 2a(A) partial bitonic top-k LANDED
+
+dsv4_bitonic_topk<SORT_N>(vals, idxs, K): phase 1 sorts K-blocks
+descending (k==K stage direction-forced), phase 2 fold+resort halving
+rounds; strict-total-order argument => top-K set identical to full
+sort, output order identical (sorted desc). Drop-in at all 3 topk
+call sites, K = next_pow2(top_k), full-sort fallback at K>=SORT_N.
+Gates: all 5 op profiles green incl EXACT 0.0 and scalar 0.0.
+Op perf (vs step-1 build): -7.5..-8.9% @top_k=512 shapes, -1.6%
+@production top_k=2048 (as predicted: phase-1 block sort dominates at
+K=N/2). Cumulative op vs pre-campaign baseline @33280x2048x512:
+104.0 -> 95.0ms (-8.7%).
