@@ -1454,7 +1454,7 @@ ncols) or KV_max-style skip inside the union call; the dense half is
 already at the fast 41-TFLOPS shape. FA-with-LSE + merge remain
 upstream-worthy standalone (sequence-parallel / tree attention).
 
-## Iteration 28 — remainder-batching scout: NEGATIVE, W=16/U4096 confirmed optimal
+## Iteration 28 — remainder-batching scout: NEGATIVE, W=16/U4096 stays
 
 Scouted the post-split remainder-FA lever (iter 27 follow-up). Code scout
 (agent) + zero-code W/UCAP sweep (gates-runs/w-sweep-20260714-173621).
@@ -1488,7 +1488,8 @@ swamps the halved window-count DRAM term, which the u2048 control bounds
 at ~1.4% total. Monotonic: every widening leg lost; u6144 (less
 truncation = more real compute) lost most.
 
-CLOSES the remainder-batching lever: W=16/U4096 stays default; kernel
+CLOSES the remainder-batching lever: W=16/U4096 is the best measured
+config and stays default; kernel
 ncols pinned; G-fold rejected; KV-min shelved. Remaining post-split FA
 headroom at d65536 is ~1-4% (u2048 control bound) — not worth kernel
 work. Depth-scaling attribution (lid indexer share grows with n_csa)
