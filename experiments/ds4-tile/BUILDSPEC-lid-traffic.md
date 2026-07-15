@@ -1,6 +1,10 @@
 # Buildspec: lid traffic campaign (post-split #1 depth-scaling cost)
 
 Scouted 2026-07-14 (iter 29 attribution + 4 parallel design scouts).
+Detail pass 2026-07-15: see BUILDPLAN-lid-traffic.md for line-precise
+hunks + corrections (pre-quant buffer 16.5 MiB/stream not 4.1MB; int8
+K is 16.8 MB @131k, the 8.4MB figure was MXFP4-packed; merge re-reads
+the score matrix per tree level — third traffic term).
 All refs `ds4-flash-experiments`. Predecessor context: split-attention
 (iter 27) made FA depth-flat; the lid chain is now the dominant
 depth-scaling prefill term.

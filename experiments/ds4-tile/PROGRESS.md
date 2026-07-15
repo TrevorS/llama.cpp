@@ -1561,3 +1561,22 @@ verdicts consolidated in BUILDSPEC-lid-traffic.md. Highlights:
   class; needs LID_CACHE_MXFP4; explicit ncu kill criterion.
 Build order: (SORT_N + f16 scores + int8-K pre-quant) -> fused
 chunk-topk prototype -> fp4-mma probe. Ceiling ~10-15% pp @d131k.
+
+### Iteration 30 addendum (2026-07-15) — detail scout, all steps
+
+Five parallel implementation scouts (code-only, no GPU) produced
+BUILDPLAN-lid-traffic.md — line-precise hunks for step 1 and settled
+designs for steps 2-3. Corrections found vs BUILDSPEC: pre-quant
+buffer is 16.5 MiB/stream not 4.1MB (int8 = 128 B x n_lid); the
+iter-29 "K 8.4MB" was the MXFP4-packed size, int8 K is 16.8 MB @131k
+(fused L2 margin tighter than assumed); merge re-reads the score
+matrix at EVERY tree level (:888) — a third traffic term, killed only
+by a candidate-value tree; fp4-mma regs ~50 @Nc=16 not ~40. Verified
+clean: pre-quant bit-identity (K-row-local amax, no block coupling);
+scores-buffer consumer trace (topk only); container nibbles ARE
+hardware e2m1 + raw ue8m0 = transform-free mma operands; supports_op
+auto-tracks the SORT_N macro. New blocker logged: fp4-mma staging
+bypass breaks EXACT pass-2's k_f16_d source — must keep staging alive
+under EXACT or use the inline-dequant arm. Step-1 gate upgraded: the
+EXACT oracle displacement re-run is load-bearing (f16 pass-1
+displacement vs m=64 window, prior p100=36).

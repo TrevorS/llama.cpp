@@ -156,3 +156,4 @@ AGENTS.local.md
 .webui_secret_key
 experiments/ds4-tile/gates-runs/
 experiments/profiles/postsplit-*/
+experiments/profiles/shallow-*/

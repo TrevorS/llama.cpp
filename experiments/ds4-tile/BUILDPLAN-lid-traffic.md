@@ -1,0 +1,268 @@
+# Buildplan: lid traffic campaign — line-precise implementation plan
+
+Detail-scouted 2026-07-15 (5 parallel implementation scouts, code-only,
+no GPU). Companion to BUILDSPEC-lid-traffic.md (the ranked lever
+record); this doc is the execution reference. All line refs verified
+against 534b2b320 (`dsv4_lid_topk.cu` = 1374 lines).
+
+## Corrections to BUILDSPEC (measured against the tree)
+
+- **Pre-quant buffer is ~16.5 MiB/stream, not 4.1MB.** int8 K =
+  128 B x n_lid (16 MiB @131k) + f32 scales 4 B x n_lid (0.5 MiB).
+  BUILDSPEC's "4.1MB" doesn't fit any d=128 encoding.
+- **n_lid tracks full depth**: `n_lid = inp_lid.kq_mask->ne[0]`
+  (deepseek4.cpp:631) — at d131072, n_lid ~ 131072. The iter-29
+  "K 8.4MB @d131k L2-resident" figure is the MXFP4-packed size
+  (68 B/row); int8 K is 16.8 MB, f16 K is 33.6 MB. The fused lever's
+  L2-residency margin is therefore TIGHTER than BUILDSPEC implied —
+  the ncu hit-rate gate is decisive, not a formality.
+- **Merge re-reads the score matrix at EVERY tree level**
+  (`row[idx]` gather, .cu:888) — a third traffic term the "~0.5GB"
+  headline undercounted. Killing it requires the candidate-VALUE tree
+  (fused plan §step-2 below).
+- **"lane-owns-4-dims" is strided-by-32** (`d = lane + i*32`), not
+  contiguous. Decode's mapping (`lane*4+i`) differs but amax is
+  order-independent. Replication must use the strided form.
+- **fp4-mma register budget**: ~50 regs @Nc=16, ~78 @Nc=32 (not ~40);
+  Nc=128 is ~246 regs — dead as claimed, more so. Probe Nc=16 first.
+- **supports_op needs no edit for SORT_N** — ggml-cuda.cu:4976 tests
+  `op->ne[0] <= DSV4_TOPK_SORT_N`, auto-tracks the macro.
+
+---
+
+## STEP 1 — one PR: SORT_N 8192 + f16 scores + int8-K pre-quant
+
+Three levers, one PR, because they touch the same two kernels: the
+3 topk kernels get dynamic smem AND a `score_t` template; the int8
+score kernel gets a new K interface AND a half scores param. Composed
+edit list below. Scope: `dsv4_lid_topk.cuh` (+1/-1), `dsv4_lid_topk.cu`
+(~+95/-45), `tests/test-backend-ops.cpp` (+2). All numerics classes:
+SORT_N identical, pre-quant bit-identical, f16 scores = existing d128
+gate class; d64/scalar path untouched (strict-0.0 gate preserved).
+
+### 1a. SORT_N 4096 -> 8192 (dynamic smem)
+
+- `.cuh:3`: `#define DSV4_TOPK_SORT_N 8192u`.
+- 3 topk kernels — replace static smem pairs at .cu:825-826 (single),
+  850-851 (chunk), 879-880 (merge), identical 3-line block:
+  ```cuda
+  extern __shared__ float dsv4_topk_smem[];
+  float    * vals = dsv4_topk_smem;
+  uint32_t * idxs = reinterpret_cast<uint32_t *>(dsv4_topk_smem + SORT_N);
+  ```
+  4-byte alignment holds naturally; `dsv4_bitonic_sort` (.cu:796)
+  already takes pointers — zero signature change. rescore_select<1024>
+  (.cu:996) SORT_N-independent, untouched.
+- Host `dsv4_topk_launch`: after `const int block = 1024;` (.cu:1011):
+  `const size_t smem = (size_t) SORT_N * (sizeof(float) + sizeof(uint32_t));`
+  (64KB). At each of the 4 launch sites (.cu:1014/1038/1047/1057):
+  `CUDA_SET_SHARED_MEMORY_LIMIT((kernel<SORT_N, score_t>), smem);` then
+  pass `smem` as 3rd `<<<>>>` arg. Macro at common.cuh:230-245 already
+  encapsulates the run-once-per-device guard (fattn-mma-f16.cuh:1974
+  precedent). Parens around the templated name are required.
+- Occupancy: 1024 thr + 64KB -> 1 block/SM on GB10 (99KB carveout);
+  fine — grids are n_tokens/(n_tokens x chunks)-wide, DRAM-bound.
+- Invariants verified: partial-chunk clamp .cu:849 parametric;
+  `n_lid<=SORT_N` single-kernel route .cu:1013 now covers <=8192;
+  `merge_group = SORT_N/top_k` assert >=2 holds for top_k<=4096.
+  Merge-launch count @n_lid=33280, top_k=2048: chunks 9->5, merges
+  4->2 (tree 3->1, +final).
+- Coverage shift: n_lid 4097/5000/6000 cases fall to the single-kernel
+  path. Add TWO cases in test-backend-ops.cpp:
+  - after :10480: `test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000, 2048, 1, 512)`
+    (multi-chunk, 17000 % 8192 = 616 partial clamp)
+  - near :9670: `test_dsv4_lid_topk(GGML_TYPE_F32, 64, 4, 8193, 2, 1, 100)`
+    (just over one 8192 boundary, scalar path)
+
+### 1b. f16 score store (d128 paths only)
+
+Kernel-path map (verified): scalar `dsv4_score_kernel` store :215 =
+the d_idx!=128 path — KEEP f32. Half-store conversions: wmma :323,
+int8 :439, decode :533 (all d128).
+
+- Template the 3 topk kernels + `dsv4_topk_launch` on
+  `<typename score_t>`; add load helper next to `dsv4_ldk` (.cu:32-33):
+  ```cuda
+  static __device__ __forceinline__ float dsv4_lds(const float * p) { return *p; }
+  static __device__ __forceinline__ float dsv4_lds(const half  * p) { return __half2float(*p); }
+  ```
+  Load sites: single :829, chunk :854, merge :888 -> `dsv4_lds(row + ...)`.
+  score_t=float compiles to a plain deref — d64 codegen unchanged.
+  smem sort vals stay f32; `dsv4_better` semantics untouched. No
+  vectorized stores/loads exist anywhere on this boundary (verified).
+- 3 store sites wrap in `__float2half(...)`; params `float*` -> `half*`
+  at kernel sigs :236/:344/:460. Masked cells: `__float2half(-inf)` =
+  f16 -inf, sorts to bottom as today.
+- Host alloc (replace .cu:1143-1145) — dual RAII allocs, the existing
+  q_fp4_alloc idiom (:1186-1188):
+  ```cuda
+  const bool scores_half = (d_idx == 128);
+  ggml_cuda_pool_alloc<float> scores_f32_alloc(pool);
+  ggml_cuda_pool_alloc<half>  scores_h_alloc(pool);
+  float * scores   = scores_half ? nullptr : scores_f32_alloc.alloc((size_t) nt * n_lid);
+  half  * scores_h = scores_half ? scores_h_alloc.alloc((size_t) nt * n_lid) : nullptr;
+  ```
+  `sc_s` retyped half at :1261 (decode) and :1281 (wmma/int8); scalar
+  branch :1310-1318 unchanged. Both `dsv4_topk_launch` call sites
+  (:1337 EXACT pass-1, :1372 final) split into
+  `scores_half ? <half>(... scores_h ...) : <float>(... scores ...)`.
+- Consumer trace CLEAN: scores feeds ONLY the 4 score-kernel launches
+  + the 2 topk_launch calls; EXACT rescore (:918-978) recomputes from
+  q/k, LID_DUMP reads q/w/k. No other reader.
+- Numerics: one rounding at the store only (compute stays f32);
+  |score| O(1..1e2) vs f16 max 65504; strictly smaller than the
+  int8/wmma quantization noise upstream. Existing d128 gates
+  (1.2e-2 int8/dec, 3e-3 wmma; test:5842-5843) cover it.
+- LOAD-BEARING GATE: EXACT-mode margin. Pass-1 over f16 scores adds
+  displacement; rescore window n_cand = top_k + m (m=64) must still
+  contain the true top-k (oracle p100 was 36). The EXACT oracle
+  re-run is REQUIRED before landing, not optional. Bump
+  LLAMA_DSV4_LID_RESCORE_M default if p100 approaches 64.
+
+### 1c. Global int8-K pre-quant
+
+BIT-IDENTITY VERDICT: SAFE. The in-kernel quant (.cu:363-384) reads
+only the K-row's own 128 values — no token-window/q/mask coupling;
+every blockIdx.y tile re-derives the identical tile today (128x
+redundant at nt_s=2048). Per-row global pre-quant reproduces every
+step: strided dims `d=lane+i*32`, fmaxf accum i=0..3, `__shfl_xor_sync`
+o=16..1, `inv=127/amax`, `sk=amax/127`, `__float2int_rn`, dim-natural
+`[comp*128+d]` layout.
+
+- New `dsv4_prequant_k_int8_kernel<KT>` (~30 LOC) above the int8
+  kernel (~:342): warp-per-comp, block 256 (8 warps), grid
+  ceil(n_lid/8); outputs `int8 k_i8[n_lid][128]` + `float k_sc[n_lid]`.
+  Padding comps skipped (score-kernel load zero-fills, matching old
+  ks=0/sk=0 behavior).
+- `dsv4_score_int8_kernel` interface: drop `template<KT>` + `k`/`nbk2`,
+  add `const int8_t* k_i8, const float* k_sc`. Replace quant block
+  :363-384 with a guarded smem copy loop (`ok ? k_i8[...] : 0`,
+  `sk[c] = ok ? k_sc[comp] : 0`). Everything from :386 (q-quant, dp4a,
+  epilogue) unchanged. smem footprint unchanged (16KB+2KB+0.5KB) —
+  global read per block drops 32-64KB -> 16KB and per-block quant
+  arithmetic disappears.
+- Host: 2 pool allocs (16.5 MiB/stream int8 + scales) + per-stream
+  pre-quant launch at the top of the int8 arm (d_idx==128 non-decode
+  branch, ~:1276-1304); the f16/f32 int8 dispatch arms collapse to one
+  (input already int8). Same stream — in-stream ordering suffices.
+- Out of scope (documented): decode path DEFERRED (pre-quanting 16MB
+  of K for 1 token is a traffic loss; its packed-direct arm reads raw
+  MXFP4 anyway); wmma path NEVER (fp16 tensor-core, no int8 form).
+- Gate: bit-identical -> existing suite + EXACT 0.0 unchanged is the
+  proof. No new tests.
+
+### Step-1 gates (in order)
+
+1. `test-backend-ops test -o DSV4_LID_TOPK` default profile (incl the
+   2 new cases).
+2. Same with `LLAMA_DSV4_LID_EXACT=1 LLAMA_DSV4_LID_QAT_WRITE=1` —
+   zero tolerance must hold.
+3. EXACT oracle displacement re-run (RESCORE_M margin, per 1b).
+4. Perf legs: single-test pp2048 @d65536 and @d131072, clocksnap
+   pre/post, settle-gated, same-boot A/B vs 534b2b320 baseline.
+   Expected: topk share 9.7% -> ~4-5% @d131k; score kernel gets the
+   pre-quant relief on top.
+5. gates.sh std battery at campaign end (not per-step).
+
+---
+
+## STEP 2 — fused score+chunk-topk (env prototype, ncu-gated)
+
+Design settled by the scout; key decisions:
+
+- **Stays SORT_N=4096 internally** — sort arrays + q staging = 40.5KB
+  (fits static 48KB); at 8192 it's 72.5KB for no benefit. DECOUPLED
+  from step-1a: merge compatibility keys on top_k/candidate_stride,
+  not SORT_N; the two regimes never mix within one call. Do not
+  entangle the PRs.
+- **Depends on 1c**: fused blocks stream pre-quantized int8-K from
+  global/L2 (512KB/chunk x 64 heads); staging K in smem is impossible
+  (smem is full of sort arrays) and re-quantizing per block is the
+  waste 1c removes.
+- Grid `(nt, n_chunks)`, block 1024; per block: compute scores for
+  one (token, 4096-comp chunk) straight into smem vals[], bitonic,
+  emit top_k (idx, VAL) pairs. Score matrix never exists.
+- **Candidate-VALUE tree**: scratch doubles to (u32 idx + f32 val)
+  per candidate — tiny vs the matrix it kills. Merge kernel drops the
+  `scores` param + `row[idx]` gather (:881/:888), reads
+  `cand_val_in[set0*top_k + i]`, writes `cand_val_out` at non-final
+  levels. Host merge loop (:1042-1059) threads the val pointers. This
+  kills the per-level matrix gather — the third traffic term.
+- Reuse verbatim (A-safety): `dsv4_bitonic_sort` + `dsv4_better`
+  (:791-816), q-quant block (:397-417), dp4a inner + ascending-h
+  relu-then-weight epilogue (:423-431), pre-quant kernel from 1c.
+  New glue ~120 LOC.
+- Env `LLAMA_DSV4_LID_FUSED_CHUNK` default OFF — static-lambda idiom
+  (:1166-1169). Predicate:
+  `fused && int8 && d128 && nt_s>1 && n_lid>SORT_N && !exact && !k_packed_direct`.
+  Decode + shallow prefill (single-chunk) structurally excluded.
+- Scope: .cu +~175/-15; tests +2; gates.sh +6 (fused re-run legs);
+  FLAGS.md +1 row. Add prefill-shaped perf case
+  `test_dsv4_lid_topk(F16,128,64,33280,2048,1,2048)` (existing :10480
+  family is decode-shaped at :10481).
+- Validation precedent (FA_SPLIT): (a) op-suite re-run under the flag
+  incl EXACT combo; (b) greedy temp-0 A/B `cmp` at d>=65k, flag 0 vs 1
+  — byte-identity is the claim, so test it as one.
+- GO/NO-GO: ncu on the d131k-shaped perf case —
+  `GGML_CUDA_DISABLE_GRAPHS=1 ncu --replay-mode application
+  --launch-count 8 --metrics lts__t_sector_hit_rate.pct,
+  lts__t_sectors.sum,dram__bytes.sum,gpu__time_duration.sum
+  --kernel-name regex:'dsv4_fused_score_chunk' test-backend-ops perf
+  -o DSV4_LID_TOPK -p <shape>` vs same-shape unfused. GO if DRAM bytes
+  drop ~= eliminated matrix traffic AND K re-streams hit L2. NO-GO if
+  DRAM flat (int8 K = 16.8MB @131k vs GB10 L2 — margin unknown, the
+  measurement IS the resolution).
+
+---
+
+## STEP 3 — fp4-mma register-resident-K probe (kill-gated)
+
+Feasibility CONFIRMED at the operand level:
+
+- **Container feeds the mma transform-free** (verified bit-for-bit):
+  P3b 17B block-32 layout (.cu:81-102) stores raw ue8m0 scale byte +
+  nibbles whose bit pattern (`best|sgn`, sgn=8) IS the hardware e2m1
+  encoding. `mma_block_scaled_fp4` (mma.cuh:1126-1154,
+  `scale_vec::2X ... ue8m0`) takes one u32 = 2 e8m0 bytes per k64
+  frag; a d=128 row = 2 frags = OR-pack the row's 4 scale bytes into
+  2 u32. Own gather from the 68B row (mmq's `load_tiles_mxfp4_fp4`
+  assumes split .e/.qs arrays — not reusable as-is; :936-941 is the
+  pack model).
+- Schedule: B = K resident. tile<8,8> B ne=2 -> 4 int32/thread per
+  8 comps x 128 dims. Loop h ascending 0..63: pack q_h e2m1 (per-32
+  e8m0, in-kernel prologue -> ~4.25KB smem A-layout, pack routine
+  ~30-40 LOC modeled on dsv4_qat_set_rows_kernel :120-141 reusing
+  `dsv4_e2m1_index`), ldmatrix A, 2x mma, drain C: `acc += relu(C)*w[h]`
+  in f32 regs (mirrors int8 :430). Store scores via templated
+  `ST*` (composes with 1b's half buffer).
+- Register budget (CORRECTED): ~50 @Nc=16 — build Nc=16 first;
+  Nc=32 (~78) only if occupancy shows headroom; Nc=128 dead (~246).
+- Gating: env `LLAMA_DSV4_LID_FP4_MMA` default OFF; compile under
+  `BLACKWELL_MMA_AVAILABLE` (common.cuh:286-288, __CUDA_ARCH__ 1200..
+  1300 — this IS the Blackwell macro, nothing newer exists); host
+  gate `k_is_mxfp4 && d_idx==128 && nt_s>1 && flag && blackwell`,
+  fallback int8 with one-shot stderr warn (:1099-1104 idiom).
+  Bypasses the prefill f16 staging (:1217-1226), reads 68B rows
+  direct like the decode packed-direct arm (:1227-1230).
+- WIRING BLOCKER (must fix in the PR): EXACT pass-2 rescore uses the
+  staged `k_f16_d` (:1346-1352); if fp4-mma bypasses staging, keep
+  staging alive when EXACT is set OR route pass-2 through the
+  packed-direct inline-dequant arm (:1339-1345). Else EXACT breaks
+  silently.
+- Numerics: class B == LID_FP4's accepted class (0.93 top-512
+  overlap, PPL statistically identical; PROGRESS:417/:491) — container
+  holds QAT-exact values, mma consumes them exactly; only q-side
+  per-32 e2m1 (already in LID_FP4's sim) + mma accumulation order
+  (near-tie reshuffle) differ. EXACT backstop -> class A.
+- Success framing: the probe pays the container tax (pp -2~3.6%)
+  unless run inside the 512k packed profile where it's already paid —
+  measure MARGINAL over int8 with LID_CACHE_MXFP4=1 in both arms.
+- KILL: ncu `--set full --launch-count 20` (no --launch-skip,
+  GGML_CUDA_DISABLE_GRAPHS=1) — kill if sm__throughput >=
+  l1tex__throughput AND duration >= int8's 21.76ms @d131k reference
+  (PROGRESS:568), or if launch__registers_per_thread shows spills.
+  This adjudicates iter-15's "bound is L1, freeing compute won't
+  help" prediction vs the register-resident rebuttal.
+- Scope: .cu +~200 (kernel ~140 + q-pack ~40 + dispatch ~20), tests
+  +~10 (extend the :5842 tolerance predicate to the new env), FLAGS
+  +1 row, PROGRESS writeup.
