@@ -1453,3 +1453,43 @@ Next lever if pursued: batch the remainder tiles wider (fold T into
 ncols) or KV_max-style skip inside the union call; the dense half is
 already at the fast 41-TFLOPS shape. FA-with-LSE + merge remain
 upstream-worthy standalone (sequence-parallel / tree attention).
+
+## Iteration 28 — remainder-batching scout: NEGATIVE, W=16/U4096 confirmed optimal
+
+Scouted the post-split remainder-FA lever (iter 27 follow-up). Code scout
+(agent) + zero-code W/UCAP sweep (gates-runs/w-sweep-20260714-173621).
+
+Code scout findings (fattn dispatch + mma):
+- Remainder instance is (DKQ 576, DV 512, ncols1 4, ncols2 16); ncols2=16
+  is pinned by gqa 64 -> ncols1 CANNOT widen for any W (W only raises
+  iter_j). nbatch_fa 32, iter_k 128 @u_cap 4096. Not block-starved:
+  ntiles_dst 2048 == dense.
+- KV skip is SUFFIX-ONLY (flash_attn_mask_to_KV_max backward scan -> upper
+  bound; no interior/lower bound, no in-kernel all-inf chunk early-out).
+- G-fold (concat G unions per stream + block-diag mask): NO DRAM win —
+  same disjoint bytes remerged; needs a new KV-min interval scan just to
+  break even. REJECTED. KV-min alone (~30-LOC mirror kernel + ~8 plumb
+  sites + 5 LOC kbc; hazard: decouple needs_fixup from mask-raised
+  kb0_start) only pays INSIDE a G-fold -> shelved with it.
+
+Sweep (pp2048@d65536, split ON, same boot, single-test + settle):
+| w16-u4096 (default) | 334.6 | baseline |
+| w32-u4096           | 326.4 | -2.5% |
+| w64-u4096           | 321.4 | -3.9% |
+| w32-u6144           | 316.0 | -5.6% |
+| w16-u2048 (control) | 339.4 | +1.4% (accuracy-invalid: ~60% of tiles
+                                truncate; control only) |
+
+WHY W-widening loses (scout model corrected): union padding is fully
+masked, so KV_max clips each stream to its ACTUAL union size (~2400 mean
+@W16). Effective FA compute is therefore ∝ union size, and unions GROW
+with W (each token computes against more cells it doesn't need) — that
+swamps the halved window-count DRAM term, which the u2048 control bounds
+at ~1.4% total. Monotonic: every widening leg lost; u6144 (less
+truncation = more real compute) lost most.
+
+CLOSES the remainder-batching lever: W=16/U4096 stays default; kernel
+ncols pinned; G-fold rejected; KV-min shelved. Remaining post-split FA
+headroom at d65536 is ~1-4% (u2048 control bound) — not worth kernel
+work. Depth-scaling attribution (lid indexer share grows with n_csa)
+is the better hunting ground for the next pp lever.
