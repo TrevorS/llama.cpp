@@ -185,13 +185,21 @@ bench_metric() { # bench_metric <log> <pp|tg> -> t/s
 
 stage_depth() {
     print "== depth legs (SOFT gates; refs: pp2048@d65536 >= 285, tg64@d131072 >= 13.5) =="
+    # GB10 power/thermal caps move same-config numbers ~4% — record clock state
+    # around every leg so outliers are attributable (experiments/profiles/clocksnap.sh).
+    local snap=experiments/profiles/clocksnap.sh
+    $snap pre-pp  >> $RUNDIR/clocks.log
     $BIN/llama-bench -m $MODEL -fa on -ub 2048 -b 2048 -mmp 0 -r 1 \
         -p 2048 -n 0 -d 65536 > $RUNDIR/depth-pp.log 2>&1
+    $snap post-pp >> $RUNDIR/clocks.log
     local pp=$(bench_metric $RUNDIR/depth-pp.log pp)
+    $snap pre-tg  >> $RUNDIR/clocks.log
     $BIN/llama-bench -m $MODEL -fa on -ub 2048 -b 2048 -mmp 0 -r 1 \
         -p 0 -n 64 -d 131072 > $RUNDIR/depth-tg.log 2>&1
+    $snap post-tg >> $RUNDIR/clocks.log
     local tg=$(bench_metric $RUNDIR/depth-tg.log tg)
     print "  pp2048@d65536 = ${pp:-?} t/s   tg64@d131072 = ${tg:-?} t/s"
+    print "  clock state: $RUNDIR/clocks.log"
     [[ -n $pp ]] && python3 -c "exit(0 if $pp >= 285 else 1)" && pass "pp@d65536 $pp" || warn "pp@d65536 ${pp:-missing} < 285 ref"
     [[ -n $tg ]] && python3 -c "exit(0 if $tg >= 13.5 else 1)" && pass "tg@d131072 $tg" || warn "tg@d131072 ${tg:-missing} < 13.5 ref"
 }
