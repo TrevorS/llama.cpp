@@ -1621,3 +1621,41 @@ boundaries. Step-2 delta scout re-anchored the fused design to the
 post-step-1 tree (cand-val stores HALF via dsv4_lds for byte-identity
 with the f16-ranked unfused path; own launch wrapper inside the d128
 branch; scores_h guarded on !fused) — folded into BUILDPLAN.
+
+## Iteration 32 — 2a/2b detail scout + production-shape decomposition
+
+Measurements first (test-backend-ops perf + nsys/ncu, committed build):
+- d131k serving shape (n_lid 33280, nt 2048) @top_k=512: op 102ms =
+  score 71.2 (69.9%) + chunk 24.1 (23.6%) + merge 6.6 (6.5%).
+- chunk kernel ncu: SM 77.8% / L1 78.0% / L2 0.5% — smem bitonic
+  COMPUTE bound; its 136MB sequential matrix read is ~0.7ms of 24ms.
+- @top_k=2048 (PRODUCTION indexer_top_k; new perf case added): op
+  121.7ms = score 71.1 (58.5%) + merge 26.4 (21.7%, 4 launches at
+  merge_group=2) + chunk 24.0 (19.8%). TOPK TOTAL 50.4ms = 41.5% of
+  the op (~10-12% wall @d131k) — the deep merge tree at production
+  top_k doubles the topk cost vs the 512-case.
+Scout verdicts:
+- 2b FUSION: KILLED by arithmetic. Unique saving <1.7% of op (matrix
+  write <1ms + chunk read 0.7ms; merge gathers already die with the
+  value tree); cost = losing the score kernel's 16-token smem-K
+  amortization (K L2 traffic 545MB -> 8.7GB, 16x) on the 58-70% score
+  side + 1.75x occupancy loss. No 512k niche (scales together, stays
+  ~1.7%). Alternative running-topk-in-score-kernel fusion is
+  geometrically blocked: 8:1 selectivity means a 128-comp tile can
+  contribute up to all 128 scores — no safe pre-selection below the
+  full matrix. Same disposition as SORT_N 8192.
+- 2a(A) partial bitonic top-k (dsv4_bitonic_topk: sort K-blocks, fold
+  + resort halving rounds; exact-set by strict-total-order argument):
+  CE-count ratio 0.70 @K=512 (~7% op) but 0.93 @K=2048 (~1.6-3% op)
+  — phase-1 block sort dominates at K=N/2. +58/-3, bit-identical,
+  reusable by all 3 topk kernels.
+- 2a(B) candidate-value tree: merge gather is ~0.7ms of 6.6/26.4ms —
+  ~1% op. Demoted; decide after (A).
+OPEN QUESTION the scouts surfaced: at production K=2048 the right
+lever is a selection algorithm whose work does not blow up at K=N/2
+— candidates: radix-select on the half-score bits (bit-exactness
+needs tie handling: strictly-greater + idx-asc fill at threshold), or
+SORT_N=8192 REVISITED with partial-K (the earlier 8192 negative was
+FULL-sort N*log^2 N; partial pays N*log^2 K + folds, and bigger N
+cuts chunks 9->5 and merge launches 4->2 at K=2048). Both unscouted.
+Prize: topk 50.4ms is 41.5% of the lid op at serving shape.

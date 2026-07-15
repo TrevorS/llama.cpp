@@ -10483,6 +10483,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  8704, 2048, 1, 512));
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000, 2048, 1, 512));  // multi-chunk, n_lid % SORT_N != 0
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 2048)); // production indexer_top_k (merge_group=2, deep tree)
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280,    1, 1, 512));
 
     return test_cases;
