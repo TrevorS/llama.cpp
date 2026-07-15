@@ -1715,3 +1715,41 @@ no OOM/Xid logged; avail steady 15.7G) — new crash signature, cause
 unattributed (radix weak suspect: d65k leg + 98 op-perf runs at the
 exact d131k shape were clean; sustained-load thermal/power lockup at
 least as likely). d131k A/B pending on the new boot.
+
+## Iteration 36 — standing matrix + MTP records + dtype audit + crash recovery
+
+Matrix (bench legs boot A on fe6043410; completion/MTP boot B on
+radix 47e0599dc; boot effect ~+6% on boot B — all deltas quoted
+same-boot):
+- llama-bench pp2048: d0 518.7 / d16k 426.3 / d32k 356.7 / d65k
+  334.3 / d131k 269.3. tg128: 17.88 / 16.61 / 16.36 / 15.88 / 14.88.
+- Radix serving A/B: pp@d65536 334.3 -> 342.2 (+2.4%, boot A pair);
+  pp@d131072 287.0 -> 302.7 (+5.5%, boot B pair). Records: 518.7@d0,
+  342.2@d65k, 302.7@d131k.
+- Completion tg (base): short 17.15 / 32k 16.13 / 65k 15.64 / 131k
+  14.97 — only -13% short->131k.
+- MTP (llama-server, draft-mtp mxfp4, defaults): 24.3 t/s @1.2k
+  (+42% vs base), 27.6 @8k (+61%) — NEW RECORDS (prior 21.6).
+  Coherence: 4 base outputs clean greedy continuations (one
+  single-token case typo @65k); MTP-vs-base greedy diverges ~token
+  20 then both coherent — expected class (verify runs nt=4 batches
+  vs base nt=1; fp reassociation flips near-ties; same class as the
+  CSA_GATHER precedent).
+- TOOLING TRAP (cost one OOM'd session + two multi-GB files):
+  llama-cli in batch mode (-f, -no-cnv, --no-display-prompt) runs
+  away writing ~70MB/s to stdout (56GB + 22GB .out files, disk hit
+  98-99%). BANNED from scripts. llama-completion lacks spec args
+  (-md gated to CLI/SERVER/SPECULATIVE examples) — MTP measurements
+  go through llama-server /completion (timings in response JSON).
+- Box crash #8 addendum: the wedge-correlated d131k radix leg ran
+  clean on reboot (same-boot A/B above) — supports sustained-load
+  thermal lockup over a radix bug; pattern recorded in memory.
+- Dtype audit (3 scouts: HF/paper, ds4.c, ours) -> DTYPES.md +
+  DTYPES-ds4c.md. Headlines: paper's own serving quantizes index
+  scores to BF16 (our f16 is finer); official attn softmax is BF16
+  (ours f32); hadamard is canonical-but-quantizer-only (invisible in
+  the BF16 HF reference); our one real lossier-than-official spot is
+  experts at ~2.5-3bpw (size-forced; ds4.c is lossier still); the
+  UD-IQ3_XXS mix is IQ2_S/IQ3_XXS (NOT IQ2_XXS — the custom moe
+  tile kernel doesn't even engage). fp4-mma (step 3) would move the
+  indexer multiply onto the official grid.
