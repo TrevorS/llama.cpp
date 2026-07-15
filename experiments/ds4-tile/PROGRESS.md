@@ -1494,3 +1494,44 @@ ncols pinned; G-fold rejected; KV-min shelved. Remaining post-split FA
 headroom at d65536 is ~1-4% (u2048 control bound) — not worth kernel
 work. Depth-scaling attribution (lid indexer share grows with n_csa)
 is the better hunting ground for the next pp lever.
+
+## Iteration 29 — post-split nsys/ncu attribution: lid indexer is the new #1
+
+Fresh profiles on the split-attention build (83767ecd1 era), replacing the
+2026-07-12 pre-split attribution. Run dir experiments/profiles/
+postsplit-20260714-182048 (local; 221MB, gitignored). nsys legs pp2048 at
+d65536 (335.2 t/s w/ ~3% overhead) and d131072 (270.2); kernsum windowed
+to the measured pass. ncu (model-free, backend-ops perf cases at the
+exact production shapes; NOTE: ncu on this stack only profiles the first
+cold launches — --launch-skip lands in the PDL region and intercepts
+nothing, GGML_CUDA_PDL=0 does not help; use --launch-count without skip).
+
+Kernel shares (top groups):
+| group                     | d65536 | d131072 |
+| lid (score_int8+topk+mrg) | 17.3%  | 30.1%   |
+| FA (both halves, one sym) | 21.4%  | 18.3%   |
+| MoE mmq (+quantize)       | 35.7%  | 31.2%   |
+| concat raw+comp K         |  3.4%  |  2.8%   |
+| gather/cpy/merge/hc/norm  | ~11%   | ~10%    |
+FA absolute is depth-FLAT post-split (1298ms -> 1380ms window share) —
+the split killed FA depth-scaling; pre-split FA was 44.8% @d131k, now
+18.3%. dsv4_fa_merge costs 0.9-1.2%. The lid indexer DOUBLES d65k->d131k
+(score 36.8ms -> 73.3ms/launch, linear in n_lid) and is now the dominant
+depth-scaling term. Empirical FA instance for BOTH halves is
+flash_attn_ext_f16<512,512,8,8> (hd=512 — k_rot hadamard keeps rope out;
+the iter-28 scout's 576/(4,16) dispatch derivation was wrong).
+
+ncu SoL, production shapes (grid 48 blocks, 8 warps/SM, occ 16.7%):
+| shape                          | compute | memory | duration(locked) |
+| dense raw 2304kv x 2048q       | 37.6%   | 49.4%  | 15.6ms |
+| remainder 4096kv x 16q x T128  | 21.6%   | 27.9%  | 48.2ms |
+Remainder is latency-bound (both pipes <30%), ~1.7x worse per unit work
+than dense; it is ~75% of FA time. Fixing it to dense efficiency would
+save only ~5-6% wall @d131k (FA is already small). Historical 34/47
+dense SoL reproduced (49/38 here) — methodology consistent.
+
+CONCLUSION: next pp-at-depth campaign target is the lid indexer (30% and
+scaling; score kernel is L1-bound per iter 14), not FA. Second-order:
+MoE mmq is the flat-share ceiling as before. Box caveat: power/thermal
+capping active during runs (clocksnap now records this; see
+83767ecd1) — shares are relative and robust, absolutes carry ±4%.

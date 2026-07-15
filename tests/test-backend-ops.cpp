@@ -10327,6 +10327,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 4352,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // W=64 variant (T=32): better Q-tile efficiency, weaker union cut (u_cap 3072)
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 32},  5376,  64,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // post-split production shapes (iter 27, LLAMA_DSV4_FA_SPLIT; nsys-confirmed
+    // instance flash_attn_ext_f16<512,512,8,8> for BOTH halves — k_rot hadamard keeps
+    // rope out of FA, so hd=512, V is a K-view): dense raw half (n_raw=2304, full
+    // ubatch, sinks in LSE) + remainder-only union half (u_cap=4096, W=16, T=128)
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 1},   2304, 2048, true, 0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 128}, 4096, 16,   true, 0.0f, false));
     // stall-attribution probes: separate short-kv amortization from ne3 batching
     // (a) dense-style T=1 with tile-short kv: if ~12 TFLOPS, kv length is the cause
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   4352,  2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

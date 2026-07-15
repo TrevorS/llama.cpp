@@ -155,3 +155,4 @@ AGENTS.local.md
 .pi/SYSTEM.md
 .webui_secret_key
 experiments/ds4-tile/gates-runs/
+experiments/profiles/postsplit-*/
