@@ -152,6 +152,7 @@ int main(int argc, char ** argv) {
     bool pre_rotated = false;
     bool int8_disp   = false;
     bool f16_scores  = false; // model the f16 scores-buffer store in pass 1
+    bool fp4mma_disp = false; // model the fp4-mma (e2m1xe2m1) pass-1 displacement
 
     for (int i = 1; i < argc; i++) {
         auto next = [&](int & i) { return atoi(argv[++i]); };
@@ -166,8 +167,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--pre-rotated")) pre_rotated = true;
         else if (!strcmp(argv[i], "--int8-displacement")) int8_disp = true;
         else if (!strcmp(argv[i], "--f16-scores")) f16_scores = true;
+        else if (!strcmp(argv[i], "--fp4-mma-displacement")) fp4mma_disp = true;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
+
+    // fp4-mma mode also emits the int8 pass-1 displacement for a direct A/B.
+    // Both real kernels store scores as f16, so compare both under the f16 store.
+    if (fp4mma_disp) { int8_disp = true; f16_scores = true; }
 
     const bool dump_mode = qf && kf && wf;
     std::vector<int> nlids = dump_mode ? std::vector<int>{nlid_arg}
@@ -287,6 +293,59 @@ int main(int argc, char ** argv) {
                 }
                 std::sort(mneed.begin(), mneed.end());
                 printf("    int8-displacement: m p50=%d p99=%d p100=%d (over %d tokens)\n",
+                       mneed[nt/2], mneed[(size_t)(0.99*nt)], mneed.back(), nt);
+            }
+
+            // --fp4-mma-displacement: pass-1 ranked by the fp4-mma lid score
+            // kernel (step 3). BOTH operands live on the e2m1 grid: q = path-B
+            // qb (the runtime kernel per-32 e2m1-quantizes the SAME rotated f32
+            // q the QAT sim does, so qb already IS the runtime q-pack — do NOT
+            // re-quantize, that would be an identity double-quant), k = path-B
+            // kb (exactly the values the packed QAT container holds). Head dot
+            // is accumulated in f32 in two 64-wide halves summed (h0+h1) to
+            // approximate the m16n8k64 mma's per-k64-fragment accumulation;
+            // relu, x weight, heads summed ascending; final score rounded
+            // through f16 (the kernel stores half). Truth = path-B exact
+            // ranking (scores_row on qb/kb, f32 serial — the same sb the int8
+            // block ranks against), so m_need isolates accumulation-order +
+            // f16-store effects only.
+            if (fp4mma_disp) {
+                std::vector<int> mneed(nt);
+                #pragma omp parallel for schedule(dynamic)
+                for (int t = 0; t < nt; t++) {
+                    const float * w_t  = w.data()  + (size_t) t * n_head;
+                    const float * qb_t = qb.data() + (size_t) t * n_head * D_IDX;
+                    std::vector<float> sc(n_lid);
+                    for (int j = 0; j < n_lid; j++) {
+                        const float * kj = kb.data() + (size_t) j * D_IDX;
+                        float acc = 0.0f;
+                        for (int h = 0; h < n_head; h++) {
+                            const float * qh = qb_t + (size_t) h * D_IDX;
+                            float h0 = 0.0f, h1 = 0.0f; // two k64 mma fragments
+                            for (int d = 0;  d < 64;  d++) h0 += qh[d] * kj[d];
+                            for (int d = 64; d < 128; d++) h1 += qh[d] * kj[d];
+                            acc += fmaxf(h0 + h1, 0.0f) * w_t[h];
+                        }
+                        sc[j] = (float) (_Float16) acc; // kernel stores f16
+                    }
+                    // truth = path-B exact serial ranking (same sb as int8 blk)
+                    std::vector<float> sb(n_lid);
+                    scores_row(qb_t, w_t, kb.data(), n_lid, n_head, sb.data());
+                    std::vector<int> tb;
+                    top_k_set(sb.data(), n_lid, kk, tb);
+                    std::vector<int> rank(n_lid);
+                    std::iota(rank.begin(), rank.end(), 0);
+                    std::sort(rank.begin(), rank.end(), [&](int a, int b) {
+                        return sc[a] > sc[b] || (sc[a] == sc[b] && a < b);
+                    });
+                    std::vector<int> pos(n_lid);
+                    for (int r = 0; r < n_lid; r++) pos[rank[r]] = r;
+                    int worst = 0;
+                    for (int j : tb) worst = std::max(worst, pos[j]);
+                    mneed[t] = std::max(0, worst + 1 - kk);
+                }
+                std::sort(mneed.begin(), mneed.end());
+                printf("    fp4mma-displacement: m p50=%d p99=%d p100=%d (over %d tokens)\n",
                        mneed[nt/2], mneed[(size_t)(0.99*nt)], mneed.back(), nt);
             }
 

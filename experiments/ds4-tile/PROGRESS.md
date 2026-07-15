@@ -1753,3 +1753,31 @@ same-boot):
   UD-IQ3_XXS mix is IQ2_S/IQ3_XXS (NOT IQ2_XXS — the custom moe
   tile kernel doesn't even engage). fp4-mma (step 3) would move the
   indexer multiply onto the official grid.
+
+## Iteration 37 — step 3 fp4-mma fully de-risked (scout + oracle, no GPU)
+
+Implementation scout vs 14f47d82c + a CPU oracle extension closed
+every open question; STEP 3 in BUILDPLAN updated to ready-to-type:
+- Q-pack: PER-HEAD (all-heads prologue killed — its 4.5KB smem
+  claim dropped the M=16 token dim; real 64KB -> 1 block/SM).
+  smem ~3.2KB total vs int8's 18.9KB.
+- K gather: direct loads from the 68B rows FAULT (qs at byte
+  offset 1 -> always misaligned); resolved mmq-style: byte-copy to
+  aligned smem + load_generic into resident B-regs, once per
+  block, amortized over 64 heads.
+- EXACT pass-2 routing fix pinned (:1680 predicate) — without it
+  pass-2 silently reads block bytes as float.
+- Oracle --fp4-mma-displacement (new mode, committed): fp4-mma
+  pass-1 m-need p50=0 p100<=4 all shapes/seeds vs int8 p100 up to
+  51 under identical f16-store numerics -> m=64 EXACT window has
+  ~16x headroom, no RESCORE_M bump. fp4-mma is not just faster
+  than int8 pass-1 — it ranks on the truth grid.
+- Container tax re-derived with fp4-mma ON: staging + pre-quant
+  terms disappear, lid-K read drops 3.76x -> LID_CACHE_MXFP4
+  flips net-neutral-to-positive; default flip gated on the kill
+  gate + EXACT combo 0.0 + both-arms serving A/B + 512k tg + PPL.
+- Cost model: ideal ~5ms, realistic 15-40ms vs int8 71.1ms @prod
+  shape; kill = l1tex>=sm AND >=71.1ms, or reg spill >64.
+Next session: type the kernel (build order in BUILDPLAN; ~+185/-4
+one file + test tolerance branch + MXFP4 perf case). Server was
+resident all through — zero GPU touched.

@@ -342,8 +342,65 @@ Design settled by the scout; key decisions:
 
 ---
 
-## STEP 3 — BUILD-READY 2026-07-14 (detail scout vs d89d2849b).
-## Deltas vs the original notes below:
+## STEP 3 — FULLY DE-RISKED 2026-07-15 (implementation scout vs
+## 14f47d82c + oracle EXACT-margin measurement). Ready to type.
+
+Final decisions (supersede everything below where they conflict):
+- Q-PACK: PER-HEAD inside the h-loop (2 syncs/head, mirroring
+  int8's structure). The all-heads-prologue idea is DEAD — its
+  "4.5KB" smem was wrong by 16x (dropped the M=16 token dim: real
+  cost 64KB -> 1 block/SM), and int8 already pays 128 syncs while
+  being L1-bound, so sync elimination buys nothing. smem layout
+  (16-tok x 128-comp block, 8 warps, Nc=16/warp): KB K-nibbles
+  1024B @0, KSC K-e8m0 1024B @1024, QB one-head q-nibbles 1024B
+  @2048, QSC 128B @3072 = ~3.2KB total vs int8's 18.9KB.
+- K GATHER: direct int/__ldg/u16 loads from the 68B rows FAULT
+  (qs at byte offset 1 of each 17B block -> {1,5,9,13} mod 17,
+  always misaligned; ldmatrix/load_generic need 16B-aligned smem
+  per mma.cuh:16-17). RESOLVED the mmq way (mmq.cuh:934):
+  memcpy(KB_smem, blk+1, 16) byte-copy into aligned smem +
+  KSC=blk[0], sync, load_generic into resident B-regs. One-time
+  prologue cost, amortized across 64 heads.
+- SCALE PACK: e=blk[2f].e | blk[2f+1].e<<8 per k64 frag
+  (mmq.cuh:936-941 verbatim); lane t supplies b_scale for comp
+  t/4, a_scale for token t/4+(t%2)*8; container byte is already
+  biased-127 ue8m0 — no conversion.
+- EXACT pass-2: predicate at :1680 -> (k_packed_direct ||
+  fp4_mma_active), routing the packed-direct inline-dequant
+  rescore arm. Without it pass-2 silently reads 17B block bytes
+  as float.
+- EXACT MARGIN MEASURED (oracle --fp4-mma-displacement, new mode
+  left in fp4_oracle.cpp): fp4-mma pass-1 m-need p50=0, p100<=4
+  across all shapes/seeds (@33280: 0/4/4) vs int8's p100 up to 51
+  under identical f16-store numerics. m=64 window has ~16x
+  headroom — NO RESCORE_M bump; the residual is purely the f16
+  score store; mma fragment-order reassociation measures as zero.
+- REGISTERS: Nc=16 ~42-48 regs -> ~5 blocks/SM (register-bound,
+  smem 3.2KB non-limiting; int8 is smem-bound at the same ~5).
+  Nc=32 ~62-66 = at the spill cliff; only if measured regs<=64.
+- CONTAINER TAX RE-DERIVED: with fp4-mma at prefill, staging
+  dequant + f16 staging DRAM + int8 pre-quant all disappear;
+  lid-K read drops 3.76x (68B vs 256B/row) and lives in L2
+  (2.26MB @33k). The old -2..-3.6% tax was those removed terms ->
+  container flips net-neutral-to-positive. DEFAULT FLIP of
+  LID_CACHE_MXFP4 is on the table, gated: kill gate passed +
+  op suite (incl EXACT combo 0.0) + serving A/B both-arms-MXFP4
+  fp4>=int8>=f16 + 512k tg>=10 + PPL flat.
+- COST MODEL: 68.15M mma @33280x2048x64h = 1.12 TFLOP; ideal
+  ~5ms @ ~220 TFLOPS mxf4, realistic 15-40ms wall vs int8 71.1ms.
+  WIN = sm-bound, l1tex<sm, <<71.1ms, regs<=64. KILL = l1tex>=sm
+  AND >=71.1ms, or spill.
+- Radix consumes the half score store unchanged; decode
+  packed-direct and QAT_SET_ROWS untouched.
+- Build order: flag+ifdef+fallback -> dispatch (byte strides at
+  :1546 + arm at :1595) with stub -> K gather/B-regs -> per-head
+  q-pack + mma + relu drain -> pass-2 predicate :1680 -> tests
+  (env tolerance branch before test:5842, ~8e-2 smoke tightened
+  to 2x observed; EXACT combo = the real proof; MXFP4 perf case
+  by test:10487) -> ncu kill gate -> resident serving A/B
+  (llama-server legs; llama-cli banned).
+
+## STEP 3 (2026-07-14 detail pass) — deltas vs the original notes:
 
 - **No nibble repack needed** (removes the hardest part): the
   container row IS an array of standard block_mxfp4 {e; qs[16]}
