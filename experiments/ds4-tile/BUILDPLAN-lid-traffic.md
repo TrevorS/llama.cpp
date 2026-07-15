@@ -190,7 +190,64 @@ o=16..1, `inv=127/amax`, `sk=amax/127`, `__float2int_rn`, dim-natural
 
 ---
 
+## STEP 2c — RADIX-SELECT topk (scouted 2026-07-14, WINNER of the
+## K=N/2 design round; supersedes 2a(B) value tree and 2b fusion)
+
+Measured basis: at production shape (n_lid 33280, nt 2048, top_k
+2048) topk = 50.4ms of the 121.7ms op (chunk 24.0 + merge 26.4, 1+4
+launches, merge_group=2); chunk kernel is smem-COMPUTE bound (SM
+77.8% / L1 78.0% / L2 0.5%). 2a(A) partial bitonic (landed
+fe6043410) only gets 0.93 at K=N/2.
+
+Design (one kernel/token replaces chunk+merge on the d128/half path):
+- key(h): canonicalize -0 first (`hb==0x8000 -> 0` — REQUIRED: +0/-0
+  compare equal in f32 with index tie-break, but have distinct f16
+  bits; -0 is reachable via __float2half(tiny negative); without the
+  fold a top_k boundary slicing the ±0 group breaks set-equality),
+  then `(hb&0x8000) ? ~hb : hb^0x8000` — key-eq == f32-value-eq, so
+  the radix tie rule (all key>T, then lowest-index fill among ==T)
+  IS dsv4_better exactly. No NaN possible (finite acc + {0,-INF};
+  -INF -> key 0x03FF, smallest).
+- grid=nt, block=1024, 2x 8-bit MSB-first smem-histogram passes ->
+  threshold byte pair; pass 3 = deterministic ORDERED prefix-scan
+  compaction (tiles ascending, in-tile scan preserves index order;
+  atomic-append is WRONG — nondeterministic in which ==T wins);
+  final dsv4_bitonic_sort<pow2(top_k)> over <=2048 selected (67.6k
+  CE/tok = 3% of the old 2,076.7k).
+- smem ~17KB @top_k 2048; NO pool scratch (candidate tree deleted on
+  this path). First pass streams the 136MB matrix once (~0.5ms);
+  passes 2-3 hit the L2-resident 66KB/token row.
+- Fallbacks stay bitonic: d64/f32 scalar (strict-0.0 gate, untouched
+  code path), decode/small-nt (nt < NT_RADIX_MIN ~16: one block per
+  token starves the grid). Env LLAMA_DSV4_LID_RADIX default ON, =0
+  reverts.
+- Dispatch: both dsv4_topk_launch call sites (EXACT pass-1 ~:1407
+  and final ~:1446) route the half arm to dsv4_topk_radix_launch;
+  EXACT compat: radix yields the correct SET of n_cand candidates,
+  rescore re-sorts. supports_op unchanged.
+- Expected: topk 50.4 -> ~5ms, op 121.7 -> ~76 (-37.5%), ~9-11%
+  serving wall @d131k. After landing, score kernel = 93% of the op.
+- Scope: dsv4_lid_topk.cu +~180/-4 (1 kernel, 1 launcher, 1 key
+  helper, 2 call-site edits), tests +1 boundary-tie eval case (many
+  equal scores straddling top_k).
+- Gates: all 5 op profiles at existing tolerances (0.0 gates live on
+  untouched paths but EXACT pass-1 set-equality DOES exercise radix)
+  + new tie case + op perf A/B both top_k shapes + serving legs.
+- Ranked risks: (1) ±0 canonicalization omitted -> boundary set
+  mismatch; (2) compaction must be ordered-scan, not atomic-append;
+  (3) small-nt occupancy (gated); (4) none for d64 (untouched).
+
+ALSO REJECTED this round: SORT_N=8192-with-partial-K — exact CE math
+at production K=2048: chunk CE +7.9% (more tail padding), total
++4.6%, occupancy 2->1 blocks/SM; only pays at small K where radix
+wins anyway. Dead in both full-sort and partial forms. SORT_N=16384
+dead outright (128KB > GB10 99KB carveout).
+
 ## STEP 2 — fused score+chunk-topk (env prototype, ncu-gated)
+## [KILLED 2026-07-14 — see PROGRESS iter 32: ceiling <1.7% vs 16x
+## K-L2-traffic cost on the 58-70% score side; no 512k niche;
+## running-topk-in-score-kernel geometrically blocked at 8:1
+## selectivity. Kept below for the record.]
 
 REVISED 2026-07-14 by the post-step-1 delta scout + the step-1 perf
 findings. Changes vs the original design below:
@@ -285,7 +342,46 @@ Design settled by the scout; key decisions:
 
 ---
 
-## STEP 3 — fp4-mma register-resident-K probe (kill-gated)
+## STEP 3 — BUILD-READY 2026-07-14 (detail scout vs d89d2849b).
+## Deltas vs the original notes below:
+
+- **No nibble repack needed** (removes the hardest part): the
+  container row IS an array of standard block_mxfp4 {e; qs[16]}
+  (ggml-common.h:216-218; dsv4_qat_set_rows packs canonical order),
+  and Blackwell mmq consumes qs by plain memcpy (mmq.cuh:934 — the
+  feared quantize_mxfp4_mmq permutation does not exist in this
+  tree). B(K) = raw 4B gathers from the 68B row; A(q) = pack with
+  the dsv4_qat_set_rows routine into block_mxfp4 order in smem.
+  Dot products are permutation-invariant when A and B agree on
+  physical dim per k-slot — they do, verbatim.
+- Geometry: reuse the int8 kernel's block=256 / grid
+  ((n_lid+127)/128,(nt_s+15)/16); warp owns 16 comps (2 B-tiles
+  resident, ~42-50 regs, ~5 blocks/SM, smem ~1.2KB vs int8's 18KB).
+  A-smem is ~1.1KB (4-bit: 64B/token), not the 4.25KB prior note.
+- Bypass: fp4_mma_active skips BOTH the f16 staging and the int8
+  pre-quant; byte strides nbk2/nbk3 = k->nb[2]/nb[3]. Off-Blackwell
+  one-shot warn -> int8 fallback.
+- EXACT wiring: route pass-2 through the packed-direct inline-
+  dequant rescore arm (predicate k_packed_direct || fp4_mma_active
+  at ~:1413) — staged-f16-alive rejected (doubles K reads). q_d
+  stays official f32 (fp4-mma skips the q fake-quant kernel).
+- Test tolerances: fp4-mma is class B — the 1.2e-2 d128 gate WILL
+  fail. Add an env-gated max_err branch (~8e-2 smoke, tightened to
+  ~2x observed miss before commit); the REAL correctness proof is
+  LID_FP4_MMA=1 + LID_EXACT=1 at 0.0 (load-bearing). Plus resident
+  greedy A/B + PPL (the LID_FP4 acceptance protocol).
+- Perf reference: int8 score = 71.1ms @33280x2048 (the old 21.76ms
+  was n_lid=8704, not comparable). Add MXFP4 perf case
+  (MXFP4,128,64,33280,2048,1,2048). KILL if sm>=l1tex AND duration
+  >= 71.1ms, or regs spill >64, or wall >= 71.1ms.
+- Marginal protocol: BOTH A/B arms run LID_CACHE_MXFP4=1 (container
+  tax common-mode).
+- Scope: dsv4_lid_topk.cu +~185/-4 (kernel ~120 + arm/gates), tests
+  +~4, FLAGS +1.
+- Post-radix context: after step 2c lands, score = 93% of the lid
+  op — this probe is the remaining campaign.
+
+## STEP 3 (original notes) — fp4-mma register-resident-K probe (kill-gated)
 
 Feasibility CONFIRMED at the operand level:
 

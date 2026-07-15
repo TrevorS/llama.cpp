@@ -1672,3 +1672,27 @@ Op perf (vs step-1 build): -7.5..-8.9% @top_k=512 shapes, -1.6%
 @production top_k=2048 (as predicted: phase-1 block sort dominates at
 K=N/2). Cumulative op vs pre-campaign baseline @33280x2048x512:
 104.0 -> 95.0ms (-8.7%).
+
+## Iteration 34 — selection-design round: RADIX-SELECT wins; step 3 build-ready
+
+Two design scouts against fe6043410/d89d2849b:
+- RADIX-SELECT on f16 score bits (STEP 2c in BUILDPLAN): one kernel
+  per token replaces chunk+merge on the d128/half path. Tie story
+  SOLVED: canonicalize -0 (0x8000->0) so key-eq == f32-value-eq,
+  then strictly-greater + lowest-index ordered-scan fill at ==T is
+  dsv4_better exactly (atomic-append is wrong — nondeterministic).
+  Expected topk 50.4 -> ~5ms, op -37.5%, ~9-11% serving wall.
+  SORT_N-8192-with-partial-K REJECTED by CE math (+4.6% total at
+  production K=2048; occupancy 2->1 blocks/SM); 16384 dead (128KB >
+  99KB carveout).
+- STEP 3 fp4-mma detail scout: build-ready, and the hardest part
+  evaporated — container rows are literal block_mxfp4 arrays and
+  Blackwell mmq consumes qs verbatim (mmq.cuh:934 memcpy), so no
+  nibble repack anywhere. EXACT via packed-direct inline-dequant
+  rescore; class-B test gate needs an env-gated max_err branch
+  (~8e-2 smoke) with the EXACT 0.0 run as the true proof; kill gate
+  vs int8 71.1ms @33280x2048. After radix lands, score = 93% of the
+  lid op.
+Standing bench matrix (18 legs, cooldowns, base+mtp) running on
+fe6043410 — results in the matrix-p5b profile dir; first legs:
+pp2048@d0 518.7 (NEW RECORD, prior ~505), tg128@d0 17.9.
