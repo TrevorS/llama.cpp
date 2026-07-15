@@ -7,15 +7,17 @@ against 534b2b320 (`dsv4_lid_topk.cu` = 1374 lines).
 
 ## Corrections to BUILDSPEC (measured against the tree)
 
-- **Pre-quant buffer is ~16.5 MiB/stream, not 4.1MB.** int8 K =
-  128 B x n_lid (16 MiB @131k) + f32 scales 4 B x n_lid (0.5 MiB).
-  BUILDSPEC's "4.1MB" doesn't fit any d=128 encoding.
-- **n_lid tracks full depth**: `n_lid = inp_lid.kq_mask->ne[0]`
-  (deepseek4.cpp:631) — at d131072, n_lid ~ 131072. The iter-29
-  "K 8.4MB @d131k L2-resident" figure is the MXFP4-packed size
-  (68 B/row); int8 K is 16.8 MB, f16 K is 33.6 MB. The fused lever's
-  L2-residency margin is therefore TIGHTER than BUILDSPEC implied —
-  the ncu hit-rate gate is decisive, not a formality.
+- **RETRACTED 2026-07-14 (post-build): the n_lid correction below was
+  WRONG.** n_lid = kq_mask->ne[0] is the COMPRESSED lid length
+  (compressor ratio 4), not full depth: at d131072 n_lid ~ 32768+pad
+  (the 33280 perf case IS the d131k serving shape). BUILDSPEC's
+  original figures were right: score matrix 268MB, K f16 8.4MB,
+  int8 K ~4.2MB, pre-quant buffer ~4.3MB/stream. The fused lever's
+  L2 margin is comfortable after all; the ncu gate remains the
+  formal check.
+- ~~Pre-quant buffer is ~16.5 MiB/stream, not 4.1MB~~ (retracted, see
+  above — holds only at ctx >= 512k where n_lid reaches 131072).
+- ~~n_lid tracks full depth~~ (retracted, see above).
 - **Merge re-reads the score matrix at EVERY tree level**
   (`row[idx]` gather, .cu:888) — a third traffic term the "~0.5GB"
   headline undercounted. Killing it requires the candidate-VALUE tree
@@ -30,7 +32,29 @@ against 534b2b320 (`dsv4_lid_topk.cu` = 1374 lines).
 
 ---
 
-## STEP 1 — one PR: SORT_N 8192 + f16 scores + int8-K pre-quant
+## STEP 1 — BUILT 2026-07-14. Outcome: f16+pre-quant land (~1% op win),
+## SORT_N 8192 REVERTED (measured negative)
+
+Measured (op-level A/B, test-backend-ops perf, same boot):
+- SORT_N=8192: +13% op time @n_lid 8704, +7% @17000, flat @33280,
+  +12% @33280-decode. ROOT CAUSE the launch-count argument missed:
+  bitonic work grows N*log^2 N, so fewer-but-bigger chunks do ~30%
+  MORE total sort work than the halved merge launches save. Reverted
+  to 4096; the dynamic-smem + score_t template structure KEPT.
+- f16 scores + int8-K pre-quant at SORT_N=4096: -0.6..-1.3% op time
+  across all four deep shapes. Wall: flat within noise (lid op is
+  score-dominated; topk's f16 win is small because the merge GATHER
+  is random-access — 2B vs 4B lands in the same 32B sectors, so f16
+  does NOT reduce gather sectors. The gather is killed by the
+  candidate-VALUE tree, i.e. step 2's merge change, which also works
+  for the UNFUSED path — promoted to the front of step 2).
+- EXACT oracle with f16 pass-1: p100 51 vs 50 baseline @33k — m=64
+  window holds (13 ranks headroom). Note baseline seed-2 was already
+  50, tighter than the previously quoted 36.
+
+Original plan below, kept for the record.
+
+## STEP 1 (original plan) — one PR: SORT_N 8192 + f16 scores + int8-K pre-quant
 
 Three levers, one PR, because they touch the same two kernels: the
 3 topk kernels get dynamic smem AND a `score_t` template; the int8
@@ -167,6 +191,52 @@ o=16..1, `inv=127/amax`, `sk=amax/127`, `__float2int_rn`, dim-natural
 ---
 
 ## STEP 2 — fused score+chunk-topk (env prototype, ncu-gated)
+
+REVISED 2026-07-14 by the post-step-1 delta scout + the step-1 perf
+findings. Changes vs the original design below:
+
+- **Sub-step 2a, DO FIRST (may stand alone): candidate-VALUE tree for
+  the UNFUSED path.** Step-1 measurement showed the merge's random
+  `row[idx]` score-matrix gather is the topk term f16 can't touch
+  (random 2B vs 4B = same 32B sectors). Storing (idx, half val) at
+  chunk emit and merging over stored vals kills the per-level gather
+  without any fusion. Small diff (merge kernel variant + chunk emits
+  vals + launch threads a half val-scratch), A-safe: the stored half
+  IS the same rounded score the gather would load via dsv4_lds.
+  Measure op-level before deciding 2b.
+- **Fused kernel (2b) bit-identity under f16 scores**: the fused
+  kernel must round each score through __float2half BEFORE the sort
+  (vals[i] = __half2float(__float2half(acc+mv)), matching the unfused
+  store at :469 + load at :889) and the cand-val tree stores HALF —
+  merge then reads dsv4_lds(cand_val_in + i), byte-identical to the
+  unfused merge inputs.
+- **Fused internal chunk = SORT_N (4096 after the step-1 revert)** —
+  identical partition to the unfused chunk kernel, so intermediates
+  match byte-for-byte; 40.5KB smem, 2 blocks/SM. (The delta scout's
+  8192 recommendation predated the SORT_N revert; with the host back
+  at 4096, 4096-internal is both the bit-identity choice AND the
+  occupancy choice.)
+- **Own launch wrapper** (dsv4_fused_topk_launch): level 0 = fused
+  kernel (emits idx+val), merges read cand-vals; per-stream offsets
+  like the int8 loop. Must be called INSIDE the d128 branch (k_i8
+  pool alloc is branch-scoped) with an early return.
+- **scores_h guard**: compute the fused predicate before the dual
+  scores alloc and skip scores_h when fused — otherwise the fused
+  path still reserves the matrix it eliminates.
+- **top_k at the gated perf shapes is 512** (the 2048 in those cases
+  is nt_s); serving uses top_k 2048. merge_group at 4096: 8 and 2.
+- Predicate: fused && int8 && d128 && nt_s>1 && n_lid>SORT_N &&
+  !exact && !k_packed_direct. Env LLAMA_DSV4_LID_FUSED_CHUNK, static
+  lambda after the dec flag (~:1256).
+- Scope (delta-scout): dsv4_lid_topk.cu +~155/-15 (fused kernel ~80,
+  merge-val kernel ~45, launch wrapper ~50), tests +1-2, FLAGS +1.
+- K L2-residency stays the ncu go/no-go for 2b, but with n_lid
+  corrected to ~33k @d131k (int8 K ~4.2MB) the margin is comfortable;
+  the risk is real only at 512k-class contexts (n_lid ~131k, 16.8MB).
+
+Original design notes below, kept for the record.
+
+### STEP 2 (original design)
 
 Design settled by the scout; key decisions:
 

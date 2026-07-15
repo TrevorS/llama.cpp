@@ -1580,3 +1580,44 @@ bypass breaks EXACT pass-2's k_f16_d source — must keep staging alive
 under EXACT or use the inline-dequant arm. Step-1 gate upgraded: the
 EXACT oracle displacement re-run is load-bearing (f16 pass-1
 displacement vs m=64 window, prior p100=36).
+
+## Iteration 31 — lid traffic step 1: f16 scores + int8-K pre-quant land; SORT_N 8192 measured negative
+
+Built the step-1 trio from BUILDPLAN-lid-traffic. Op-level A/B
+(test-backend-ops perf, same boot) split the verdict:
+- SORT_N 8192: +13% op @n_lid 8704, +7% @17000, +12% @33280-decode.
+  The launch-count argument missed that bitonic work grows N*log^2 N:
+  fewer-but-bigger chunks add ~30% total sort work, more than the
+  halved merge launches save. REVERTED to 4096; kept the dynamic-smem
+  + score_t template conversion (32KB dyn @4096, no cost measured,
+  and step 2 builds on it).
+- f16 score store (d128) + global int8-K pre-quant @4096: -0.6..-1.3%
+  op across the four deep shapes. KEPT (strictly-less-work, A-safe).
+Serving legs (same-boot A/B, r=3, clocksnap; SW Power Cap seen on
+this boot): pp2048@d65536 326.2 vs base 326.3 (flat); @d131072 270.5
++/-1.4 vs 268.0 +/-0.5 (+0.9%, marginal).
+
+Why the projected ~5% @d131k was wrong, in order of importance:
+1. ATTRIBUTION BUG (mine): n_lid is the COMPRESSED lid length
+   (ratio 4) — @d131k n_lid~33k, not 131k. The 33280 perf case IS the
+   d131k shape; BUILDSPEC's original 268MB/8.4MB figures were right
+   and my BUILDPLAN "correction" to 16.8MB is retracted there.
+2. The merge's row[idx] gather is RANDOM-access: f16 doesn't cut
+   gather sectors (2B vs 4B in the same 32B sector). The gather dies
+   only via a candidate-VALUE tree (store (idx, half val) at chunk
+   emit, merge over stored vals) — that is step 2's merge change and
+   it works UNFUSED: promoted to sub-step 2a, do-first.
+3. The lid op at these shapes is score-kernel-dominated; topk was
+   9.7% of GPU-busy, and only its sequential-read fraction responds
+   to f16.
+EXACT oracle re-run with f16 pass-1 (--f16-scores added to
+fp4_oracle): displacement p100 51 vs 50 baseline @33k — m=64 holds
+with 13 ranks headroom (note: baseline seed-2 was already 50, not the
+previously quoted 36). Op gates: default / EXACT+QAT_WRITE / INT8=0 /
+DEC=0 / FP4 all green, incl 4 new eval cases (8193, 17000, 70000
+tree-merge, d128 17000 f16-multi-chunk) — found and closed a gap
+where no eval case exercised the chunk/merge kernels above the old
+boundaries. Step-2 delta scout re-anchored the fused design to the
+post-step-1 tree (cand-val stores HALF via dsv4_lds for byte-identity
+with the f16-ranked unfused path; own launch wrapper inside the d128
+branch; scores_h guarded on !fused) — folded into BUILDPLAN.

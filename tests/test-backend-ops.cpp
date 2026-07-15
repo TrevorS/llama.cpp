@@ -9668,6 +9668,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,    4, 1, 512));  // realistic dims, F16 k
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8,  5000,    2, 1, 128));  // multi-chunk (>4096), not divisible, F16
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  4097,    2, 1, 100));  // just over one chunk boundary
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  8193,    2, 1, 100));  // just over two chunk boundaries
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 17000,    2, 1, 128));  // multi-chunk, partial last chunk, chunk+final merge
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 70000,    2, 1, 960));  // tree merge: 18 chunks > merge_group 4 (top_k <= 960 keeps EXACT's n_cand <= 1024)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,    4, 1, 512));  // d128 f16-scores multi-chunk topk
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
     // wmma score path (d_idx == 128): multi-token-tile, non-128-divisible n_lid, streams
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // wmma: 3 token-tiles (partial), n_lid % 128 != 0
@@ -10477,6 +10481,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // DSV4 fused lightning-indexer score+topk at DS4-Flash serving depths
     // (ub2048 prefill at depth 32k/131k -> n_lid = (depth+ub)/4; plus decode nt=1)
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  8704, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000, 2048, 1, 512));  // multi-chunk, n_lid % SORT_N != 0
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 512));
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280,    1, 1, 512));
 

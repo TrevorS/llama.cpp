@@ -32,6 +32,12 @@
 static __device__ __forceinline__ float dsv4_ldk(const float * p) { return *p; }
 static __device__ __forceinline__ float dsv4_ldk(const half  * p) { return __half2float(*p); }
 
+// scores-buffer load: the d_idx==128 score kernels store f16 (halves the
+// [nt, n_lid] DRAM round-trip); the scalar path keeps f32 to stay bit-exact
+// under its strict 0.0-tolerance gate. Sort compares stay f32 either way.
+static __device__ __forceinline__ float dsv4_lds(const float * p) { return *p; }
+static __device__ __forceinline__ float dsv4_lds(const half  * p) { return __half2float(*p); }
+
 // ---------------------------------------------------------------------------
 // fp4 QAT fake-quant (LLAMA_DSV4_LID_FP4) — e2m1 block-32 round trip matching
 // ds4.c dsv4_fp4_act_quantize_row_inplace_cpu. The indexer q/k arrive already
@@ -233,7 +239,7 @@ static __global__ void dsv4_score_kernel(
 
 template <typename KT>
 static __global__ void dsv4_score_wmma128_kernel(
-        float       * __restrict__ scores,   // [nt_s, n_lid] for this stream
+        half        * __restrict__ scores,   // [nt_s, n_lid] for this stream (f16 store)
         const float * __restrict__ q,        // [(t*n_head + h)*128 + d] for this stream
         const float * __restrict__ weights,  // [t*n_head + h] for this stream
         const KT    * __restrict__ k,        // [j*nbk2 + d] for this stream
@@ -320,7 +326,7 @@ static __global__ void dsv4_score_wmma128_kernel(
         const uint32_t comp  = tile_c + wtile * 16u + c;
         if (token < (uint32_t) n_tokens && comp < (uint32_t) n_lid) {
             const float mv = mask[(int64_t) token * nbm1 + comp];
-            scores[(int64_t) token * n_lid + comp] = acc[slot] + mv;
+            scores[(int64_t) token * n_lid + comp] = __float2half(acc[slot] + mv);
         }
     }
 #endif
@@ -339,14 +345,49 @@ static __global__ void dsv4_score_wmma128_kernel(
 // thread owns 1 token x 8 comps.
 // ---------------------------------------------------------------------------
 
+// Global int8 pre-quant of lid-K: one warp per comp (K-row). Layout and
+// arithmetic identical to the quant the score kernel used to run per
+// (16-token x 128-comp) block — strided dims d = lane + i*32, warp shfl_xor
+// amax, round-to-nearest-even, per-comp scale amax/127 — so consuming the
+// buffer is bit-identical to re-quantizing, minus the ceil(nt_s/16)-fold
+// redundant work and the wider f16/f32 global reads.
 template <typename KT>
+static __global__ void dsv4_prequant_k_int8_kernel(
+        int8_t      * __restrict__ k_i8,   // [comp*128 + d] int8, dim-contiguous
+        float       * __restrict__ k_sc,   // [comp] per-comp scale (amax/127)
+        const KT    * __restrict__ k,      // [comp*nbk2 + d]
+        int64_t nbk2, int n_lid) {
+    const int comp = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (comp >= n_lid) return;
+    const KT * krow = k + (int64_t) comp * nbk2;
+    float v[4];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int d = lane + i * 32;
+        v[i] = dsv4_ldk(krow + d);
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (lane == 0) k_sc[comp] = amax > 0.0f ? amax / 127.0f : 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const int d = lane + i * 32;
+        k_i8[(int64_t) comp * 128 + d] = (int8_t) __float2int_rn(v[i] * inv);
+    }
+}
+
 static __global__ void dsv4_score_int8_kernel(
-        float       * __restrict__ scores,   // [n_tokens, n_lid] for this stream
-        const float * __restrict__ q,        // [(t*n_head + h)*128 + d]
-        const float * __restrict__ weights,  // [t*n_head + h]
-        const KT    * __restrict__ k,        // [j*nbk2 + d]
-        const float * __restrict__ mask,     // [t*nbm1 + j]
-        int64_t nbk2, int64_t nbm1,
+        half         * __restrict__ scores,   // [n_tokens, n_lid] for this stream (f16 store)
+        const float  * __restrict__ q,        // [(t*n_head + h)*128 + d]
+        const float  * __restrict__ weights,  // [t*n_head + h]
+        const int8_t * __restrict__ k_i8,     // [j*128 + d] pre-quantized (this stream)
+        const float  * __restrict__ k_sc,     // [j] per-comp scale
+        const float  * __restrict__ mask,     // [t*nbm1 + j]
+        int64_t nbm1,
         int n_tokens, int n_lid, int n_head) {
     const int tile_c = blockIdx.x * 128;
     const int tile_t = blockIdx.y * 16;
@@ -360,26 +401,15 @@ static __global__ void dsv4_score_int8_kernel(
     __shared__ float  sk[128];        // per-comp  scale
     __shared__ float  sq[16];         // per-token scale
 
-    // --- quantize K tile once (shared across heads) ---
+    // --- load pre-quantized K tile into smem (shared across heads) ---
     for (int c = warp; c < 128; c += nwarps) {
         const int comp = tile_c + c;
-        const KT * krow = k + (int64_t) comp * nbk2;
-        float v[4];
-        float amax = 0.0f;
+        const bool ok  = comp < n_lid;
+        if (lane == 0) sk[c] = ok ? k_sc[comp] : 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int d = lane + i * 32;
-            v[i] = comp < n_lid ? dsv4_ldk(krow + d) : 0.0f;
-            amax = fmaxf(amax, fabsf(v[i]));
-        }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        if (lane == 0) sk[c] = amax > 0.0f ? amax / 127.0f : 0.0f;
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const int d = lane + i * 32;
-            ks[c * 128 + d] = (int8_t) __float2int_rn(v[i] * inv);
+            ks[c * 128 + d] = ok ? k_i8[(int64_t) comp * 128 + d] : (int8_t) 0;
         }
     }
 
@@ -436,7 +466,7 @@ static __global__ void dsv4_score_int8_kernel(
         for (int cc = 0; cc < 8; cc++) {
             const int comp = tile_c + my_c0 + cc;
             if (comp < n_lid) {
-                scores[(int64_t) token * n_lid + comp] = acc[cc] + mask[(int64_t) token * nbm1 + comp];
+                scores[(int64_t) token * n_lid + comp] = __float2half(acc[cc] + mask[(int64_t) token * nbm1 + comp]);
             }
         }
     }
@@ -457,7 +487,7 @@ static __global__ void dsv4_score_int8_kernel(
 // warp reads 68B/row instead of 256B f16 (the P3b-ii decode bandwidth win).
 template <typename KT, bool PACKED = false>
 static __global__ void dsv4_score_decode_kernel(
-        float       * __restrict__ scores,   // [n_lid]
+        half        * __restrict__ scores,   // [n_lid] (f16 store)
         const float * __restrict__ q,        // [h*128 + d]  (single token)
         const float * __restrict__ weights,  // [h]
         const KT    * __restrict__ k,        // [j*nbk2 + d]
@@ -530,7 +560,7 @@ static __global__ void dsv4_score_decode_kernel(
             const float d = (float) dot * sq[h] * ksc;
             acc += fmaxf(d, 0.0f) * sw[h];
         }
-        if (lane == 0) scores[j] = acc + mask[j];
+        if (lane == 0) scores[j] = __float2half(acc + mask[j]);
     }
 }
 
@@ -815,18 +845,25 @@ static __device__ void dsv4_bitonic_sort(float * vals, uint32_t * idxs) {
     }
 }
 
-// single-block-per-token, n_lid <= SORT_N
-template <uint32_t SORT_N>
+// single-block-per-token, n_lid <= SORT_N.
+// The three topk kernels carve one dynamic extern buffer (host raises the
+// limit via CUDA_SET_SHARED_MEMORY_LIMIT) so SORT_N is not capped by the
+// 48KB static smem limit. NOTE: SORT_N=8192 was measured a net NEGATIVE
+// (+7-13% op time at n_lid 8704-17000): bitonic work grows N*log^2 N, so
+// fewer-but-bigger chunks add ~30% sort work — more than the halved merge
+// launches save. Keep 4096.
+template <uint32_t SORT_N, typename score_t>
 static __global__ void dsv4_topk_single_kernel(
-        uint32_t * selected, const float * scores,
+        uint32_t * selected, const score_t * scores,
         int n_lid, int n_tokens, int top_k) {
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
-    __shared__ float    vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-    const float * row = scores + (int64_t)t * n_lid;
+    extern __shared__ float dsv4_topk_smem[];
+    float    * vals = dsv4_topk_smem;
+    uint32_t * idxs = reinterpret_cast<uint32_t *>(dsv4_topk_smem + SORT_N);
+    const score_t * row = scores + (int64_t)t * n_lid;
     for (uint32_t i = threadIdx.x; i < SORT_N; i += blockDim.x) {
-        if ((int)i < n_lid) { vals[i] = row[i]; idxs[i] = i; }
+        if ((int)i < n_lid) { vals[i] = dsv4_lds(row + i); idxs[i] = i; }
         else                { vals[i] = -INFINITY; idxs[i] = UINT32_MAX; }
     }
     __syncthreads();
@@ -837,9 +874,9 @@ static __global__ void dsv4_topk_single_kernel(
 }
 
 // per (token, chunk): emit top_k candidate indices for this chunk
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, typename score_t>
 static __global__ void dsv4_topk_chunk_kernel(
-        uint32_t * candidates, const float * scores,
+        uint32_t * candidates, const score_t * scores,
         int n_lid, int n_tokens, int top_k, int candidate_stride) {
     const int t     = blockIdx.x;
     const int chunk = blockIdx.y;
@@ -847,11 +884,12 @@ static __global__ void dsv4_topk_chunk_kernel(
     const uint32_t chunk_start = (uint32_t)chunk * SORT_N;
     if ((int)chunk_start >= n_lid) return;
     const uint32_t chunk_n = ((int)(n_lid - chunk_start) < (int)SORT_N) ? (uint32_t)(n_lid - chunk_start) : SORT_N;
-    __shared__ float    vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-    const float * row = scores + (int64_t)t * n_lid;
+    extern __shared__ float dsv4_topk_smem[];
+    float    * vals = dsv4_topk_smem;
+    uint32_t * idxs = reinterpret_cast<uint32_t *>(dsv4_topk_smem + SORT_N);
+    const score_t * row = scores + (int64_t)t * n_lid;
     for (uint32_t i = threadIdx.x; i < SORT_N; i += blockDim.x) {
-        if (i < chunk_n) { vals[i] = row[chunk_start + i]; idxs[i] = chunk_start + i; }
+        if (i < chunk_n) { vals[i] = dsv4_lds(row + chunk_start + i); idxs[i] = chunk_start + i; }
         else             { vals[i] = -INFINITY; idxs[i] = UINT32_MAX; }
     }
     __syncthreads();
@@ -861,9 +899,9 @@ static __global__ void dsv4_topk_chunk_kernel(
 }
 
 // merge `set_count` candidate sets (per group) -> top_k, re-reading scores
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, typename score_t>
 static __global__ void dsv4_topk_merge_kernel(
-        uint32_t * out, const uint32_t * candidates, const float * scores,
+        uint32_t * out, const uint32_t * candidates, const score_t * scores,
         int n_lid, int n_tokens, int top_k,
         int n_sets, int merge_group, int candidate_stride, int out_stride,
         int final) {
@@ -876,16 +914,17 @@ static __global__ void dsv4_topk_merge_kernel(
     if (set_count > merge_group) set_count = merge_group;
     const int candidate_count = set_count * top_k;
 
-    __shared__ float    vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-    const float    * row  = scores + (int64_t)t * n_lid;
+    extern __shared__ float dsv4_topk_smem[];
+    float    * vals = dsv4_topk_smem;
+    uint32_t * idxs = reinterpret_cast<uint32_t *>(dsv4_topk_smem + SORT_N);
+    const score_t  * row  = scores + (int64_t)t * n_lid;
     const uint32_t * cand = candidates + (int64_t)t*candidate_stride + (int64_t)set0*top_k;
     for (uint32_t i = threadIdx.x; i < SORT_N; i += blockDim.x) {
         uint32_t idx = UINT32_MAX;
         float    v   = -INFINITY;
         if ((int)i < candidate_count) {
             idx = cand[i];
-            if (idx < (uint32_t) n_lid) v = row[idx];
+            if (idx < (uint32_t) n_lid) v = dsv4_lds(row + idx);
         }
         vals[i] = v; idxs[i] = idx;
     }
@@ -1003,15 +1042,19 @@ static __global__ void dsv4_lid_rescore_select_kernel(
 // host launcher
 // ---------------------------------------------------------------------------
 
+template <typename score_t>
 static void dsv4_topk_launch(
-        ggml_cuda_pool & pool, uint32_t * selected, const float * scores,
+        ggml_cuda_pool & pool, uint32_t * selected, const score_t * scores,
         int n_lid, int n_tokens, int top_k, cudaStream_t stream) {
     constexpr uint32_t SORT_N = DSV4_TOPK_SORT_N;
     GGML_ASSERT((uint32_t) top_k <= SORT_N);
     const int block = 1024;
+    // 64KB vals+idxs at SORT_N=8192 — dynamic smem, limit raised per kernel
+    const size_t smem = (size_t) SORT_N * (sizeof(float) + sizeof(uint32_t));
 
     if ((uint32_t) n_lid <= SORT_N) {
-        dsv4_topk_single_kernel<SORT_N><<<n_tokens, block, 0, stream>>>(
+        CUDA_SET_SHARED_MEMORY_LIMIT((dsv4_topk_single_kernel<SORT_N, score_t>), smem);
+        dsv4_topk_single_kernel<SORT_N, score_t><<<n_tokens, block, smem, stream>>>(
                 selected, scores, n_lid, n_tokens, top_k);
         return;
     }
@@ -1035,7 +1078,8 @@ static void dsv4_topk_launch(
     uint32_t * cur = scratch;
     int cur_stride = candidate_stride;
     dim3 grid_chunks(n_tokens, n_chunks, 1);
-    dsv4_topk_chunk_kernel<SORT_N><<<grid_chunks, block, 0, stream>>>(
+    CUDA_SET_SHARED_MEMORY_LIMIT((dsv4_topk_chunk_kernel<SORT_N, score_t>), smem);
+    dsv4_topk_chunk_kernel<SORT_N, score_t><<<grid_chunks, block, smem, stream>>>(
             cur, scores, n_lid, n_tokens, top_k, candidate_stride);
 
     // tree merges until n_sets <= merge_group
@@ -1044,7 +1088,8 @@ static void dsv4_topk_launch(
         const int next_stride = next_sets * top_k;
         uint32_t * next = cur + (int64_t) n_tokens * cur_stride;
         dim3 grid_merge(n_tokens, next_sets, 1);
-        dsv4_topk_merge_kernel<SORT_N><<<grid_merge, block, 0, stream>>>(
+        CUDA_SET_SHARED_MEMORY_LIMIT((dsv4_topk_merge_kernel<SORT_N, score_t>), smem);
+        dsv4_topk_merge_kernel<SORT_N, score_t><<<grid_merge, block, smem, stream>>>(
                 next, cur, scores, n_lid, n_tokens, top_k,
                 n_sets, merge_group, cur_stride, next_stride, /*final=*/0);
         cur = next;
@@ -1054,7 +1099,8 @@ static void dsv4_topk_launch(
 
     // final merge -> selected
     dim3 grid_final(n_tokens, 1, 1);
-    dsv4_topk_merge_kernel<SORT_N><<<grid_final, block, 0, stream>>>(
+    CUDA_SET_SHARED_MEMORY_LIMIT((dsv4_topk_merge_kernel<SORT_N, score_t>), smem);
+    dsv4_topk_merge_kernel<SORT_N, score_t><<<grid_final, block, smem, stream>>>(
             selected, cur, scores, n_lid, n_tokens, top_k,
             n_sets, merge_group, cur_stride, top_k, /*final=*/1);
 }
@@ -1141,8 +1187,14 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
 
     // scores buffer lives in the pool, not the graph compute buffer.
-    ggml_cuda_pool_alloc<float> scores_alloc(pool, (size_t) nt * n_lid);
-    float * scores = scores_alloc.get();
+    // d_idx==128 kernels store f16 scores to halve the [nt, n_lid] DRAM
+    // round-trip; the scalar (d_idx != 128) path keeps f32 to stay bit-exact
+    // under its strict 0.0-tolerance test gate.
+    const bool scores_half = (d_idx == 128);
+    ggml_cuda_pool_alloc<float> scores_f32_alloc(pool);
+    ggml_cuda_pool_alloc<half>  scores_h_alloc(pool);
+    float * scores   = scores_half ? nullptr : scores_f32_alloc.alloc((size_t) nt * n_lid);
+    half  * scores_h = scores_half ? scores_h_alloc.alloc((size_t) nt * n_lid) : nullptr;
 
     // element strides are meaningless for the packed MXFP4 container; its
     // staging path below overwrites these with dense-buffer strides
@@ -1258,7 +1310,7 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         int gx = (n_lid + nwarps - 1) / nwarps;
         if (gx > 512) gx = 512;
         for (int s = 0; s < n_stream; s++) {
-            float       * sc_s = scores + (int64_t) s * nt_s * n_lid;
+            half        * sc_s = scores_h + (int64_t) s * nt_s * n_lid;
             const float * q_s  = q_d + (int64_t) s * nt_s * n_head * d_idx;
             const float * w_s  = w_d + (int64_t) s * nt_s * n_head;
             const float * m_s  = m_d + (int64_t) s * nbm3;
@@ -1276,30 +1328,48 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
     } else if (d_idx == 128) {
         const dim3 block(256);
         const dim3 grid((n_lid + 127) / 128, (nt_s + 15) / 16, 1);
+        // int8 path: pre-quantize K to a global int8 buffer + per-comp scales
+        // once per stream (bit-identical layout/arithmetic to the quant the
+        // score kernel used to redo per 16-token tile).
+        ggml_cuda_pool_alloc<int8_t> k_i8_alloc(pool);
+        ggml_cuda_pool_alloc<float>  k_sc_alloc(pool);
+        int8_t * k_i8 = nullptr;
+        float  * k_sc = nullptr;
+        if (dsv4_lid_int8) {
+            k_i8 = k_i8_alloc.alloc((size_t) n_stream * n_lid * 128);
+            k_sc = k_sc_alloc.alloc((size_t) n_stream * n_lid);
+            const int pq_block = 256; // 8 warps -> 8 comps/block
+            const int pq_grid  = (n_lid + 7) / 8;
+            for (int s = 0; s < n_stream; s++) {
+                int8_t * ki_s = k_i8 + (int64_t) s * n_lid * 128;
+                float  * ks_s = k_sc + (int64_t) s * n_lid;
+                if (k_is_f16) {
+                    dsv4_prequant_k_int8_kernel<half><<<pq_grid, pq_block, 0, stream>>>(
+                            ki_s, ks_s, k_h_d + (int64_t) s * nbk3, nbk2, n_lid);
+                } else {
+                    dsv4_prequant_k_int8_kernel<float><<<pq_grid, pq_block, 0, stream>>>(
+                            ki_s, ks_s, (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3, nbk2, n_lid);
+                }
+            }
+        }
         for (int s = 0; s < n_stream; s++) {
             const int64_t t0    = (int64_t) s * nt_s;
-            float       * sc_s  = scores + t0 * n_lid;
+            half        * sc_s  = scores_h + t0 * n_lid;
             const float * q_s   = q_d + t0 * n_head * d_idx;
             const float * w_s   = w_d + t0 * n_head;
             const float * m_s   = m_d + (int64_t) s * nbm3;
-            if (k_is_f16) {
-                const half * k_s = k_h_d + (int64_t) s * nbk3;
-                if (dsv4_lid_int8) {
-                    dsv4_score_int8_kernel<half><<<grid, block, 0, stream>>>(
-                            sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
-                } else {
-                    dsv4_score_wmma128_kernel<half><<<grid, block, 0, stream>>>(
-                            sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
-                }
+            if (dsv4_lid_int8) {
+                dsv4_score_int8_kernel<<<grid, block, 0, stream>>>(
+                        sc_s, q_s, w_s,
+                        k_i8 + (int64_t) s * n_lid * 128, k_sc + (int64_t) s * n_lid,
+                        m_s, nbm1, nt_s, n_lid, n_head);
+            } else if (k_is_f16) {
+                dsv4_score_wmma128_kernel<half><<<grid, block, 0, stream>>>(
+                        sc_s, q_s, w_s, k_h_d + (int64_t) s * nbk3, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
             } else {
-                const float * k_s = (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3;
-                if (dsv4_lid_int8) {
-                    dsv4_score_int8_kernel<float><<<grid, block, 0, stream>>>(
-                            sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
-                } else {
-                    dsv4_score_wmma128_kernel<float><<<grid, block, 0, stream>>>(
-                            sc_s, q_s, w_s, k_s, m_s, nbk2, nbm1, nt_s, n_lid, n_head);
-                }
+                dsv4_score_wmma128_kernel<float><<<grid, block, 0, stream>>>(
+                        sc_s, q_s, w_s, (k_force_f32 ? k_f32_d : (const float *) k->data) + (int64_t) s * nbk3,
+                        m_s, nbk2, nbm1, nt_s, n_lid, n_head);
             }
         }
     } else {
@@ -1334,7 +1404,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         GGML_ASSERT(n_cand <= 1024); // rescore kernel smem/bitonic width
         ggml_cuda_pool_alloc<uint32_t> cand_alloc(pool, (size_t) nt * n_cand);
         ggml_cuda_pool_alloc<float>    cand_val_alloc(pool, (size_t) nt * n_cand);
-        dsv4_topk_launch(pool, cand_alloc.get(), scores, n_lid, nt, n_cand, stream);
+        if (scores_half) {
+            dsv4_topk_launch<half>(pool, cand_alloc.get(), scores_h, n_lid, nt, n_cand, stream);
+        } else {
+            dsv4_topk_launch<float>(pool, cand_alloc.get(), scores, n_lid, nt, n_cand, stream);
+        }
         const dim3 grid_rs(nt, (n_cand + 127) / 128, 1);
         if (k_packed_direct) {
             // decode with packed cache: no staged buffer exists — dequant the
@@ -1369,5 +1443,9 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         return;
     }
 
-    dsv4_topk_launch(pool, (uint32_t *) dst->data, scores, n_lid, nt, n_top_k, stream);
+    if (scores_half) {
+        dsv4_topk_launch<half>(pool, (uint32_t *) dst->data, scores_h, n_lid, nt, n_top_k, stream);
+    } else {
+        dsv4_topk_launch<float>(pool, (uint32_t *) dst->data, scores, n_lid, nt, n_top_k, stream);
+    }
 }

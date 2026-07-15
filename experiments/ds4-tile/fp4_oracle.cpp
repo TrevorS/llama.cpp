@@ -151,6 +151,7 @@ int main(int argc, char ** argv) {
     int nlid_arg = 0;
     bool pre_rotated = false;
     bool int8_disp   = false;
+    bool f16_scores  = false; // model the f16 scores-buffer store in pass 1
 
     for (int i = 1; i < argc; i++) {
         auto next = [&](int & i) { return atoi(argv[++i]); };
@@ -164,6 +165,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--w"))      wf = argv[++i];
         else if (!strcmp(argv[i], "--pre-rotated")) pre_rotated = true;
         else if (!strcmp(argv[i], "--int8-displacement")) int8_disp = true;
+        else if (!strcmp(argv[i], "--f16-scores")) f16_scores = true;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
 
@@ -262,7 +264,9 @@ int main(int argc, char ** argv) {
                             for (int d = 0; d < D_IDX; d++) dot += (int32_t) qh[d] * k8[d];
                             acc += fmaxf((float) dot * qsc * ksc, 0.0f) * w_t[h];
                         }
-                        sc[j] = acc;
+                        // f16 scores-buffer store: pass-1 ranks over the
+                        // rounded value (d128 paths since the lid-traffic PR)
+                        sc[j] = f16_scores ? (float) (_Float16) acc : acc;
                     }
                     // full int8 ranking (desc, idx tie-break); find worst rank
                     // of any true (path-B) top-512 member
