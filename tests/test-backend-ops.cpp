@@ -5836,8 +5836,9 @@ struct test_dsv4_lid_topk : public test_case {
         // int8, so a larger set-mismatch on random test fill. Smoke gate only
         // (~2x the ~0.056 observed on the 2048x4 case); the real correctness
         // proof is the LID_FP4_MMA + LID_EXACT run at 0.0 above.
+        // Default ON since 2026-07-16 (mirror dsv4_lid_topk.cu gate).
         const char * fm = getenv("LLAMA_DSV4_LID_FP4_MMA");
-        if (fm && fm[0] == '1' && d_idx == 128) return 1.1e-1;
+        if ((!fm || fm[0] != '0') && d_idx == 128) return 1.1e-1;
         // LLAMA_DSV4_LID_INT8 scores via int8 dp4a vs the fp32 CPU reference;
         // per-row int8 quant flips a small fraction of near-tie selections
         // (observed <= 0.7%). Loosen the set-mismatch gate for that path.

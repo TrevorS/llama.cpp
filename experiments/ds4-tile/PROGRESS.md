@@ -1931,3 +1931,23 @@ byte-identity @64k full-power C2==D2; UNION_STATS over=0/26880 at
 PENDING (tier 3, optional): d131k overflow-ACTIVE passkey demo
 (positions 85/95 land in the drop victims; OVF may recover keys
 truncation loses).
+
+## Iteration 41 — fp4-mma DEFAULT ON + OVF@131k stamp + governor ring/debt
+
+fp4-mma flip gates (2026-07-16): PPL c4096 4.2350 (fp4-mma) vs 4.2352
+(int8) — statistically identical; passkey@42k 3/3; determinism
+byte-identical. FLIPPED default ON (=0 disables) — only bites with
+the MXFP4 container on Blackwell. Test tolerance gate mirrored.
+
+OVF overflow-ACTIVE stamp @131k (POWER=85): passkey pos 85/95, OVF
+off/on = 4/4 PASS. No truncation-loss demo (needle redundancy makes
+drops probabilistic) but overflow-active retrieval + coherence hold;
+2d's continuation differs from 2c while both correct — the exactness
+fix visibly biting at depth. Boot survived SEVEN 131k-class prefills.
+
+Governor reworked to ring(8 event pairs)+debt accumulator: sleeps
+are paid from measured-but-unpaid debt each pre-hook, so pipelining
+can never starve the tax (v1 was proven exact on our graphs but the
+failure mode existed). Re-stamp d0: 438.23 @85 (duty 85.0%,
+residual-debt 0, ring never full). Telemetry line now includes
+residual debt + ring-full count.

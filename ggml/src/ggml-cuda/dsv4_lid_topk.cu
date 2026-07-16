@@ -1758,11 +1758,15 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const char * e = getenv("LLAMA_DSV4_LID_DEC");
         return !e || e[0] != '0';
     }();
-    // fp4-mma probe (step 3): register-resident-K block-scaled fp4 tensor-core
+    // fp4-mma (step 3): register-resident-K block-scaled fp4 tensor-core
     // scoring. Prefill only, packed MXFP4 container, Blackwell only.
+    // Default ON since 2026-07-16 (=0 disables): flip gates passed — PPL
+    // 4.2350 vs 4.2352 int8 (identical), passkey 42k 3/3 + deterministic,
+    // op -47.8%, serving +4.7% pp@d65k / +8.6% @d131k; official e2m1 grid
+    // (more canonical than int8). Only bites when the container is active.
     static const bool dsv4_lid_fp4_mma = []() {
         const char * e = getenv("LLAMA_DSV4_LID_FP4_MMA");
-        return e && e[0] == '1';
+        return !e || e[0] != '0';
     }();
     bool fp4_mma_active = dsv4_lid_fp4_mma && k_is_mxfp4 && d_idx == 128 && nt_s > 1;
     if (fp4_mma_active) {

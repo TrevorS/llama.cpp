@@ -4036,15 +4036,23 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 // compensating sleep happens before the NEXT submit, when the previous compute has
 // already been drained by the caller's own output sync — no synchronization is added.
 
+// ring of in-flight event pairs + a sleep-debt accumulator: measurement never
+// stalls on one unresolved pair (deep pipelining just delays payment by a
+// compute or two, irrelevant at thermal time constants), and the duty tax is
+// exact in aggregate: every measured span eventually gets paid.
 struct ggml_cuda_power_dev {
-    cudaEvent_t ev_start = nullptr;
-    cudaEvent_t ev_stop  = nullptr;
-    bool started = false; // start event recorded, stop not yet
-    bool pending = false; // event pair recorded, elapsed not yet consumed
+    static constexpr int RING = 8;
+    cudaEvent_t ev_start[RING] = {};
+    cudaEvent_t ev_stop [RING] = {};
+    int  head    = 0;     // next slot to record
+    int  tail    = 0;     // oldest in-flight slot
+    int  count   = 0;     // in-flight pairs
+    bool started = false; // start recorded at head, stop not yet
+    double debt_ms = 0.0; // measured-but-unpaid sleep
     // GGML_CUDA_POWER_DEBUG=1 telemetry
     uint64_t n_pre     = 0; // pre-hook calls (graph computes)
-    uint64_t n_meas    = 0; // event pairs consumed (sleeps applied)
-    uint64_t n_busy    = 0; // pre-hooks where the pending pair was unresolved (no sleep)
+    uint64_t n_meas    = 0; // event pairs consumed
+    uint64_t n_full    = 0; // pre-hooks where the ring was full (span unmeasured)
     double   meas_ms   = 0.0;
     double   sleep_ms  = 0.0;
 };
@@ -4075,10 +4083,11 @@ struct ggml_cuda_power_state {
                 }
                 const double duty = dev[i].meas_ms + dev[i].sleep_ms > 0.0
                     ? dev[i].meas_ms / (dev[i].meas_ms + dev[i].sleep_ms) : 1.0;
-                fprintf(stderr, "[cuda-power] dev%d: computes=%llu measured=%llu busy-skips=%llu "
-                        "meas=%.0fms slept=%.0fms effective-duty=%.1f%%\n",
+                fprintf(stderr, "[cuda-power] dev%d: computes=%llu measured=%llu ring-full=%llu "
+                        "meas=%.0fms slept=%.0fms residual-debt=%.0fms effective-duty=%.1f%%\n",
                         i, (unsigned long long) dev[i].n_pre, (unsigned long long) dev[i].n_meas,
-                        (unsigned long long) dev[i].n_busy, dev[i].meas_ms, dev[i].sleep_ms, 100.0*duty);
+                        (unsigned long long) dev[i].n_full, dev[i].meas_ms, dev[i].sleep_ms,
+                        dev[i].debt_ms, 100.0*duty);
             }
         }
     }
@@ -4204,32 +4213,40 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
     }
     ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
     d.n_pre++;
-    if (d.ev_start == nullptr) {
-        CUDA_CHECK(cudaEventCreate(&d.ev_start));
-        CUDA_CHECK(cudaEventCreate(&d.ev_stop));
-    }
-    if (d.pending) {
-        if (cudaEventQuery(d.ev_stop) == cudaSuccess) {
-            float ms = 0.0f;
-            if (cudaEventElapsedTime(&ms, d.ev_start, d.ev_stop) == cudaSuccess && ms > 0.05f) {
-                const int pct = ps.cur_pct.load(std::memory_order_relaxed);
-                if (pct >= 1 && pct <= 99) {
-                    const double sleep_ms = std::min((double) ms * (100 - pct) / pct, 5000.0);
-                    std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(sleep_ms * 1000.0)));
-                    d.n_meas++;
-                    d.meas_ms  += ms;
-                    d.sleep_ms += sleep_ms;
-                }
-            }
-            d.pending = false;
-        } else {
-            (void) cudaGetLastError(); // clear cudaErrorNotReady
-            d.n_busy++;
+    if (d.ev_start[0] == nullptr) {
+        for (int i = 0; i < ggml_cuda_power_dev::RING; i++) {
+            CUDA_CHECK(cudaEventCreate(&d.ev_start[i]));
+            CUDA_CHECK(cudaEventCreate(&d.ev_stop[i]));
         }
     }
-    if (!d.pending && !d.started) {
-        CUDA_CHECK(cudaEventRecord(d.ev_start, cuda_ctx->stream()));
+    // drain every resolved pair from the tail into the debt accumulator
+    while (d.count > 0 && cudaEventQuery(d.ev_stop[d.tail]) == cudaSuccess) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, d.ev_start[d.tail], d.ev_stop[d.tail]) == cudaSuccess && ms > 0.05f) {
+            const int pct = ps.cur_pct.load(std::memory_order_relaxed);
+            if (pct >= 1 && pct <= 99) {
+                d.debt_ms += (double) ms * (100 - pct) / pct;
+            }
+            d.n_meas++;
+            d.meas_ms += ms;
+        }
+        d.tail = (d.tail + 1) % ggml_cuda_power_dev::RING;
+        d.count--;
+    }
+    (void) cudaGetLastError(); // clear cudaErrorNotReady from the probe
+    // pay accumulated debt before submitting new work (capped per stop so a
+    // huge span cannot stall the loop; the residue carries to the next call)
+    if (d.debt_ms > 0.05) {
+        const double pay = std::min(d.debt_ms, 5000.0);
+        std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(pay * 1000.0)));
+        d.sleep_ms += pay;
+        d.debt_ms  -= pay;
+    }
+    if (d.count < ggml_cuda_power_dev::RING && !d.started) {
+        CUDA_CHECK(cudaEventRecord(d.ev_start[d.head], cuda_ctx->stream()));
         d.started = true;
+    } else if (d.count >= ggml_cuda_power_dev::RING) {
+        d.n_full++;
     }
 }
 
@@ -4240,9 +4257,10 @@ static void ggml_cuda_power_post_compute(ggml_backend_cuda_context * cuda_ctx) {
     }
     ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
     if (d.started) {
-        CUDA_CHECK(cudaEventRecord(d.ev_stop, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventRecord(d.ev_stop[d.head], cuda_ctx->stream()));
+        d.head = (d.head + 1) % ggml_cuda_power_dev::RING;
+        d.count++;
         d.started = false;
-        d.pending = true;
     }
 }
 
