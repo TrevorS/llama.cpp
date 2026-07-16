@@ -4242,6 +4242,21 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
         d.sleep_ms += pay;
         d.debt_ms  -= pay;
     }
+    // GGML_CUDA_POWER_DEBUG=2: periodic in-run telemetry, flushed per line so
+    // a hard box wedge still leaves the trail in the log
+    static const bool dbg2 = []() {
+        const char * e = getenv("GGML_CUDA_POWER_DEBUG");
+        return e && e[0] == '2';
+    }();
+    if (dbg2 && d.n_pre % 16 == 0) {
+        fprintf(stderr, "[cuda-power] t=%llu computes=%llu measured=%llu ring-full=%llu "
+                "meas=%.0fms slept=%.0fms debt=%.0fms\n",
+                (unsigned long long) (std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count() % 100000),
+                (unsigned long long) d.n_pre, (unsigned long long) d.n_meas,
+                (unsigned long long) d.n_full, d.meas_ms, d.sleep_ms, d.debt_ms);
+        fflush(stderr);
+    }
     if (d.count < ggml_cuda_power_dev::RING && !d.started) {
         CUDA_CHECK(cudaEventRecord(d.ev_start[d.head], cuda_ctx->stream()));
         d.started = true;

@@ -1768,7 +1768,18 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const char * e = getenv("LLAMA_DSV4_LID_FP4_MMA");
         return !e || e[0] != '0';
     }();
-    bool fp4_mma_active = dsv4_lid_fp4_mma && k_is_mxfp4 && d_idx == 128 && nt_s > 1;
+    // DEPTH GATE (2026-07-16, GB10 wedges #9-#11): sustained fp4-mma at the
+    // d131k shape (n_lid 33280) hard-locks the box even under a perfectly
+    // functioning 75% duty cycle (burst draw latches the firmware power cap;
+    // telemetry in experiments/profiles/wedge-hunt/). 1-for-4 at d131k vs
+    // dozens of clean runs at <= d65k shapes -> fall back to int8 above the
+    // cap. Default 24576 clears every 65k-class shape and blocks 131k+.
+    static const int64_t dsv4_lid_fp4_mma_max_nlid = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_FP4_MMA_MAX_NLID");
+        return e ? atoll(e) : (long long) 24576;
+    }();
+    bool fp4_mma_active = dsv4_lid_fp4_mma && k_is_mxfp4 && d_idx == 128 && nt_s > 1 &&
+                          n_lid <= dsv4_lid_fp4_mma_max_nlid;
     if (fp4_mma_active) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL)) {

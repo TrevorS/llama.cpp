@@ -1,23 +1,19 @@
 #!/usr/bin/env zsh
-# DS4-Flash standing bench matrix: llama-bench pp2048/tg128 at 5 depths +
-# llama-completion tg (n=256, temp 0) at 4 prompt depths x {base, mtp}.
-# One llama process at a time; cooldown (mem settle + temp) between legs;
-# clocksnap around every leg. Usage: bench-matrix.sh <tag>
+# Resume of matrix-newdefaults after the 11:45 wedge: remaining legs only,
+# d131k first (fresh boot), POWER=75 on deep legs, power-settle cooldown.
 set -u
 cd /home/trevor/Projects/llama.cpp
-
-TAG=${1:-run}
 MODEL=~/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf
 DRAFT=~/models/ds4/DeepSeek-V4-Flash-MTP-mxfp4.gguf
 BIN=./build/bin
-RUN=experiments/profiles/matrix-$TAG-$(date +%Y%m%d-%H%M%S)
+RUN=experiments/profiles/matrix-newdefaults-resume-$(date +%Y%m%d-%H%M%S)
 mkdir -p $RUN
 STATUS=$RUN/STATUS
 SNAP=experiments/profiles/clocksnap.sh
 log() { print -r -- "$(date +%H:%M:%S) $1" >> $STATUS; }
 
+powercap_us() { nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -i "SW Power Capping" | grep -oE '[0-9]+' | head -1; }
 cooldown() {
-    # mem avail >= 100G twice, then temp <= 55C (cap 6 min on the temp wait)
     local ok=0 t=0
     while (( ok < 2 )); do
         local avail=$(free -g | awk '/^Mem:/{print $7}')
@@ -29,30 +25,20 @@ cooldown() {
         [[ -n "$temp" ]] && (( temp <= 55 )) && break
         sleep 10; t=$((t+1))
     done
+    # NOTE: no power-settle gate — the cumulative SW-power-cap counter
+    # advances at IDLE by design (parked clocks count as capping), so there
+    # is no usable settle signal. Fixed 90s grace instead.
+    sleep 90
 }
 
-# deterministic prompt text from immutable blobs (no working-tree drift)
-mkprompt() {
-    local out=$1 bytes=$2
-    { git show e3546c794:ggml/src/ggml.c
-      git show e3546c794:ggml/src/ggml-cuda/ggml-cuda.cu
-      git show e3546c794:ggml/src/ggml-cpu/ggml-cpu.c
-    } | head -c $bytes > $out
-}
+log "== matrix resume start (build $(git rev-parse --short HEAD)) =="
 
-log "== bench matrix $TAG start (build $(git rev-parse --short HEAD)) =="
-
-# ---- llama-bench legs: pp2048 and tg128 at 5 depths --------------------
-for d in 0 16384 32768 65536 131072; do
+for d in 131072; do
     for mode in pp tg; do
         if [[ $mode == pp ]]; then args=(-p 2048 -n 0); else args=(-p 0 -n 128); fi
-        # new-default profile (2026-07-16): MXFP4 lid container (auto-engages
-        # fp4-mma); POWER=85 on deep legs per the lockup rule — note raw t/s,
-        # duty-normalize (/0.85) when comparing to pre-governor records
-        envs=(LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_LID_CACHE_MXFP4=1)
-        (( d >= 65536 )) && envs+=(GGML_CUDA_POWER=85 GGML_CUDA_POWER_DEBUG=1)
+        envs=(LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_LID_CACHE_MXFP4=1 GGML_CUDA_POWER=75 GGML_CUDA_POWER_DEBUG=1)
         cooldown
-        log "== bench $mode d$d =="
+        log "== bench $mode d$d (POWER=75) =="
         $SNAP pre-$mode-d$d >> $RUN/clocks.log
         env $envs $BIN/llama-bench -m $MODEL -fa on -ub 2048 -b 2048 -mmp 0 -r 3 \
             $args -d $d > $RUN/bench-$mode-d$d.log 2>&1
@@ -62,8 +48,13 @@ for d in 0 16384 32768 65536 131072; do
     done
 done
 
-# ---- completion tg legs: {base, mtp} x 4 prompt depths ------------------
-# bytes ~ 3.1 chars/token for source text
+mkprompt() {
+    local out=$1 bytes=$2
+    { git show e3546c794:ggml/src/ggml.c
+      git show e3546c794:ggml/src/ggml-cuda/ggml-cuda.cu
+      git show e3546c794:ggml/src/ggml-cpu/ggml-cpu.c
+    } | head -c $bytes > $out
+}
 typeset -A PB CTX
 PB=(short 4000 32k 101000 65k 203000 131k 406000)
 CTX=(short 4096 32k 36864 65k 69632 131k 139264)
@@ -73,7 +64,8 @@ for depth in short 32k 65k 131k; do
         extra=()
         [[ $arm == mtp ]] && extra=(-md $DRAFT --spec-type draft-mtp)
         envs=(LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_LID_CACHE_MXFP4=1)
-        [[ $depth == 65k || $depth == 131k ]] && envs+=(GGML_CUDA_POWER=85 GGML_CUDA_POWER_DEBUG=1)
+        [[ $depth == 65k ]] && envs+=(GGML_CUDA_POWER=85 GGML_CUDA_POWER_DEBUG=1)
+        [[ $depth == 131k ]] && envs+=(GGML_CUDA_POWER=75 GGML_CUDA_POWER_DEBUG=1)
         cooldown
         log "== completion $arm $depth (ctx ${CTX[$depth]}) =="
         $SNAP pre-$arm-$depth >> $RUN/clocks.log
@@ -86,5 +78,4 @@ for depth in short 32k 65k 131k; do
         log "$arm@$depth: ${eval_line:-FAIL}"
     done
 done
-
-log "== DONE =="
+log "== RESUME DONE =="

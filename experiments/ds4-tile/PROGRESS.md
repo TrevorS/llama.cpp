@@ -1951,3 +1951,25 @@ can never starve the tax (v1 was proven exact on our graphs but the
 failure mode existed). Re-stamp d0: 438.23 @85 (duty 85.0%,
 residual-debt 0, ring never full). Telemetry line now includes
 residual debt + ring-full count.
+
+## Iteration 42 — wedges #9-#11: fp4-mma burst draw convicted, depth gate landed
+
+Three hard lockups in one day (matrix pp@d131k @85; resume fresh-boot
+@75; wedge-hunt leg2 @75) — all fp4-mma-at-d131k via the new default,
+all with the ring/debt governor accounting PERFECT to the last
+flushed telemetry line (DEBUG=2, per-16-computes, fflush — the
+wedge-proof instrument). Discrimination: leg1 (identical config,
+FP4_MMA=0) completed cleanly at 230.05 t/s with exact 75% duty.
+Mechanism measured WITHOUT further crashes: watchdog-guarded 30s
+op-level bursts at the d131k shape — int8 74.7W mean / 83.0W peak
+vs fp4-mma 76.8W / 98.3W peak (+15W burst). The firmware power-cap
+latch is BURST-sensitive; duty cycling shapes only the average.
+Explains everything: int8 83W ceiling survivable (10/11 at d131k),
+fp4-mma short-burst at 65k safe (dozens of runs), fp4-mma sustained
+98W bursts at 131k+ lethal (1/4).
+
+Fix: LLAMA_DSV4_LID_FP4_MMA_MAX_NLID depth gate (default 24576 —
+clears every 65k-class shape, blocks 131k+; int8 fallback above).
+Also learned: the cumulative SW-power-cap counter advances at IDLE
+(parked clocks count as capping) — there is NO known observable
+that predicts the latch; prevention is the only strategy.
