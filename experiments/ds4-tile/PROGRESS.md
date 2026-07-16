@@ -1818,3 +1818,34 @@ fp4-mma puts the indexer multiply on the OFFICIAL e2m1 grid — faster
 AND more canonical than the int8 default. Pending: on-model serving
 A/B (both arms CACHE_MXFP4=1), PPL/coherence, then default-flip
 decision for the 512k serving profile.
+
+## Iteration 39 — GGML_CUDA_POWER duty-cycle governor (pattern-#8 counter)
+
+Context: 5th box lockup 2026-07-15 20:37 (journal-stop, mem flat, no
+OOM/kill/Xid — pattern #8) under interactive llama-server load. Root
+class: sustained draw engages firmware SW Power Cap which never
+clears. Studied competing fork Entrpi/ds4 (whose "2x prefill" is
+llama.cpp's own MMQ stack vendored back — 11k LOC verbatim); the
+stealable idea was upstream antirez/ds4 --power N (ds4.c:10583): EWMA
+work time per unit, host-sleep work*(100-N)/N -> duty cycle N%. Their
+Spark data: 85% FASTER than 100% sustained (18.99 vs 17.52 t/s)
+because the firmware throttle never engages.
+
+Our version (ggml-cuda.cu, env-gated, default off, all binaries):
+- GGML_CUDA_POWER=N: cudaEvent pair around each graph_compute;
+  elapsed consumed at the NEXT compute (already drained by caller's
+  output sync — zero added syncs); sleep min(work*(100-N)/N, 5s)
+  before submit; <0.05ms skipped.
+- GGML_CUDA_POWER_ADAPT=1 (+_MIN, default 60): dlopen libnvidia-ml
+  poller (500ms) on ClocksEventReasons; distress mask 0xE4 (SwPowerCap
+  | Sw/HwThermal | HwPowerBrake); engage -> floor duty, restore after
+  10s clear. Better than ds4's open-loop: pays the tax only in
+  distress. NVML init verified clean on GB10.
+
+Gates (2026-07-15): default-off parity pp2048@d0 520.58 +/- 1.60 (vs
+523 standing, in-noise); duty accuracy POWER=85 -> 444.69 = 0.854x
+(85 requested). PENDING (attended boot): the killer repro — two
+consecutive pp2048@d131072 same boot with POWER=85 or ADAPT=1;
+survival = the fix. Also pending: adapt engage-path exercise under a
+real cap event; whether 85 beats 100 on SUSTAINED deep legs here like
+it did for antirez.

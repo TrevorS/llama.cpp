@@ -35,6 +35,20 @@ Last audit: 2026-07-14 (commit 210a22df3 era).
 | `LLAMA_DSV4_LID_CACHE_MXFP4` | OFF (`=1` enables) | lid cache stored as packed MXFP4 (68 B/row vs 256 B f16, 3.76×); writes via `GGML_OP_DSV4_QAT_SET_ROWS` (QAT rounding in the scatter); decode reads 68 B rows directly, prefill stages to f16 (bit-exact) | f16/f32 lid cache per `-ctk` | P3b. Rows are QAT by construction → subsumes QAT_WRITE for the container. Forces fused lid at decode. State ver 2. Price: pp −2~3.6%, tg neutral @d131k. Add to 512k serving profile (memory-bound); stays opt-in as default. Gates: op suite zero-tolerance (incl EXACT), coherence/determinism, prompt-cache round-trip, perf legs iter 26. |
 | `LLAMA_DSV4_MOE_TILE` | OFF | MoE expert-tile bridge kernels in the graph | standard MoE path | NEGATIVE RESULT (tile bridge regresses; hc-batch memory). Leave OFF. |
 
+## Power / box-protection (ggml-cuda, 2026-07-15)
+
+Duty-cycle governor targeting the GB10 pattern-#8 hard lockup (sustained deep prefill
+engages firmware SW Power Cap which never clears → wedge). Idea from antirez/ds4
+`--power N` (85% measured faster than 100% there under sustained load). Work intervals
+measured with cudaEvent pairs per graph compute; compensating host sleep before the
+next submit — no added syncs. Applies to every binary (bench/server/cli/tests).
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `GGML_CUDA_POWER` | unset (=100, off) | fixed duty cycle N% in [1,99]: sleep `work×(100−N)/N` between graph computes | throttles avg board power to ~N% of sustained; sleeps <0.05 ms skipped, capped 5 s |
+| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML reports SwPowerCap/thermal-slowdown/power-brake, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear transitions |
+| `GGML_CUDA_POWER_MIN` | 60 | adaptive floor duty % | only read with ADAPT=1 |
+
 ## Speculative decoding / MTP (server + common)
 
 | Flag | Default | Effect | Notes |

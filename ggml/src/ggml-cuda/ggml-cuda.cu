@@ -88,7 +88,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
+
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -4013,10 +4019,197 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// ==================== duty-cycle power throttle (GGML_CUDA_POWER) ====================
+// Idles the GPU between graph computes so sustained board power stays below the
+// platform firmware's power cap. On GB10 (DGX Spark) sustained deep-context prefill
+// engages the firmware "SW Power Cap" state, which can fail to clear and hard-wedge
+// the box; a duty cycle below 100% keeps it from engaging at all (same idea as
+// antirez/ds4 --power N, where 85% measured faster than 100% under sustained load).
+//
+//   GGML_CUDA_POWER=N        fixed duty cycle, N in [1,99] = percent GPU-busy
+//   GGML_CUDA_POWER_ADAPT=1  closed loop: full speed until NVML reports a
+//                            power/thermal throttle reason, then drop to
+//                            GGML_CUDA_POWER_MIN (default 60) until the reason
+//                            has stayed clear for 10s (Linux only, dlopen NVML)
+//
+// Work intervals are measured with a cudaEvent pair around each graph compute; the
+// compensating sleep happens before the NEXT submit, when the previous compute has
+// already been drained by the caller's own output sync — no synchronization is added.
+
+struct ggml_cuda_power_dev {
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_stop  = nullptr;
+    bool started = false; // start event recorded, stop not yet
+    bool pending = false; // event pair recorded, elapsed not yet consumed
+};
+
+struct ggml_cuda_power_state {
+    bool enabled  = false;
+    bool adapt    = false;
+    int  base_pct = 100;
+    int  min_pct  = 60;
+    std::atomic<int>  cur_pct{100};
+    std::atomic<bool> stop_poller{false};
+    std::thread poller;
+    ggml_cuda_power_dev dev[GGML_CUDA_MAX_DEVICES];
+
+    ~ggml_cuda_power_state() {
+        if (poller.joinable()) {
+            stop_poller.store(true, std::memory_order_relaxed);
+            poller.join();
+        }
+    }
+};
+
+#ifdef __linux__
+static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
+    typedef int (*nvml_init_t)(void);
+    typedef int (*nvml_handle_t)(unsigned int, void **);
+    typedef int (*nvml_reasons_t)(void *, unsigned long long *);
+
+    void * lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) {
+        lib = dlopen("libnvidia-ml.so", RTLD_NOW);
+    }
+    if (lib == nullptr) {
+        GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT: libnvidia-ml not found, adaptive governor disabled\n");
+        return;
+    }
+    nvml_init_t    p_init    = (nvml_init_t)    dlsym(lib, "nvmlInit_v2");
+    nvml_handle_t  p_handle  = (nvml_handle_t)  dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
+    nvml_reasons_t p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksEventReasons");
+    if (p_reasons == nullptr) {
+        p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksThrottleReasons");
+    }
+    void * handle = nullptr;
+    if (p_init == nullptr || p_handle == nullptr || p_reasons == nullptr ||
+        p_init() != 0 || p_handle(0, &handle) != 0) {
+        GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT: NVML init failed, adaptive governor disabled\n");
+        return;
+    }
+
+    // distress = SwPowerCap (0x4) | SwThermalSlowdown (0x20) | HwThermalSlowdown (0x40) |
+    //            HwPowerBrakeSlowdown (0x80); GpuIdle/ApplicationsClocks excluded on purpose
+    const unsigned long long distress = 0xE4ull;
+    const auto poll_period  = std::chrono::milliseconds(500);
+    const auto clear_period = std::chrono::seconds(10);
+
+    bool engaged = false;
+    auto last_set = std::chrono::steady_clock::now();
+
+    while (!ps->stop_poller.load(std::memory_order_relaxed)) {
+        unsigned long long reasons = 0;
+        if (p_reasons(handle, &reasons) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (reasons & distress) {
+                last_set = now;
+                if (!engaged) {
+                    engaged = true;
+                    ps->cur_pct.store(ps->min_pct, std::memory_order_relaxed);
+                    GGML_LOG_WARN("ggml_cuda: power throttle reason engaged (0x%llx) -> duty %d%%\n",
+                                  reasons & distress, ps->min_pct);
+                }
+            } else if (engaged && now - last_set > clear_period) {
+                engaged = false;
+                ps->cur_pct.store(ps->base_pct, std::memory_order_relaxed);
+                GGML_LOG_WARN("ggml_cuda: power throttle reason cleared -> duty %d%%\n", ps->base_pct);
+            }
+        }
+        std::this_thread::sleep_for(poll_period);
+    }
+}
+#endif // __linux__
+
+static ggml_cuda_power_state & ggml_cuda_power(void) {
+    static ggml_cuda_power_state ps;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const char * env = getenv("GGML_CUDA_POWER");
+        if (env != nullptr) {
+            const int v = atoi(env);
+            if (v >= 1 && v <= 100) {
+                ps.base_pct = v;
+            }
+        }
+        const char * env_min = getenv("GGML_CUDA_POWER_MIN");
+        if (env_min != nullptr) {
+            const int v = atoi(env_min);
+            if (v >= 1 && v <= 99) {
+                ps.min_pct = v;
+            }
+        }
+        const char * env_adapt = getenv("GGML_CUDA_POWER_ADAPT");
+        ps.adapt   = env_adapt != nullptr && env_adapt[0] == '1';
+        ps.enabled = ps.base_pct < 100 || ps.adapt;
+        if (!ps.enabled) {
+            return;
+        }
+        ps.cur_pct.store(ps.base_pct, std::memory_order_relaxed);
+        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%%\n",
+                      ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct);
+#ifdef __linux__
+        if (ps.adapt) {
+            ps.poller = std::thread(ggml_cuda_power_poller, &ps);
+        }
+#else
+        if (ps.adapt) {
+            GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT is Linux-only, ignored\n");
+        }
+#endif
+    });
+    return ps;
+}
+
+static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    if (d.ev_start == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&d.ev_start));
+        CUDA_CHECK(cudaEventCreate(&d.ev_stop));
+    }
+    if (d.pending) {
+        if (cudaEventQuery(d.ev_stop) == cudaSuccess) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, d.ev_start, d.ev_stop) == cudaSuccess && ms > 0.05f) {
+                const int pct = ps.cur_pct.load(std::memory_order_relaxed);
+                if (pct >= 1 && pct <= 99) {
+                    const double sleep_ms = std::min((double) ms * (100 - pct) / pct, 5000.0);
+                    std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(sleep_ms * 1000.0)));
+                }
+            }
+            d.pending = false;
+        } else {
+            (void) cudaGetLastError(); // clear cudaErrorNotReady
+        }
+    }
+    if (!d.pending && !d.started) {
+        CUDA_CHECK(cudaEventRecord(d.ev_start, cuda_ctx->stream()));
+        d.started = true;
+    }
+}
+
+static void ggml_cuda_power_post_compute(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    if (d.started) {
+        CUDA_CHECK(cudaEventRecord(d.ev_stop, cuda_ctx->stream()));
+        d.started = false;
+        d.pending = true;
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_power_pre_compute(cuda_ctx);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4068,6 +4261,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_power_post_compute(cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }
