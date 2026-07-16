@@ -1844,8 +1844,25 @@ Our version (ggml-cuda.cu, env-gated, default off, all binaries):
 
 Gates (2026-07-15): default-off parity pp2048@d0 520.58 +/- 1.60 (vs
 523 standing, in-noise); duty accuracy POWER=85 -> 444.69 = 0.854x
-(85 requested). PENDING (attended boot): the killer repro — two
-consecutive pp2048@d131072 same boot with POWER=85 or ADAPT=1;
-survival = the fix. Also pending: adapt engage-path exercise under a
-real cap event; whether 85 beats 100 on SUSTAINED deep legs here like
-it did for antirez.
+(85 requested).
+
+SURVIVAL TEST PASSED (2026-07-15 21:28-21:46, attended): two
+consecutive pp2048@d131072 same boot with POWER=85 — leg 1 262.16,
+leg 2 264.04, both exit 0. Leg 2 is the leg that wedged the box 3/3
+times before (plus 2 more wedges in other forms); first-ever double
+completion. No degradation leg-to-leg (leg 2 slightly faster). Cost:
+264 vs 301-303 full-power single-shot = 0.87x ~= the duty tax.
+Mechanism confirmed by boundary clocksnaps
+(experiments/profiles/power-survival/): firmware cumulative slowdown
+counters DID advance during the legs (SW thermal 2.1s->15.2s, HW
+thermal 0.5s->4.1s across leg 2) — transient throttling happened but
+never latched; the per-graph idle gaps give the power subsystem
+recovery air. n=1 survival vs 3/3 prior repro — treat as strong but
+keep POWER=85 mandatory on deep legs until more runs accumulate.
+
+Telemetry finding + fix: "SW Power Cap: Active" reads at IDLE on
+GB10 (normal power mgmt, 208MHz parked; clears under healthy load).
+The v1 adapt mask (0xE4) would false-engage whenever the GPU idled.
+Fixed: hard bits (0xE0 thermal/power-brake) unconditional; SwPowerCap
+(0x4) counts only when nvmlDeviceGetUtilizationRates reports gpu>=50%
+— capped-while-working is distress, capped-while-idle is sleep.

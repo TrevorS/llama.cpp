@@ -45,8 +45,8 @@ next submit — no added syncs. Applies to every binary (bench/server/cli/tests)
 
 | Flag | Default | Effect | Notes |
 | --- | --- | --- | --- |
-| `GGML_CUDA_POWER` | unset (=100, off) | fixed duty cycle N% in [1,99]: sleep `work×(100−N)/N` between graph computes | throttles avg board power to ~N% of sustained; sleeps <0.05 ms skipped, capped 5 s |
-| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML reports SwPowerCap/thermal-slowdown/power-brake, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear transitions |
+| `GGML_CUDA_POWER` | unset (=100, off) | fixed duty cycle N% in [1,99]: sleep `work×(100−N)/N` between graph computes | throttles avg board power to ~N% of sustained; sleeps <0.05 ms skipped, capped 5 s. **SURVIVAL STAMPED 2026-07-15: POWER=85 completed 2× consecutive pp2048@d131072 (262/264 t/s) — the sequence that wedged the box 3/3 times at 100%. MANDATORY on deep legs.** |
+| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML distress, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear. Distress = thermal-slowdown/power-brake bits always; SwPowerCap only with GPU util ≥50% (bit is benign at idle on GB10 — parked clocks set it) |
 | `GGML_CUDA_POWER_MIN` | 60 | adaptive floor duty % | only read with ADAPT=1 |
 
 ## Speculative decoding / MTP (server + common)

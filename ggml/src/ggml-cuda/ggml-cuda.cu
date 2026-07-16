@@ -4066,6 +4066,8 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
     typedef int (*nvml_init_t)(void);
     typedef int (*nvml_handle_t)(unsigned int, void **);
     typedef int (*nvml_reasons_t)(void *, unsigned long long *);
+    struct nvml_utilization { unsigned int gpu; unsigned int memory; };
+    typedef int (*nvml_util_t)(void *, nvml_utilization *);
 
     void * lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
     if (lib == nullptr) {
@@ -4081,6 +4083,7 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
     if (p_reasons == nullptr) {
         p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksThrottleReasons");
     }
+    nvml_util_t p_util = (nvml_util_t) dlsym(lib, "nvmlDeviceGetUtilizationRates");
     void * handle = nullptr;
     if (p_init == nullptr || p_handle == nullptr || p_reasons == nullptr ||
         p_init() != 0 || p_handle(0, &handle) != 0) {
@@ -4088,9 +4091,13 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
         return;
     }
 
-    // distress = SwPowerCap (0x4) | SwThermalSlowdown (0x20) | HwThermalSlowdown (0x40) |
-    //            HwPowerBrakeSlowdown (0x80); GpuIdle/ApplicationsClocks excluded on purpose
-    const unsigned long long distress = 0xE4ull;
+    // Hard distress bits count unconditionally: SwThermalSlowdown (0x20) |
+    // HwThermalSlowdown (0x40) | HwPowerBrakeSlowdown (0x80).
+    // SwPowerCap (0x4) is benign at idle on GB10 (normal power management parks clocks at
+    // 208 MHz with the bit set; it clears under healthy load — measured 2026-07-15), so it
+    // only counts as distress while GPU utilization is simultaneously high.
+    const unsigned long long distress_hard = 0xE0ull;
+    const unsigned long long sw_power_cap  = 0x04ull;
     const auto poll_period  = std::chrono::milliseconds(500);
     const auto clear_period = std::chrono::seconds(10);
 
@@ -4100,14 +4107,21 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
     while (!ps->stop_poller.load(std::memory_order_relaxed)) {
         unsigned long long reasons = 0;
         if (p_reasons(handle, &reasons) == 0) {
+            bool distress = (reasons & distress_hard) != 0;
+            if (!distress && (reasons & sw_power_cap) != 0 && p_util != nullptr) {
+                nvml_utilization util = {0, 0};
+                if (p_util(handle, &util) == 0 && util.gpu >= 50) {
+                    distress = true; // capped while working, not capped while idle
+                }
+            }
             const auto now = std::chrono::steady_clock::now();
-            if (reasons & distress) {
+            if (distress) {
                 last_set = now;
                 if (!engaged) {
                     engaged = true;
                     ps->cur_pct.store(ps->min_pct, std::memory_order_relaxed);
                     GGML_LOG_WARN("ggml_cuda: power throttle reason engaged (0x%llx) -> duty %d%%\n",
-                                  reasons & distress, ps->min_pct);
+                                  reasons, ps->min_pct);
                 }
             } else if (engaged && now - last_set > clear_period) {
                 engaged = false;
