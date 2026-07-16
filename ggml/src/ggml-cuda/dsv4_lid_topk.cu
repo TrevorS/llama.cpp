@@ -912,38 +912,52 @@ void ggml_cuda_op_dsv4_qat_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor
 // ea = exp(lse_a - max(lse_a, lse_b)). srcs [DV, H, Q, S+1] with LSE tail at
 // element offset DV*H*Q*S, tail idx == row idx; dst [DV, H, Q, S].
 static __global__ void dsv4_fa_merge_kernel(
-        const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst,
-        const int DV, const int64_t n_rows) {
+        const float * __restrict__ a, const float * __restrict__ b, const float * __restrict__ c,
+        float * __restrict__ dst, const int DV, const int64_t n_rows) {
     const int64_t r = blockIdx.x;
 
     const float la = a[DV*n_rows + r];
     const float lb = b[DV*n_rows + r];
-    const float m  = fmaxf(la, lb);
+    const float lc = c ? c[DV*n_rows + r] : -INFINITY;
+    const float m  = fmaxf(fmaxf(la, lb), lc);
 
     float wa = 0.0f;
     float wb = 0.0f;
-    if (m != -INFINITY) { // else both halves fully masked -> zeros
+    float wc = 0.0f;
+    if (m != -INFINITY) { // else all parts fully masked -> zeros
         const float ea = expf(la - m);
         const float eb = expf(lb - m);
-        wa = ea / (ea + eb);
-        wb = eb / (ea + eb);
+        const float ec = c ? expf(lc - m) : 0.0f;
+        const float es = ea + eb + ec;
+        wa = ea / es;
+        wb = eb / es;
+        wc = ec / es;
     }
 
     const float * ar = a   + r*DV;
     const float * br = b   + r*DV;
+    const float * cr = c ? c + r*DV : nullptr;
     float       * dr = dst + r*DV;
 
+    // a part with lse == -inf (fully masked, weight exactly 0) may carry
+    // NaN/uninitialized values — skip it entirely, never multiply by 0
     for (int d = threadIdx.x; d < DV; d += blockDim.x) {
-        dr[d] = wa*ar[d] + wb*br[d];
+        float v = 0.0f;
+        if (wa != 0.0f) { v += wa*ar[d]; }
+        if (wb != 0.0f) { v += wb*br[d]; }
+        if (wc != 0.0f) { v += wc*cr[d]; }
+        dr[d] = v;
     }
 }
 
 void ggml_cuda_op_dsv4_fa_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * a = dst->src[0];
     const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * c = dst->src[2]; // optional third disjoint subset (merge3)
 
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+    GGML_ASSERT(c == nullptr || (c->type == GGML_TYPE_F32 && ggml_is_contiguous(c)));
 
     const int64_t DV     = dst->ne[0];
     const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
@@ -953,7 +967,8 @@ void ggml_cuda_op_dsv4_fa_merge(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const int n_threads = DV >= 256 ? 256 : 128;
     dsv4_fa_merge_kernel<<<n_rows, n_threads, 0, ctx.stream()>>>(
-            (const float *) a->data, (const float *) b->data, (float *) dst->data,
+            (const float *) a->data, (const float *) b->data,
+            c ? (const float *) c->data : nullptr, (float *) dst->data,
             (int) DV, n_rows);
 }
 

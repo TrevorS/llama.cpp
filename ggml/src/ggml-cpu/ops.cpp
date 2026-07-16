@@ -8899,40 +8899,55 @@ void ggml_compute_forward_dsv4_fa_merge(
         ggml_tensor * dst) {
     const ggml_tensor * a = dst->src[0];
     const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * c = dst->src[2]; // optional third disjoint subset (merge3)
 
     GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+    GGML_ASSERT(c == NULL || (c->type == GGML_TYPE_F32 && ggml_is_contiguous(c)));
 
     const int64_t DV     = dst->ne[0];
     const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3]; // H*Q*S
 
     const float * a_data = (const float *) a->data;
     const float * b_data = (const float *) b->data;
+    const float * c_data = c ? (const float *) c->data : NULL;
     const float * lse_a  = a_data + DV*n_rows;
     const float * lse_b  = b_data + DV*n_rows;
+    const float * lse_c  = c_data ? c_data + DV*n_rows : NULL;
     float       * d_data = (float *) dst->data;
 
     for (int64_t r = params->ith; r < n_rows; r += params->nth) {
         const float la = lse_a[r];
         const float lb = lse_b[r];
-        const float m  = MAX(la, lb);
+        const float lc = lse_c ? lse_c[r] : -INFINITY;
+        const float m  = MAX(MAX(la, lb), lc);
 
         const float * ar = a_data + r*DV;
         const float * br = b_data + r*DV;
+        const float * cr = c_data ? c_data + r*DV : NULL;
         float       * dr = d_data + r*DV;
 
-        if (m == -INFINITY) { // both halves fully masked
+        if (m == -INFINITY) { // all parts fully masked
             memset(dr, 0, DV*sizeof(float));
             continue;
         }
 
         const float ea  = expf(la - m);
         const float eb  = expf(lb - m);
-        const float wa  = ea / (ea + eb);
-        const float wb  = eb / (ea + eb);
+        const float ec  = lse_c ? expf(lc - m) : 0.0f;
+        const float es  = ea + eb + ec;
+        const float wa  = ea / es;
+        const float wb  = eb / es;
+        const float wc  = ec / es;
 
+        // a part with lse == -inf (fully masked, weight exactly 0) may carry
+        // NaN/uninitialized values — skip it entirely, never multiply by 0
         for (int64_t d = 0; d < DV; ++d) {
-            dr[d] = wa*ar[d] + wb*br[d];
+            float v = 0.0f;
+            if (wa != 0.0f) { v += wa*ar[d]; }
+            if (wb != 0.0f) { v += wb*br[d]; }
+            if (wc != 0.0f) { v += wc*cr[d]; }
+            dr[d] = v;
         }
     }
 }

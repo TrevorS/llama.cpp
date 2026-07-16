@@ -5684,6 +5684,24 @@ struct ggml_tensor * ggml_dsv4_fa_merge(
     return result;
 }
 
+struct ggml_tensor * ggml_dsv4_fa_merge3(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(c->ne[0] == a->ne[0]);
+    GGML_ASSERT(c->ne[3] >= 2);
+    GGML_ASSERT(c->ne[0] >= c->ne[3] - 1);
+    GGML_ASSERT(a->ne[1]*a->ne[2]*(a->ne[3] - 1) == c->ne[1]*c->ne[2]*(c->ne[3] - 1));
+
+    struct ggml_tensor * result = ggml_dsv4_fa_merge(ctx, a, b);
+    result->src[2] = c;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(

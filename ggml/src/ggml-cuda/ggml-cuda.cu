@@ -4041,6 +4041,12 @@ struct ggml_cuda_power_dev {
     cudaEvent_t ev_stop  = nullptr;
     bool started = false; // start event recorded, stop not yet
     bool pending = false; // event pair recorded, elapsed not yet consumed
+    // GGML_CUDA_POWER_DEBUG=1 telemetry
+    uint64_t n_pre     = 0; // pre-hook calls (graph computes)
+    uint64_t n_meas    = 0; // event pairs consumed (sleeps applied)
+    uint64_t n_busy    = 0; // pre-hooks where the pending pair was unresolved (no sleep)
+    double   meas_ms   = 0.0;
+    double   sleep_ms  = 0.0;
 };
 
 struct ggml_cuda_power_state {
@@ -4057,6 +4063,23 @@ struct ggml_cuda_power_state {
         if (poller.joinable()) {
             stop_poller.store(true, std::memory_order_relaxed);
             poller.join();
+        }
+        static const bool dbg = []() {
+            const char * e = getenv("GGML_CUDA_POWER_DEBUG");
+            return e && e[0] == '1';
+        }();
+        if (dbg) {
+            for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
+                if (dev[i].n_pre == 0) {
+                    continue;
+                }
+                const double duty = dev[i].meas_ms + dev[i].sleep_ms > 0.0
+                    ? dev[i].meas_ms / (dev[i].meas_ms + dev[i].sleep_ms) : 1.0;
+                fprintf(stderr, "[cuda-power] dev%d: computes=%llu measured=%llu busy-skips=%llu "
+                        "meas=%.0fms slept=%.0fms effective-duty=%.1f%%\n",
+                        i, (unsigned long long) dev[i].n_pre, (unsigned long long) dev[i].n_meas,
+                        (unsigned long long) dev[i].n_busy, dev[i].meas_ms, dev[i].sleep_ms, 100.0*duty);
+            }
         }
     }
 };
@@ -4180,6 +4203,7 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
         return;
     }
     ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    d.n_pre++;
     if (d.ev_start == nullptr) {
         CUDA_CHECK(cudaEventCreate(&d.ev_start));
         CUDA_CHECK(cudaEventCreate(&d.ev_stop));
@@ -4192,11 +4216,15 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
                 if (pct >= 1 && pct <= 99) {
                     const double sleep_ms = std::min((double) ms * (100 - pct) / pct, 5000.0);
                     std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(sleep_ms * 1000.0)));
+                    d.n_meas++;
+                    d.meas_ms  += ms;
+                    d.sleep_ms += sleep_ms;
                 }
             }
             d.pending = false;
         } else {
             (void) cudaGetLastError(); // clear cudaErrorNotReady
+            d.n_busy++;
         }
     }
     if (!d.pending && !d.started) {

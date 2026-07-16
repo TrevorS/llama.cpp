@@ -1877,3 +1877,57 @@ Boot totals: FOUR d131k prefills one boot, zero wedges, no
 throttle-counter latching (armB leg: SW thermal cum 19.7s->50.4s,
 transient only). fp4-mma default-flip now blocked ONLY on the
 PPL/coherence gate.
+
+## Iteration 40 — OVF exact-attended-set + bf16-KV parity + the 0xNaN hunt
+
+Two A-class exactness levers landed (from the class-A/B/C audit):
+
+1. LLAMA_DSV4_CSA_TILE_OVF (default OFF): removes CSA_TILE's last
+   asterisk — tiles whose 16-token union exceeds u_cap=4096 dropped
+   their HIGHEST-index (newest) cells silently (memb -inf; token
+   can't attend a cell the model selected; measured union max ~5200
+   @d131k). Now: union built at u_cap+N slots, main+overflow slices
+   (ascending emission keeps both sorted; ZERO union-kernel changes),
+   overflow rides a 3rd FA leg merged by new ggml_dsv4_fa_merge3
+   (same op, optional src[2]; CUDA+CPU). Membership computed ONCE
+   over the full array then sliced — per-slice memb would let the
+   n_csa-1 pad double-mark a cell already in main (double-count in
+   softmax). FA_SPLIT path only.
+
+2. LLAMA_DSV4_KV_BF16_RT (default OFF): official-parity instrument —
+   every persisted cache/state row rounded to the bf16 grid at write
+   (official transformers caches are bf16; ours f16=finer). 10 wrap
+   sites via double ggml_cast; zero new ops (CUDA has f32<->bf16 cpy).
+   PPL c4096 4.2278->4.2240. For logit-diff vs ../transformers.
+
+THE HUNT (a day of probing, worth recording): first OVF bench read
++16% (351 vs 302) — impossible for added work. Chased three wrong
+theories (fused-node duplicate, I32-cont CPU splits, governor
+starvation — the last plausible enough that we built
+GGML_CUDA_POWER_DEBUG counters to test it; governor ACQUITTED with
+receipts: 135/136 pairs measured, 0 skips, 85.0% duty on BOTH
+graphs). The llama-completion byte-identity gate convicted the real
+culprit: OVF output was degenerate ("<<<<<<") — an all-masked FA leg
+(empty overflow slice = the COMMON case) returns NaN values at
+LSE=-inf, and the merge's wc*cr[d] with wc=0 gave 0*NaN=NaN,
+poisoning every row. The +16% was collapsed garbage computing
+faster. Fix: merge skips zero-weight parts (CUDA+CPU) + a
+backend-ops regression case with NaN values/-inf LSE tail (old code
+NaN-fails it; random init could never catch this). The original
+2-way merge was never exposed (union rows always have >=1 live
+cell). Lesson stamped: any LSE-merge over possibly-empty subsets
+must skip, not scale.
+
+Also from the hunt: PPL-at-depth is impossible on this box —
+perplexity.cpp:514 reserves n_ctx*n_vocab f32 on HOST = 33.9 GB at
+c65536 (129280 vocab) -> exit 1 mid-fill with model resident. The
+identity/quality harness at depth is llama-completion (gates.sh
+passkey pattern), NOT llama-perplexity.
+
+Gates (2026-07-16): merge3 backend-ops 6/6 incl poison case;
+byte-identity @64k full-power C2==D2; UNION_STATS over=0/26880 at
+6144 slots @d65k; cost pp@d65k -2.1% full power (415.13->406.33) /
+-3.8% @POWER=85 (302.16->290.76). bf16: PPL gate + 10-site audit.
+PENDING (tier 3, optional): d131k overflow-ACTIVE passkey demo
+(positions 85/95 land in the drop victims; OVF may recover keys
+truncation loses).

@@ -5989,17 +5989,19 @@ struct test_dsv4_qat_set_rows : public test_case {
 struct test_dsv4_fa_merge : public test_case {
     const int64_t dv, nh, nq, ns;
     const int64_t wb, tb; // b-side tiling: b is [dv, nh, wb, tb+1] with nh*wb*tb == nh*nq*ns (0 = same shape as a)
+    const bool with_c;    // 3-way variant (overflow leg): c mirrors b's shape
 
     std::string vars() override {
         return "dv=" + std::to_string(dv) + ",nh=" + std::to_string(nh) +
                ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns) +
-               ",wb=" + std::to_string(wb) + ",tb=" + std::to_string(tb);
+               ",wb=" + std::to_string(wb) + ",tb=" + std::to_string(tb) +
+               ",with_c=" + std::to_string(with_c);
     }
 
     double max_nmse_err() override { return 1e-6; }
 
-    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0)
-        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb) {}
+    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0, bool with_c = false)
+        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb), with_c(with_c) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // srcs carry the LSE tail slice: [DV, H, Q, S+1]; uniform init doubles
@@ -6010,9 +6012,34 @@ struct test_dsv4_fa_merge : public test_case {
             ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, wb, tb + 1)
             : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
         ggml_set_name(b, "b");
-        ggml_tensor * out = ggml_dsv4_fa_merge(ctx, a, b);
+        ggml_tensor * out;
+        if (with_c) {
+            ggml_tensor * c = wb > 0
+                ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, wb, tb + 1)
+                : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+            ggml_set_name(c, "c");
+            out = ggml_dsv4_fa_merge3(ctx, a, b, c);
+        } else {
+            out = ggml_dsv4_fa_merge(ctx, a, b);
+        }
         ggml_set_name(out, "out");
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (with_c && strcmp(t->name, "c") == 0) {
+                // fully-masked part: NaN values with a -inf LSE tail — the
+                // merge must skip it entirely (0-weight x NaN must not leak)
+                std::vector<float> buf(ggml_nelements(t), std::numeric_limits<float>::quiet_NaN());
+                const int64_t rows = t->ne[1]*t->ne[2]*(t->ne[3] - 1);
+                for (int64_t r = 0; r < rows; r++) {
+                    buf[t->ne[0]*rows + r] = -INFINITY; // LSE tail
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(float));
+            }
+        }
     }
 };
 
@@ -9715,6 +9742,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mixed-shape halves (production: dense [DV,H,nt,1+1] vs tiled [DV,H,W,T+1]):
     test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128));
     test_cases.emplace_back(new test_dsv4_fa_merge(128, 8, 64, 1, 16, 4));
+    // 3-way merge (CSA-tile overflow leg)
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, true));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, true));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, true));
 
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row

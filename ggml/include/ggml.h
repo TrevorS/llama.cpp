@@ -2563,6 +2563,14 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // three-way variant over three disjoint KV subsets (same op, src[2] set);
+    // used by the CSA-tile overflow leg
+    GGML_API struct ggml_tensor * ggml_dsv4_fa_merge3(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

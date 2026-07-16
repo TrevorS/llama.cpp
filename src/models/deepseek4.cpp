@@ -234,6 +234,26 @@ static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggm
     return ggml_add(ctx, t, zero);
 }
 
+// LLAMA_DSV4_KV_BF16_RT=1: round every persisted KV-cache/state row to the
+// bf16 grid before storage. The official transformers build keeps all caches
+// in bf16; ours are f16 (finer). This is a parity/debug instrument for
+// logit-diff runs against the official build — it strictly discards
+// precision, never a serving default. f16 storage of bf16-grid values is
+// bit-exact for |x| < 65504 (bf16 has the coarser mantissa; only its extra
+// exponent range is unrepresentable, far above KV magnitudes). The lid cache
+// is deliberately NOT wrapped: with LID_QAT_WRITE/CACHE_MXFP4 it already
+// holds the official (stronger) e2m1 QAT numerics.
+static ggml_tensor * dsv4_bf16_rt(ggml_context * ctx, ggml_tensor * t) {
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_DSV4_KV_BF16_RT");
+        return e && e[0] == '1';
+    }();
+    if (!enabled) {
+        return t;
+    }
+    return ggml_cast(ctx, ggml_cast(ctx, t, GGML_TYPE_BF16), GGML_TYPE_F32);
+}
+
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
@@ -778,7 +798,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, dsv4_bf16_rt(ctx0, kv), inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "csa_raw_k", il);
@@ -831,6 +851,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const char * e = getenv("LLAMA_DSV4_CSA_TILE_MIN");
         return e ? atoll(e) : (long long) 12288;
     }();
+    static const int64_t dsv4_tile_ovf = []() {
+        // LLAMA_DSV4_CSA_TILE_OVF=N: overflow leg for an EXACT attended set —
+        // extend the union by N slots consumed by a third FA leg + 3-way LSE
+        // merge, so tiles whose true union exceeds u_cap no longer drop their
+        // highest-index (newest) cells. 0 = off (historical truncation).
+        // Measured union max ~5200 @W16 d65k-131k -> 2048 covers with
+        // headroom; u_cap+N >= W*top_k (8192) is the provable bound. Rounded
+        // up to a multiple of 256 (CUDA FA KV alignment). FA_SPLIT path only.
+        const char * e = getenv("LLAMA_DSV4_CSA_TILE_OVF");
+        long long v = e ? atoll(e) : 0;
+        if (v > 0) {
+            v = ((v + 255)/256)*256;
+        }
+        return v;
+    }();
+    static const bool dsv4_fa_split = []() {
+        const char * e = getenv("LLAMA_DSV4_FA_SPLIT");
+        return !e || e[0] != '0';
+    }();
     ggml_tensor * k_all     = nullptr;
     ggml_tensor * kq_mask   = nullptr;
     ggml_tensor * split_out = nullptr; // set by the split-attention path (bypasses build_attn_mha)
@@ -843,8 +882,39 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const int64_t T_t   = nt_s / W_t;
         const int64_t u_cap = dsv4_tile_ucap;
 
-        ggml_tensor * uni = ggml_dsv4_lid_union(ctx0, top_k, n_csa, u_cap, W_t); // [u_cap,T,1,1]
-        cb(uni, "csa_union_idx", il);
+        // overflow leg only on the split path (it rides a third FA + merge3)
+        const bool    use_split = dsv4_fa_split && cparams.flash_attn && T_t <= raw_k->ne[0];
+        const int64_t u_ovf     = (use_split && dsv4_tile_ovf > 0 && u_cap + dsv4_tile_ovf < n_csa)
+                                  ? dsv4_tile_ovf : 0;
+
+        ggml_tensor * uni     = nullptr; // [u_cap,T,1,1] main union
+        ggml_tensor * memb    = nullptr; // [u_cap,nt_s]  main membership
+        ggml_tensor * uni_ovf  = nullptr;
+        ggml_tensor * memb_ovf = nullptr;
+        if (u_ovf > 0) {
+            // one union over u_cap+u_ovf slots (globally ascending, so both
+            // slices stay sorted), one membership over the FULL array so each
+            // selected cell is marked exactly once at its first occurrence —
+            // pad slots (n_csa-1 repeats) can never double-mark a cell that
+            // already sits in the main slice.
+            const int64_t u_tot = u_cap + u_ovf;
+            ggml_tensor * uni_all = ggml_dsv4_lid_union(ctx0, top_k, n_csa, u_tot, W_t); // [u_tot,T,1,1]
+            cb(uni_all, "csa_union_idx", il);
+            ggml_tensor * memb_all = ggml_dsv4_lid_memb(ctx0, top_k, uni_all, n_csa);    // [u_tot,nt_s]
+
+            uni = ggml_cont(ctx0, ggml_view_4d(ctx0, uni_all, u_cap, T_t, 1, 1,
+                    uni_all->nb[1], uni_all->nb[2], uni_all->nb[3], 0));
+            uni_ovf = ggml_cont(ctx0, ggml_view_4d(ctx0, uni_all, u_ovf, T_t, 1, 1,
+                    uni_all->nb[1], uni_all->nb[2], uni_all->nb[3], u_cap*ggml_element_size(uni_all)));
+            memb = ggml_cont(ctx0, ggml_view_4d(ctx0, memb_all, u_cap, nt_s, 1, 1,
+                    memb_all->nb[1], memb_all->nb[2], memb_all->nb[3], 0));
+            memb_ovf = ggml_cont(ctx0, ggml_view_4d(ctx0, memb_all, u_ovf, nt_s, 1, 1,
+                    memb_all->nb[1], memb_all->nb[2], memb_all->nb[3], u_cap*ggml_element_size(memb_all)));
+        } else {
+            uni = ggml_dsv4_lid_union(ctx0, top_k, n_csa, u_cap, W_t); // [u_cap,T,1,1]
+            cb(uni, "csa_union_idx", il);
+            memb = ggml_dsv4_lid_memb(ctx0, top_k, uni, n_csa); // [u_cap,nt_s,1,1] f32
+        }
 
         // gather all per-tile unions with flat ids into the shared CSA cache
         ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
@@ -858,11 +928,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, u_cap, T_t);
         cb(gathered, "csa_tile_k", il);
 
-        ggml_tensor * memb = ggml_dsv4_lid_memb(ctx0, top_k, uni, n_csa); // [u_cap,nt_s,1,1] f32
         if (memb->type != raw_mask->type) {
             memb = ggml_cast(ctx0, memb, raw_mask->type);
         }
         memb = ggml_reshape_4d(ctx0, memb, u_cap, W_t, 1, T_t);
+
+        ggml_tensor * gathered_ovf = nullptr;
+        if (u_ovf > 0) {
+            ggml_tensor * oidx = ggml_reshape_4d(ctx0, uni_ovf, u_ovf*T_t, 1, 1, 1);
+            gathered_ovf = ggml_get_rows(ctx0, csa_src, oidx); // [hd, u_ovf*T, 1, 1]
+            if (gathered_ovf->type != raw_k->type) {
+                gathered_ovf = ggml_cast(ctx0, gathered_ovf, raw_k->type);
+            }
+            gathered_ovf = ggml_reshape_4d(ctx0, gathered_ovf, csa_k->ne[0], 1, u_ovf, T_t);
+            cb(gathered_ovf, "csa_tile_k_ovf", il);
+
+            if (memb_ovf->type != raw_mask->type) {
+                memb_ovf = ggml_cast(ctx0, memb_ovf, raw_mask->type);
+            }
+            memb_ovf = ggml_reshape_4d(ctx0, memb_ovf, u_ovf, W_t, 1, T_t);
+        }
 
         // Split-attention + LSE merge (LLAMA_DSV4_FA_SPLIT, default ON): the
         // raw window is shared by all tiles, so instead of physically
@@ -873,11 +958,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         // the concat path (softmax over the disjoint KV union); the attention
         // sink lives in the raw half's LSE. T <= hd keeps the LSE tail slice
         // within the FA result (constructor constraint DV >= ne3).
-        static const bool dsv4_fa_split = []() {
-            const char * e = getenv("LLAMA_DSV4_FA_SPLIT");
-            return !e || e[0] != '0';
-        }();
-        if (dsv4_fa_split && cparams.flash_attn && T_t <= raw_k->ne[0]) {
+        if (use_split) {
             // dense raw half: all queries vs the shared raw window, ne3 = 1
             ggml_tensor * q_full = ggml_permute(ctx0, q, 0, 2, 1, 3);     // [hd, nt_s, n_head, 1]
             ggml_tensor * k_raw  = ggml_permute(ctx0, raw_k, 0, 2, 1, 3); // [hd, n_raw, 1, 1]
@@ -902,9 +983,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             ggml_flash_attn_ext_set_prec(fa_uni, GGML_PREC_F32);
             cb(fa_uni, "csa_fa_uni", il);
 
+            // overflow leg: same queries vs the union's overflow slice.
+            // non-overflowing tiles carry pure padding there (all-masked rows
+            // -> LSE = -inf), which the 3-way merge weights to exactly zero.
+            ggml_tensor * fa_ovf = nullptr;
+            if (u_ovf > 0) {
+                ggml_tensor * k_ovf = ggml_permute(ctx0, gathered_ovf, 0, 2, 1, 3); // [hd, u_ovf, 1, T]
+                ggml_tensor * v_ovf = ggml_permute(ctx0, gathered_ovf, 0, 2, 1, 3);
+                fa_ovf = ggml_flash_attn_ext_with_lse(ctx0, q_tiles, k_ovf, v_ovf,
+                        memb_ovf, kq_scale, 0.0f, 0.0f);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa_ovf, il});
+                ggml_flash_attn_ext_set_prec(fa_ovf, GGML_PREC_F32);
+                cb(fa_ovf, "csa_fa_ovf", il);
+            }
+
             // rows align between the halves (g = t*W + iq): [hd,n_head,nt_s,1+1]
             // and [hd,n_head,W,T+1] share the same row order and tail offset
-            ggml_tensor * merged = ggml_dsv4_fa_merge(ctx0, fa_raw, fa_uni); // [hd, n_head, nt_s, 1]
+            ggml_tensor * merged = fa_ovf
+                ? ggml_dsv4_fa_merge3(ctx0, fa_raw, fa_uni, fa_ovf)
+                : ggml_dsv4_fa_merge (ctx0, fa_raw, fa_uni); // [hd, n_head, nt_s, 1]
             cb(merged, "csa_fa_merge", il);
 
             split_out = ggml_reshape_2d(ctx0, merged, merged->ne[0]*merged->ne[1], merged->ne[2]*merged->ne[3]);
@@ -988,7 +1085,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
 
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, dsv4_bf16_rt(ctx0, kv), inp_attn->get_k_idxs(), il));
 
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "hca_raw_k", il);
@@ -1048,7 +1145,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
         k_idxs = ggml_view_1d(ctx0, k_idxs, 1, (size_t) row * k_idxs->nb[0]);
     }
 
-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, dsv4_bf16_rt(ctx0, kv), k_idxs, il));
 
     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
     if (row >= 0) {
@@ -1199,7 +1296,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         }
 
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
-                    kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
+                    dsv4_bf16_rt(ctx0, kv_comp_csa_state), inp_dsv4->get_csa().state_write_idxs, il));
 
         csa_state_kv    = dsv4_with_zero_dep(ctx0, csa_state_kv,    kv_comp_csa_state);
         csa_state_score = dsv4_with_zero_dep(ctx0, csa_state_score, kv_comp_csa_state);
@@ -1208,9 +1305,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * csa_persist_score = ggml_get_rows(ctx0, csa_state_score, inp_dsv4->get_csa().state_persist_src_idxs);
 
         csa_state_kv = inp_dsv4->mctx->get_csa_state()->cpy_kv(ctx0,
-                csa_persist_kv, inp_dsv4->get_csa().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, csa_persist_kv), inp_dsv4->get_csa().state_persist_dst_idxs, il);
         csa_state_score = inp_dsv4->mctx->get_csa_state()->cpy_score(ctx0,
-                csa_persist_score, inp_dsv4->get_csa().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, csa_persist_score), inp_dsv4->get_csa().state_persist_dst_idxs, il);
 
         ggml_build_forward_expand(gf, csa_state_kv);
         ggml_build_forward_expand(gf, csa_state_score);
@@ -1285,9 +1382,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * lid_persist_score = ggml_get_rows(ctx0, lid_state_score, inp_dsv4->get_lid().state_persist_src_idxs);
 
         lid_state_kv = inp_dsv4->mctx->get_lid_state()->cpy_kv(ctx0,
-                lid_persist_kv, inp_dsv4->get_lid().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, lid_persist_kv), inp_dsv4->get_lid().state_persist_dst_idxs, il);
         lid_state_score = inp_dsv4->mctx->get_lid_state()->cpy_score(ctx0,
-                lid_persist_score, inp_dsv4->get_lid().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, lid_persist_score), inp_dsv4->get_lid().state_persist_dst_idxs, il);
 
         ggml_build_forward_expand(gf, lid_state_kv);
         ggml_build_forward_expand(gf, lid_state_score);
@@ -1319,7 +1416,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         }
 
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca()->cpy_k(ctx0,
-                    kv_comp_hca, inp_dsv4->get_hca().state_write_idxs, il));
+                    dsv4_bf16_rt(ctx0, kv_comp_hca), inp_dsv4->get_hca().state_write_idxs, il));
         hca_state_dep = kv_comp_hca;
     }
 
@@ -1334,9 +1431,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * hca_persist_score = ggml_get_rows(ctx0, hca_state_score, inp_dsv4->get_hca().state_persist_src_idxs);
 
         hca_state_kv = inp_dsv4->mctx->get_hca_state()->cpy_kv(ctx0,
-                hca_persist_kv, inp_dsv4->get_hca().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, hca_persist_kv), inp_dsv4->get_hca().state_persist_dst_idxs, il);
         hca_state_score = inp_dsv4->mctx->get_hca_state()->cpy_score(ctx0,
-                hca_persist_score, inp_dsv4->get_hca().state_persist_dst_idxs, il);
+                dsv4_bf16_rt(ctx0, hca_persist_score), inp_dsv4->get_hca().state_persist_dst_idxs, il);
 
         ggml_build_forward_expand(gf, hca_state_kv);
         ggml_build_forward_expand(gf, hca_state_score);
