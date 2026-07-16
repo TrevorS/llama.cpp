@@ -1866,3 +1866,14 @@ The v1 adapt mask (0xE4) would false-engage whenever the GPU idled.
 Fixed: hard bits (0xE0 thermal/power-brake) unconditional; SwPowerCap
 (0x4) counts only when nvmlDeviceGetUtilizationRates reports gpu>=50%
 — capped-while-working is distress, capped-while-idle is sleep.
+
+DIVIDEND — fp4-mma d131k A/B UNBLOCKED AND RUN same boot (the leg
+that was uncrunnable for days): both arms CACHE_MXFP4=1 + POWER=85,
+pp2048@d131072: int8 263.07 vs FP4_MMA=1 285.57 = +8.6%. With d65k
++4.7% (357.4->374.3), the register-resident-K advantage GROWS with
+depth (score kernel share rises with n_lid). Duty-normalized 100%
+equivalent ~328 vs the 303 standing record (est., not measured).
+Boot totals: FOUR d131k prefills one boot, zero wedges, no
+throttle-counter latching (armB leg: SW thermal cum 19.7s->50.4s,
+transient only). fp4-mma default-flip now blocked ONLY on the
+PPL/coherence gate.
