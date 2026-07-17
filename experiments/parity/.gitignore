@@ -1,0 +1,9 @@
+# generated artifacts — never commit (dumps are ~2.5GB each)
+*.kld
+*.log
+*.out
+*.report
+corpus.txt
+meta.json
+.tok.tmp
+api/
