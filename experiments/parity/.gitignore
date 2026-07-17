@@ -3,7 +3,8 @@
 *.log
 *.out
 *.report
-corpus.txt
-meta.json
+corpus*.txt
+meta*.json
 .tok.tmp
 api/
+api-*/

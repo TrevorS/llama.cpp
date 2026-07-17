@@ -23,7 +23,9 @@ import urllib.request
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL   = os.environ.get("PARITY_MODEL", "deepseek-v4-flash")
-OUTDIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api")
+OUTDIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       os.environ.get("PARITY_API_DIR", "api"))
+TEMP    = float(os.environ.get("PARITY_TEMP", "0"))
 MAX_TOKENS = 256
 
 # ~4.3k chars of neutral, information-dense context. Long on purpose: it
@@ -114,7 +116,7 @@ def call_api(key: str, task: str, thinking_off: bool):
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": PREAMBLE + task}],
-        "temperature": 0,
+        "temperature": TEMP,
         "max_tokens": MAX_TOKENS,
         "logprobs": True,
         "top_logprobs": 20,

@@ -117,6 +117,9 @@ def main():
         "~/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf"))
     ap.add_argument("--tokenize", default=os.path.join(REPO, "build/bin/llama-tokenize"))
     ap.add_argument("--template-kwargs", default="{}")
+    ap.add_argument("--api-dir", default="api")
+    ap.add_argument("--out-corpus", default="corpus.txt")
+    ap.add_argument("--out-meta", default="meta.json")
     args = ap.parse_args()
     tkw = json.loads(args.template_kwargs)
 
@@ -125,7 +128,8 @@ def main():
         sys.exit("no chat template in GGUF")
     tmp = os.path.join(HERE, ".tok.tmp")
 
-    api_files = sorted(f for f in os.listdir(os.path.join(HERE, "api")) if f.endswith(".json"))
+    api_dir = os.path.join(HERE, args.api_dir)
+    api_files = sorted(f for f in os.listdir(api_dir) if f.endswith(".json"))
     if not api_files:
         sys.exit("no api/*.json — run fetch_api.py first")
 
@@ -136,7 +140,7 @@ def main():
     dropped = 0
 
     for k, fn in enumerate(api_files):
-        with open(os.path.join(HERE, "api", fn)) as f:
+        with open(os.path.join(api_dir, fn)) as f:
             j = json.load(f)
         messages = j["request"]["messages"]
         choice   = j["response"]["choices"][0]
@@ -237,9 +241,9 @@ def main():
         print(f"[{fn}] unit {k-dropped}: prompt {n_prompt} tok, "
               f"{len(comparable)}/{len(lp)} comparable ({100.0*len(comparable)/max(1,len(lp)):.0f}%)")
 
-    with open(os.path.join(HERE, "corpus.txt"), "w") as f:
+    with open(os.path.join(HERE, args.out_corpus), "w") as f:
         f.write("".join(corpus))
-    with open(os.path.join(HERE, "meta.json"), "w") as f:
+    with open(os.path.join(HERE, args.out_meta), "w") as f:
         json.dump(meta, f)
     os.unlink(tmp)
     print(f"\ncorpus: {len(corpus)} units ({dropped} dropped), "

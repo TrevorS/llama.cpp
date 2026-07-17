@@ -159,3 +159,6 @@ experiments/profiles/postsplit-*/
 experiments/profiles/shallow-*/
 experiments/profiles/lidtraffic-*/
 experiments/profiles/matrix-*/
+
+# secrets — never commit
+.env
