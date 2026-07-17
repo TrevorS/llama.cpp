@@ -25,7 +25,7 @@ import sys
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
 REPO   = os.path.abspath(os.path.join(HERE, "..", ".."))
-N_CTX  = 2048
+N_CTX  = 1024
 FIRST  = N_CTX // 2          # perplexity emits rows for positions >= FIRST
 FILLER = " the"              # 1 token each in the DS4 BPE (validated at run)
 
@@ -60,24 +60,43 @@ class Vocab:
         ct = kv.get("tokenizer.chat_template")
         self.chat_template = bytes(ct.parts[ct.data[0]]).decode() if ct else None
         u2b = bytes_to_unicode()
-        self.tok_bytes = []
+        # two candidate byte forms per token: byte-BPE decoded (the standard
+        # storage for type-1 tokens) and raw utf-8 (added tokens like math
+        # glyphs are stored raw — observed on x, /, approx signs). The span
+        # builder matches candidates against the actual text.
+        self.tok_bytes = []      # primary (byte-BPE) form
+        self.tok_bytes_alt = []  # raw utf-8 form (None if identical)
         for piece, typ in zip(self.pieces, self.types):
+            raw = piece.encode("utf-8")
+            if typ == 6 and re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", piece):
+                # byte-fallback token: literal single byte
+                self.tok_bytes.append(bytes([int(piece[3:5], 16)]))
+                self.tok_bytes_alt.append(None)
+                continue
             if typ != 1:  # control/special/user-defined: literal utf-8
-                self.tok_bytes.append(piece.encode("utf-8"))
-            else:
-                try:
-                    self.tok_bytes.append(bytes(u2b[ch] for ch in piece))
-                except KeyError:  # not byte-BPE encoded (shouldn't happen)
-                    self.tok_bytes.append(piece.encode("utf-8"))
+                self.tok_bytes.append(raw)
+                self.tok_bytes_alt.append(None)
+                continue
+            try:
+                dec = bytes(u2b[ch] for ch in piece)
+            except KeyError:
+                dec = raw
+            self.tok_bytes.append(dec)
+            self.tok_bytes_alt.append(raw if raw != dec else None)
         self.bytes2id = {}
-        for i, b in enumerate(self.tok_bytes):
+        for i, (b, a) in enumerate(zip(self.tok_bytes, self.tok_bytes_alt)):
             self.bytes2id.setdefault(b, i)
+            if a is not None:
+                self.bytes2id.setdefault(a, i)
 
 
 def tokenize(binpath, model, text, tmp):
     with open(tmp, "w") as f:
         f.write(text)
-    out = subprocess.run([binpath, "-m", model, "-f", tmp, "--ids", "--no-bos"],
+    # --no-escape: the tool otherwise rewrites literal \t, \n etc. in the
+    # INPUT (LaTeX like \times becomes TAB+imes) — must match perplexity,
+    # which run_arms.sh also invokes with --no-escape
+    out = subprocess.run([binpath, "-m", model, "-f", tmp, "--ids", "--no-bos", "--no-escape"],
                          capture_output=True, check=True)
     stdout = out.stdout.decode("utf-8", errors="replace")
     ids = [int(x) for x in re.findall(r"-?\d+", stdout.rsplit("[", 1)[-1])]
@@ -128,14 +147,25 @@ def main():
         unit_text   = prompt_text + content
         ids = tokenize(args.tokenize, args.model, unit_text, tmp)
 
-        # byte spans of our tokens
-        spans, off = [], 0
+        # byte spans of our tokens, matched against the actual text so that
+        # raw-stored vocab pieces (math glyphs etc.) resolve correctly
+        ubytes = unit_text.encode("utf-8")
+        spans, off, bad = [], 0, False
         for tid in ids:
             b = vocab.tok_bytes[tid]
+            if ubytes[off:off + len(b)] != b:
+                a = vocab.tok_bytes_alt[tid]
+                if a is not None and ubytes[off:off + len(a)] == a:
+                    b = a
+                else:
+                    print(f"[{fn}] WARN: token {tid} bytes mismatch at offset {off} — dropping")
+                    bad = True
+                    break
             spans.append((off, off + len(b), tid))
             off += len(b)
-        if off != len(unit_text.encode("utf-8")):
-            print(f"[{fn}] WARN: byte reconstruction {off} != {len(unit_text.encode())} — dropping")
+        if bad or off != len(ubytes):
+            if not bad:
+                print(f"[{fn}] WARN: byte reconstruction {off} != {len(ubytes)} — dropping")
             dropped += 1
             continue
 
@@ -177,8 +207,11 @@ def main():
                 "top": top,
             })
 
-        # pad the unit to end exactly at file-token boundary (k+1)*N_CTX - 1
-        target = (k - dropped + 1) * N_CTX - 1 - n_file_tokens
+        # pad each unit to EXACTLY N_CTX tokens — one standalone perplexity
+        # chunk. analyze.py self-locates each unit by token-subsequence match
+        # in the dump, so no assumption about perplexity's BOS layout (global
+        # add_bos prepend + per-chunk token[0] overwrite) is baked in here.
+        target = N_CTX
         text = unit_text
         n = len(ids)
         for _ in range(8):
@@ -187,21 +220,21 @@ def main():
             if n > target:
                 sys.exit(f"[{fn}] unit overshot chunk ({n} > {target})")
             text = text + FILLER * (target - n)
-            n = len(tokenize(args.tokenize, args.model, text, tmp))
+            ids = tokenize(args.tokenize, args.model, text, tmp)
+            n = len(ids)
         if n != target:
             sys.exit(f"[{fn}] padding failed to converge ({n} vs {target})")
 
-        unit_base = n_file_tokens  # file-token index of unit start
         corpus.append(text)
         meta["units"].append({
             "file": fn,
-            "chunk": k - dropped,
-            "unit_base_file_tok": unit_base,
+            "unit_idx": k - dropped,
+            "ids": ids,                       # full N_CTX token ids (locator key)
             "n_comparable": len(comparable),
             "comparable": comparable,
         })
-        n_file_tokens = (k - dropped + 1) * N_CTX - 1
-        print(f"[{fn}] chunk {k-dropped}: prompt {n_prompt} tok, "
+        n_file_tokens += target
+        print(f"[{fn}] unit {k-dropped}: prompt {n_prompt} tok, "
               f"{len(comparable)}/{len(lp)} comparable ({100.0*len(comparable)/max(1,len(lp)):.0f}%)")
 
     with open(os.path.join(HERE, "corpus.txt"), "w") as f:

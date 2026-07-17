@@ -65,29 +65,50 @@ def main():
     n_ctx, n_vocab, n_chunk, tokens, raw, _nv, rpc = read_dump(args.dump)
     assert n_ctx == n_ctx_m, f"n_ctx mismatch dump {n_ctx} vs meta {n_ctx_m}"
 
+    # locate each unit in the dump token stream by subsequence match (robust to
+    # perplexity's BOS layout: global add_bos prepend + per-chunk token[0]
+    # overwrite). Match on ids[1:] so a clobbered position-0 never breaks it.
+    def locate(unit_ids):
+        needle = np.asarray(unit_ids[1:], dtype=np.int32)
+        nlen = needle.size
+        # candidate starts where the second token matches, then verify a window
+        cand = np.nonzero(tokens == needle[0])[0]
+        for c0 in cand:
+            base = c0 - 1  # base = dump index of unit token 0
+            if base < 0 or base + len(unit_ids) > tokens.size:
+                continue
+            seg = tokens[base + 1: base + 1 + min(nlen, 64)]
+            if np.array_equal(seg, needle[:seg.size]):
+                # full verify
+                full = tokens[base: base + len(unit_ids)]
+                # position 0 may be BOS-overwritten — compare from index 1
+                if np.array_equal(full[1:], np.asarray(unit_ids[1:], dtype=np.int32)):
+                    return base
+        return None
+
     agg = {"n": 0, "top1": 0, "lp_ours": 0.0, "lp_api": 0.0,
            "rank_sum": 0, "rank_le5": 0, "kl20": 0.0, "kl20_n": 0,
            "ov20": 0.0, "ov20_n": 0, "floor_hits": 0}
     unit_rows = []
 
+    located = 0
     for unit in meta["units"]:
-        c = unit["chunk"]
-        if c >= n_chunk:
-            print(f"[{unit['file']}] chunk {c} beyond dump ({n_chunk}), skipping")
+        base = locate(unit["ids"])
+        if base is None:
+            print(f"[{unit['file']}] could not locate unit in dump, skipping")
             continue
-        base = unit["unit_base_file_tok"]
+        located += 1
         u = {"file": unit["file"], "n": 0, "top1": 0, "lp_ours": 0.0, "lp_api": 0.0}
         for cp in unit["comparable"]:
-            dump_pos = base + cp["unit_tok_idx"] + 1     # +1: global BOS
-            r = dump_pos - (c * n_ctx + first) - 1       # row predicting dump_pos
+            dump_pos = base + cp["unit_tok_idx"]         # absolute dump index
+            within = dump_pos % n_ctx                    # position within its chunk
+            cc = dump_pos // n_ctx
+            r = within - 1 - first                       # row predicting dump_pos
             if r < 0 or r >= rpc:
                 continue
-            # token-identity check: the dump's token stream must match ours
             if tokens[dump_pos] != cp["id"]:
-                print(f"[{unit['file']}] token mismatch at dump {dump_pos}: "
-                      f"{tokens[dump_pos]} vs {cp['id']} — corpus drift, skipping unit")
-                break
-            lp, floor = row_logprobs(raw[c * rpc + r], n_vocab)
+                continue                                 # BOS-clobbered pos 0 etc.
+            lp, floor = row_logprobs(raw[cc * rpc + r], n_vocab)
             ours = float(lp[cp["id"]])
             if ours <= floor + 1e-9:
                 agg["floor_hits"] += 1
@@ -116,7 +137,8 @@ def main():
         unit_rows.append(u)
 
     n = max(1, agg["n"])
-    print(f"\n== {os.path.basename(args.dump)} vs API ({agg['n']} positions) ==")
+    print(f"\n== {os.path.basename(args.dump)} vs API "
+          f"({located}/{len(meta['units'])} units located, {agg['n']} positions) ==")
     print(f"top-1 agreement      : {100.0*agg['top1']/n:.2f}%")
     print(f"mean logprob (ours)  : {agg['lp_ours']/n:.4f}")
     print(f"mean logprob (API)   : {agg['lp_api']/n:.4f}")
