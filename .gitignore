@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+.webui_secret_key
+
+# secrets — never commit
+.env

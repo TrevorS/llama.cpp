@@ -1457,6 +1457,43 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
+ggml_tensor * llama_kv_cache::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+
+    GGML_ASSERT(k->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(k_cur->type == GGML_TYPE_F32);
+
+    const int64_t n_embd_head = k_cur->ne[0];
+    const int64_t n_head      = k_cur->ne[1];
+    const int64_t n_tokens    = k_cur->ne[2];
+
+    const int64_t n_embd_gqa = n_embd_head*n_head;
+
+    // merge dims 0/1 (same as cpy_k)
+    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    const int64_t n_stream = k->ne[2];
+
+    if (n_stream > 1) {
+        const int64_t kv_size = get_size();
+
+        assert(n_embd_gqa == k->ne[0]);
+        assert(kv_size    == k->ne[1]);
+
+        // merge the buffer across all streams because the idxs are global
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+    }
+
+    // QAT-rounded scatter into the packed container
+    return ggml_dsv4_qat_set_rows(ctx, k, k_cur, k_idxs);
+}
+
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2850,6 +2887,10 @@ ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) 
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_qat(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {

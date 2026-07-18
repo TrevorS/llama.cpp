@@ -186,6 +186,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK4_MTP:
             return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
@@ -2322,7 +2323,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_MTP) {
+                        // DEEPSEEK4_MTP: all layers have compress_ratio 0, so the
+                        // composite cache degenerates to kv_raw only (the draft
+                        // block is plain sliding-window MLA — ds4.c raw_window).
+                        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+                        res = new llama_kv_cache_dsv4(
+                                *this,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                params.swa_full,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_seq_max,
+                                cparams.n_ubatch,
+                                1,
+                                filter,
+                                reuse);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2484,6 +2505,10 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
+int32_t llama_model_n_embd_nextn(const llama_model * model) {
+    return model->hparams.n_embd_nextn();
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }
@@ -2580,6 +2605,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK4_MTP:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

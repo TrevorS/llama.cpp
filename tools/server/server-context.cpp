@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_dsv4_spec_stash/restore (frontier rewind)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -18,8 +19,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
+#include <ctime>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -213,6 +216,10 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // this round's rollback protection is a DSV4 frontier stash (KiB-scale)
+    // instead of a full spec_ckpt target dump; see llama_dsv4_spec_stash
+    bool spec_frontier = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -941,6 +948,10 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // DSV4 frontier-stash rollback for speculative rounds (kill switch:
+    // LLAMA_DSV4_SPEC_FRONTIER=0). Ignored when the memory is not DSV4.
+    bool spec_frontier_enabled = true;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1304,6 +1315,11 @@ private:
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
 
+        if (const char * s = std::getenv("LLAMA_DSV4_SPEC_FRONTIER")) {
+            spec_frontier_enabled = atoi(s) != 0;
+        }
+        SRV_INF("dsv4 spec frontier rollback: %s\n", spec_frontier_enabled ? "enabled" : "disabled");
+
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
@@ -1397,6 +1413,26 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        // optional L2 on-disk tier for the prompt cache
+        if (!params_base.cache_disk_dir.empty()) {
+            if (prompt_cache) {
+                char model_desc[256] = {0};
+                llama_model_desc(llama_get_model(ctx_tgt), model_desc, sizeof(model_desc));
+                // any change here (model, ctx size, draft presence) must invalidate old files,
+                // since a serialized sequence state is only restorable into a matching setup.
+                const std::string compat_desc = string_format("%s|n_ctx=%d|n_embd=%d|draft=%d",
+                        model_desc, n_ctx, llama_model_n_embd(llama_get_model(ctx_tgt)), ctx_dft ? 1 : 0);
+                prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
+                        params_base.cache_disk_dir,
+                        compat_desc,
+                        (size_t) std::max(0, params_base.cache_disk_mib)        * 1024ull * 1024ull,
+                        (size_t) std::max(0, params_base.cache_disk_min_tokens),
+                        (size_t) std::max(0, params_base.cache_disk_max_entry_mib) * 1024ull * 1024ull);
+            } else {
+                SRV_WRN("%s", "--cache-disk requires the RAM prompt cache; enable it with `--cache-ram N`\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -2630,6 +2666,23 @@ private:
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
 
+                    // Synthesize a context checkpoint at the restored boundary.
+                    // The SWA/hybrid prompt-reuse gate requires checkpoint
+                    // coverage to resume near the frontier; a freshly restored
+                    // slot has none (checkpoints are not part of the save
+                    // file), so without this the next request silently forces a
+                    // full prompt re-process. pos_min is recorded as 0: the
+                    // restored state resumes at its tail (the pos_max guard in
+                    // the gate rejects deeper rewinds), and the actual
+                    // seq_pos_min sits exactly at the SWA window edge, one
+                    // position too new for the gate's coverage predicate.
+                    {
+                        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (pos_max >= 0) {
+                            create_checkpoint(*slot, 0, /*pos_min=*/ 0, pos_max);
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -3005,6 +3058,11 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        // stash the speculative impl state (e.g. draft-mtp's pending_h) so a
+                        // rollback restores it together with the KV it was produced with
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -3056,17 +3114,26 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    // DSV4 frontier stash: a KiB-scale device snapshot of the
+                    // compressor frontier replaces the MiB-scale full state
+                    // dump when the memory supports it. Streams isolate slots,
+                    // so per-slot stashes of the same pre-verify moment coexist.
+                    slot.spec_frontier = spec_frontier_enabled &&
+                                         llama_dsv4_spec_stash(ctx_tgt, slot.id);
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (!slot.spec_frontier) {
+                        //const int64_t t_start = ggml_time_us();
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
-                            (float) ckpt.size() / 1024 / 1024,
-                            (float) ckpt.data_dft.size() / 1024 / 1024);
+                        //const int64_t t_total = ggml_time_us() - t_start;
+                        //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+
+                        SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                                (float) ckpt.size() / 1024 / 1024,
+                                (float) ckpt.data_dft.size() / 1024 / 1024);
+                    }
                 }
 
                 if (use_ckpt_dft) {
@@ -3872,7 +3939,27 @@ private:
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
-                    if (use_ckpt_tgt) {
+                    if (use_ckpt_tgt && slot.spec_frontier) {
+                        // DSV4 frontier rewind: restore only the rejected
+                        // positions' compressor-frontier ring rows, keep the
+                        // accepted rows' raw cells and ring contributions, and
+                        // fall through to the normal accept path below - no
+                        // full state reload, no re-verify round.
+                        const auto & ckpt = slot.spec_ckpt;
+
+                        const llama_pos p0_reject = ckpt.pos_max + (llama_pos) accepted.size() + 1;
+                        const llama_pos p1_reject = ckpt.pos_max + (llama_pos) n_draft + 1;
+
+                        const bool ok = llama_dsv4_spec_restore(slot.ctx_tgt, slot.id, p0_reject, p1_reject);
+                        GGML_ASSERT(ok && "dsv4 frontier restore failed - stash out of sync with verify round");
+
+                        if (trace > 0) {
+                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (frontier rewind)\n", accepted.size() - 1, slot.spec_draft.size());
+                        }
+                        // the deep raw-tail trim happens on the normal path via
+                        // common_context_seq_rm at pos_next(), which the dsv4
+                        // cache accepts now that the frontier is consistent
+                    } else if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
@@ -3892,6 +3979,10 @@ private:
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+
+                        if (!ckpt.data_spec.empty()) {
+                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
@@ -3924,6 +4015,14 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += n_accepted;
             slot.n_draft_verif_steps += 1;
+
+            // per-round spec trace for the offline depth-0/1/2 oracle (LLAMA_SPEC_TRACE=1).
+            // acceptance is prefix-monotone, so the accepted length at the run's draft
+            // depth determines what a shallower depth would have yielded that round.
+            static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+            if (spec_trace) {
+                SLT_INF(slot, "SPECTRACE acc=%zu draft=%zu\n", ids.size() - 1, n_draft);
+            }
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
@@ -4529,6 +4628,82 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->slots_data);
+        return res;
+    };
+
+    this->get_slots_saves = [this](const server_http_req &) {
+        // filesystem only - no task queue, so it responds while slots are busy and
+        // must not wake a sleeping server (bypass_sleep)
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const int64_t t_now_unix = (int64_t) time(nullptr);
+        const auto    ft_now     = std::filesystem::file_time_type::clock::now();
+
+        json saves = json::array();
+        for (const auto & file : fs_list(params.slot_save_path, false)) {
+            // only expose names that a later ?action=restore would accept
+            if (!fs_validate_filename(file.name)) {
+                continue;
+            }
+            std::error_code ec;
+            const auto ftime = std::filesystem::last_write_time(file.path, ec);
+            if (ec) {
+                continue; // deleted mid-listing
+            }
+            // C++17-portable file_time -> unix seconds via delta from now
+            const int64_t delta = std::chrono::duration_cast<std::chrono::seconds>(ft_now - ftime).count();
+            saves.push_back(json {
+                { "filename",   file.name },
+                { "size_bytes", file.size },
+                { "mtime",      t_now_unix - delta },
+            });
+        }
+
+        // newest first; tie-break on filename so same-second saves order deterministically
+        std::sort(saves.begin(), saves.end(), [](const json & a, const json & b) {
+            const int64_t am = a.at("mtime").get<int64_t>();
+            const int64_t bm = b.at("mtime").get<int64_t>();
+            if (am != bm) {
+                return am > bm;
+            }
+            return a.at("filename").get<std::string>() < b.at("filename").get<std::string>();
+        });
+
+        res->ok(json { { "saves", saves } });
+        return res;
+    };
+
+    this->del_slots_saves = [this](const server_http_req & req) {
+        // filesystem only - see get_slots_saves
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const std::string filename = req.get_param("filename");
+        if (filename.empty() || !fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // same path construction as handle_slots_save/restore (slot_save_path ends with a separator)
+        const std::string filepath = params.slot_save_path + filename;
+        std::error_code ec;
+        if (!std::filesystem::remove(filepath, ec)) {
+            if (ec) {
+                res->error(format_error_response("Failed to delete slot save file: " + ec.message(), ERROR_TYPE_SERVER));
+            } else {
+                res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+            }
+            return res;
+        }
+
+        res->ok(json { { "success", true }, { "filename", filename } });
         return res;
     };
 
@@ -5186,6 +5361,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+
+    // distinguish a missing file from a real restore failure up front - the task-level
+    // error lumps both into "no available space in KV cache or invalid slot save file"
+    if (!std::filesystem::is_regular_file(filepath)) {
+        res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+        return res;
+    }
 
     auto & rd = res->rd;
     {

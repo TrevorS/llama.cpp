@@ -622,6 +622,13 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // L2 on-disk prompt cache (empty dir = disabled). Persists evicted / oversize slot states so a
+    // replayed token prefix (session resume, tree/fork jump, server restart) skips re-prefilling.
+    std::string cache_disk_dir;                 // enables the disk tier when non-empty
+    int32_t cache_disk_mib        = 65536;      // on-disk budget in MiB (0 = no limit)
+    int32_t cache_disk_min_tokens = 2048;       // smallest prompt worth persisting
+    int32_t cache_disk_max_entry_mib = 4096;    // largest single state to divert to disk
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
