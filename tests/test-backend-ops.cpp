@@ -4491,6 +4491,82 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_DSV4_HC_FUSED mode 0 (DeepSeek-V4 hyper-connection weighted sum)
+struct test_dsv4_hc_weighted_sum : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_weighted_sum(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_dsv4_hc_weighted_sum(ctx, x, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 1 (DeepSeek-V4 hyper-connection post/comb mixing)
+struct test_dsv4_hc_fused_post : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t nt;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, nt);
+    }
+
+    test_dsv4_hc_fused_post(int64_t n_embd = 256, int64_t hc = 4, int64_t nt = 5)
+        : n_embd(n_embd), hc(hc), nt(nt) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_set_name(res, "res");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_name(comb, "comb");
+
+        ggml_tensor * out = ggml_dsv4_hc_fused_post(ctx, x, res, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_HC_FUSED mode 2 (DeepSeek-V4 hyper-connection Sinkhorn normalization)
+struct test_dsv4_hc_sinkhorn : public test_case {
+    const int64_t hc, nt;
+    const int iters;
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(hc, nt, iters, eps);
+    }
+
+    test_dsv4_hc_sinkhorn(int64_t hc = 8, int64_t nt = 5, int iters = 20, float eps = 1e-6f)
+        : hc(hc), nt(nt), iters(iters), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, nt);
+        ggml_set_name(comb, "comb");
+        ggml_tensor * out = ggml_dsv4_hc_sinkhorn(ctx, comb, iters, eps);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -5849,6 +5925,215 @@ struct test_argsort : public test_case {
     }
 };
 
+// GGML_OP_DSV4_LID_TOPK
+struct test_dsv4_lid_topk : public test_case {
+    const ggml_type k_type;
+    const int64_t d_idx;
+    const int64_t n_head;
+    const int64_t n_lid;
+    const int64_t nt_s;
+    const int64_t n_stream;
+    const int top_k;
+
+    std::string vars() override {
+        return std::string("k_type=") + ggml_type_name(k_type) +
+               ",d_idx=" + std::to_string(d_idx) + ",n_head=" + std::to_string(n_head) +
+               ",n_lid=" + std::to_string(n_lid) + ",nt_s=" + std::to_string(nt_s) +
+               ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k);
+    }
+
+    test_dsv4_lid_topk(ggml_type k_type = GGML_TYPE_F32,
+            int64_t d_idx = 128, int64_t n_head = 64, int64_t n_lid = 2048,
+            int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512)
+        : k_type(k_type), d_idx(d_idx), n_head(n_head), n_lid(n_lid),
+          nt_s(nt_s), n_stream(n_stream), top_k(top_k) {}
+
+    // Output is index sets per row; compare order-independently (top-k selection
+    // is a set — the downstream mask does not care about intra-row order).
+    // The CUDA head_dim==128 paths score with quantized matmuls (int8 dp4a,
+    // fp4-mma), so a tiny fraction of indices at near-tie score boundaries may
+    // differ from the fp32 CPU reference. Allow a small set-mismatch fraction
+    // there; keep the scalar path (d_idx != 128) strict at exact set match.
+    double max_err(ggml_backend_t) override {
+        // LLAMA_DSV4_LID_FP4_MMA: e2m1xe2m1 tensor-core scoring — class B
+        // (same grid the model was QAT'd on), a coarser 8-level quant than
+        // int8, so a larger set-mismatch on random test fill. Smoke gate only
+        // (~2x the ~0.056 observed on the 2048x4 case).
+        // Default ON since 2026-07-16 (mirror dsv4_lid_topk.cu gate).
+        const char * fm = getenv("LLAMA_DSV4_LID_FP4_MMA");
+        if ((!fm || fm[0] != '0') && d_idx == 128) return 1.1e-1;
+        // int8 dp4a is the d128 score path (decode kernel included): per-row
+        // int8 quant flips a small fraction of near-tie selections
+        // (observed <= 0.7%). Loosen the set-mismatch gate accordingly.
+        return d_idx == 128 ? 1.2e-2 : 0.0;
+    }
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t rows = n / (size_t) top_k;
+        size_t mism = 0;
+        for (size_t r = 0; r < rows; r++) {
+            std::set<int> sa, sb;
+            for (int i = 0; i < top_k; i++) {
+                sa.insert((int) a[r*top_k + i]);
+                sb.insert((int) b[r*top_k + i]);
+            }
+            for (int x : sa) { if (!sb.count(x)) { mism++; } }
+        }
+        return n ? (double) mism / (double) n : 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nt = nt_s * n_stream;
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_idx, n_head, nt);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, d_idx, 1, n_lid, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, nt);
+        ggml_set_name(w, "w");
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_lid, nt_s, 1, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * out = ggml_dsv4_lid_topk(ctx, q, k, w, mask, top_k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_LID_UNION / GGML_OP_DSV4_LID_MEMB
+struct test_dsv4_lid_union : public test_case {
+    const int64_t n_top_k, nt_s, n_stream, n_csa, u_max;
+    const int64_t W;  // tokens per union tile (0 = whole batch)
+    const bool memb;  // false: test union_idx; true: test membership mask
+
+    std::string op_desc(ggml_tensor *) override { return memb ? "DSV4_LID_MEMB" : "DSV4_LID_UNION"; }
+    std::string vars() override {
+        return "n_top_k=" + std::to_string(n_top_k) + ",nt_s=" + std::to_string(nt_s) +
+               ",n_stream=" + std::to_string(n_stream) + ",n_csa=" + std::to_string(n_csa) +
+               ",u_max=" + std::to_string(u_max) + ",W=" + std::to_string(W) +
+               ",memb=" + std::to_string(memb);
+    }
+    test_dsv4_lid_union(int64_t n_top_k, int64_t nt_s, int64_t n_stream, int64_t n_csa, int64_t u_max, int64_t W, bool memb)
+        : n_top_k(n_top_k), nt_s(nt_s), n_stream(n_stream), n_csa(n_csa), u_max(u_max), W(W), memb(memb) {}
+
+    // both ops are exact vs the CPU reference (deterministic union order); -inf
+    // in the membership mask must compare equal.
+    double max_err(ggml_backend_t) override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        double maxd = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            const bool ia = std::isinf(a[i]) && a[i] < 0, ib = std::isinf(b[i]) && b[i] < 0;
+            if (ia && ib) continue;
+            maxd = std::max(maxd, (double) std::fabs(a[i] - b[i]));
+        }
+        return maxd;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nt_s, 1, n_stream);
+        ggml_set_name(top_k, "top_k");
+        ggml_tensor * uni = ggml_dsv4_lid_union(ctx, top_k, n_csa, u_max, W);
+        ggml_set_name(uni, "uni");
+        ggml_tensor * out = memb ? ggml_dsv4_lid_memb(ctx, top_k, uni, n_csa) : uni;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32 && !ggml_is_view_op(t->op) && t->op == GGML_OP_NONE) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) v = rand() % n_csa;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+// GGML_OP_DSV4_QAT_SET_ROWS (QAT-rounded scatter into a packed MXFP4 container)
+struct test_dsv4_qat_set_rows : public test_case {
+    const int64_t ne0, kv_size, r;
+
+    std::string vars() override {
+        return "ne0=" + std::to_string(ne0) + ",kv_size=" + std::to_string(kv_size) +
+               ",r=" + std::to_string(r);
+    }
+    // CPU and CUDA implement the identical QAT pack (same scale, same
+    // tie-break, same nibble layout) -> containers must match exactly.
+    double max_err(ggml_backend_t) override { return 0.0; }
+
+    test_dsv4_qat_set_rows(int64_t ne0, int64_t kv_size, int64_t r)
+        : ne0(ne0), kv_size(kv_size), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP4, ne0, kv_size);
+        ggml_set_name(dst, "dst");
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, r);
+        ggml_set_name(row_idxs, "row_idxs");
+        ggml_tensor * out = ggml_dsv4_qat_set_rows(ctx, dst, src, row_idxs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, kv_size);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_DSV4_FA_MERGE (LSE merge of two FA-with-LSE halves)
+struct test_dsv4_fa_merge : public test_case {
+    const int64_t dv, nh, nq, ns;
+    const int64_t wb, tb; // b-side tiling: b is [dv, nh, wb, tb+1] with nh*wb*tb == nh*nq*ns (0 = same shape as a)
+    const bool poison_b;  // NaN-poison the b leg (fully-masked -inf LSE) to exercise the 0-weight skip
+
+    std::string vars() override {
+        return "dv=" + std::to_string(dv) + ",nh=" + std::to_string(nh) +
+               ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns) +
+               ",wb=" + std::to_string(wb) + ",tb=" + std::to_string(tb) +
+               ",poison_b=" + std::to_string(poison_b);
+    }
+
+    double max_nmse_err() override { return 1e-6; }
+
+    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0, bool poison_b = false)
+        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb), poison_b(poison_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // srcs carry the LSE tail slice: [DV, H, Q, S+1]; uniform init doubles
+        // as both attention values and plausible LSE magnitudes.
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = wb > 0
+            ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, wb, tb + 1)
+            : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv, nh, nq, ns + 1);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_dsv4_fa_merge(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (poison_b && strcmp(t->name, "b") == 0) {
+                // fully-masked part: NaN values with a -inf LSE tail — the
+                // merge must skip it entirely (0-weight x NaN must not leak)
+                std::vector<float> buf(ggml_nelements(t), std::numeric_limits<float>::quiet_NaN());
+                const int64_t rows = t->ne[1]*t->ne[2]*(t->ne[3] - 1);
+                for (int64_t r = 0; r < rows; r++) {
+                    buf[t->ne[0]*rows + r] = -INFINITY; // LSE tail
+                }
+                ggml_backend_tensor_set(t, buf.data(), 0, buf.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -6925,6 +7210,185 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT with opt-in per-row log-sum-exp tail output.
+// The result tensor has ne3 = q->ne[3]+1; the tail slice holds lse[h, iq, s] at
+// element offset DV*n_head*n_q*ne3. Only the first n_head*n_q*ne3 elements of the
+// tail slice are defined, so the compared output is a contiguous 1D view covering
+// exactly the main result + the LSE values.
+struct test_flash_attn_ext_lse : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nh;  // num KV heads
+    const std::array<int64_t, 2> nr23; // repeat in dim 2 and 3
+    const int64_t kv;  // kv size
+    const int64_t nb;  // batch size
+
+    const bool mask;
+    const float logit_softcap;
+    const bool sinks;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    std::string vars() override {
+        return "LSE," + VARS_TO_STR9(hsk, hsv, nh, nr23, kv, nb, mask, logit_softcap, sinks);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_lse(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1},
+                            int64_t kv = 512, int64_t nb = 8, bool mask = true, float logit_softcap = 0.0f, bool sinks = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), logit_softcap(logit_softcap), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, kv, nh, nr23[1]);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = nullptr;
+        if (hsv <= hsk && (hsk == 576 || hsk == 512)) {
+            // MLA/DSV4-style: the V tensor is a sub-view of the K tensor.
+            v = ggml_view_4d(ctx, k, hsv, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+        } else {
+            v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsv, kv, nh, nr23[1]);
+        }
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * fa = ggml_flash_attn_ext_with_lse(ctx, q, k, v, m, 1.0f/sqrtf(hsk), 0.0f, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(fa, s);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_set_name(fa, "fa");
+
+        const int64_t n_rows = fa->ne[1]*fa->ne[2]*(fa->ne[3] - 1); // n_head*n_q*ne3
+        const int64_t n_main = fa->ne[0]*n_rows;                    // regular FA output
+
+        ggml_tensor * out = ggml_cont(ctx, ggml_view_1d(ctx, fa, n_main + n_rows, 0));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT — DSV4 union-gather padding pattern:
+// the last n_pad KV columns are duplicates of the last real row and are fully
+// masked (-inf for EVERY query row). This is what per-tile union padding
+// produces (union_idx padded with n_csa-1). V is the K tensor itself (MLA-style
+// k_all passed as both K and V, hsk == hsv == 512, n_head_kv = 1).
+struct test_fa_pad : public test_case {
+    const int64_t hs;     // head size (K and V)
+    const int64_t kv_real;
+    const int64_t n_pad;  // trailing fully-masked duplicate columns
+    const int64_t nb;     // batch (query tokens)
+    const int64_t nr2;    // GQA repeat (query heads per KV head)
+    const int64_t nr3;    // dim-3 batch (tiles/streams)
+    const bool sinks;
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT"; }
+    std::string vars() override {
+        return "PAD,hs=" + std::to_string(hs) + ",kv_real=" + std::to_string(kv_real) +
+               ",n_pad=" + std::to_string(n_pad) + ",nb=" + std::to_string(nb) +
+               ",nr2=" + std::to_string(nr2) + ",nr3=" + std::to_string(nr3) +
+               ",sinks=" + std::to_string(sinks);
+    }
+
+    test_fa_pad(int64_t hs, int64_t kv_real, int64_t n_pad, int64_t nb, int64_t nr2, int64_t nr3, bool sinks)
+        : hs(hs), kv_real(kv_real), n_pad(n_pad), nb(nb), nr2(nr2), nr3(nr3), sinks(sinks) {}
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv = kv_real + n_pad;
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nr2, nr3);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, nr3);
+        ggml_set_name(k, "k");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr3);
+        ggml_set_name(m, "m");
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr2);
+            ggml_set_name(s, "s");
+        }
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, k, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_prec (out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+        const int64_t kv = kv_real + n_pad;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "k") == 0) {
+                std::vector<float>       kf(hs*kv*nr3);
+                std::vector<ggml_fp16_t> kh(kf.size());
+                for (int64_t i3 = 0; i3 < nr3; i3++) {
+                    float * kp = kf.data() + i3*hs*kv;
+                    for (int64_t i = 0; i < hs*kv_real; i++) {
+                        kp[i] = dis(gen);
+                    }
+                    // padding rows duplicate the last real row
+                    for (int64_t r = kv_real; r < kv; r++) {
+                        memcpy(kp + r*hs, kp + (kv_real - 1)*hs, hs*sizeof(float));
+                    }
+                }
+                ggml_fp32_to_fp16_row(kf.data(), kh.data(), kf.size());
+                ggml_backend_tensor_set(t, kh.data(), 0, kh.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<float>       mf(kv*nb*nr3);
+                std::vector<ggml_fp16_t> mh(mf.size());
+                for (int64_t i3 = 0; i3 < nr3; i3++) {
+                    for (int64_t i1 = 0; i1 < nb; i1++) {
+                        float * row = mf.data() + i3*nb*kv + i1*kv;
+                        for (int64_t i0 = 0; i0 < kv_real; i0++) {
+                            row[i0] = dis(gen);
+                        }
+                        for (int64_t i0 = kv_real; i0 < kv; i0++) {
+                            row[i0] = -INFINITY;
+                        }
+                    }
+                }
+                ggml_fp32_to_fp16_row(mf.data(), mh.data(), mf.size());
+                ggml_backend_tensor_set(t, mh.data(), 0, mh.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -9046,6 +9510,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+
+    // DeepSeek-V4 fused hyper-connection mixing (both modes; hc=8 is GGML_DSV4_HC_MAX)
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 4, 1));   // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_weighted_sum(4096, 8, 17));  // hc max, odd nt
+    test_cases.emplace_back(new test_dsv4_hc_fused_post(256,  4, 5));
+    test_cases.emplace_back(new test_dsv4_hc_fused_post(4096, 4, 1));           // decode shape
+    test_cases.emplace_back(new test_dsv4_hc_fused_post(4096, 8, 17));          // hc max, odd nt
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 1,  20, 1e-6f)); // decode shape, real iters
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 17, 20, 1e-6f)); // odd nt
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(4, 5,   1, 1e-4f)); // single iteration
+    test_cases.emplace_back(new test_dsv4_hc_sinkhorn(8, 2048, 20, 1e-6f)); // prefill width
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
@@ -9342,6 +9819,64 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
 
+    // GGML_OP_DSV4_LID_TOPK (DeepSeek-V4 fused lightning-indexer score + top-k)
+    //                                       k_type,          d_idx, n_head, n_lid, nt_s, n_stream, top_k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,   300,    1, 1,  64));  // decode (nt=1), single chunk, n_lid % chunk != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    8, 1, 256));  // small
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,    4, 1, 512));  // realistic dims, F16 k
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8,  5000,    2, 1, 128));  // multi-chunk (>4096), not divisible, F16
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  4097,    2, 1, 100));  // just over one chunk boundary
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  4,  8193,    2, 1, 100));  // just over two chunk boundaries
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 17000,    2, 1, 128));  // multi-chunk, partial last chunk, chunk+final merge
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16,  64,  8, 70000,    2, 1, 960));  // tree merge: 18 chunks > merge_group 4 (top_k <= 960 keeps EXACT's n_cand <= 1024)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,    4, 1, 512));  // d128 f16-scores multi-chunk topk (nt<16: bitonic)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,   20, 1, 512));  // d128 radix top-k (nt>=16, wide row, multi-pass)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1000,    4, 2,  64));  // n_stream = 2
+    // int8 dp4a score path (d_idx == 128): multi-token-tile, non-128-divisible n_lid, streams
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 512));  // 3 token-tiles (partial), n_lid % 128 != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  6000,   33, 1, 256));  // multi-chunk topk + partial token tile
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // n_stream = 2, per-stream launch
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 1, 512));  // decode kernel: d_idx=128, nt_s=1
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512));  // decode kernel: nt_s=1, n_stream=2
+
+    // B2 union + membership (top_k -> union_idx / membership mask)
+    for (bool memb : { false, true }) {
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  8192, 4096, 0, memb)); // realistic: union < u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1,  4096, 2048, 0, memb)); // overflow: union may exceed u_max
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  1, 1,  8192, 2048, 0, memb)); // decode-like: nt_s=1
+        test_cases.emplace_back(new test_dsv4_lid_union(256,  8, 2,  3000, 1500, 0, memb)); // n_stream=2, odd n_csa
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 16, 1, 32768, 2048, 0, memb)); // deep: n_csa=32768
+        // per-tile (W>0): T = ceil(nt_s/W) unions, memb per tile
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 128, 1,  8192, 2048, 16, memb)); // prefill-like: 8 tiles
+        test_cases.emplace_back(new test_dsv4_lid_union(512, 100, 1,  8192, 2048, 16, memb)); // partial last tile
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  64, 1,  2048, 1024, 16, memb)); // per-tile overflow
+        test_cases.emplace_back(new test_dsv4_lid_union(256,  48, 2,  3000, 1500,  8, memb)); // tiles x streams
+        test_cases.emplace_back(new test_dsv4_lid_union(512,  32, 1, 32768, 1024, 16, memb)); // deep per-tile
+    }
+    // QAT e2m1 round-trip (lid-cache write op)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32, 128, 32,  1024,   17, 1, 100));  // F32 k, d128 partial tile
+
+    // P3b packed MXFP4 lid container
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8));    // DSV4 tile geometry
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1));  // prefill width
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3));     // odd sizes
+    // mixed-shape halves (production: dense [DV,H,nt,1+1] vs tiled [DV,H,W,T+1]):
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 8, 64, 1, 16, 4));
+    // NaN-poison the b leg (fully-masked -inf LSE): the 0-weight skip must not leak
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, true));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, true));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, true));
+
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row
+    test_cases.emplace_back(new test_dsv4_qat_set_rows(256, 32, 1));    // multi-block single row
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  2048,    4, 1, 512)); // packed K, d128 dims
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  4096,    1, 1, 512)); // packed K, decode kernel
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4,  64,  8,  1024,    8, 1, 256)); // packed K, scalar path
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  1500,   20, 2, 128)); // packed K, n_stream=2
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64,  4096,    1, 2, 512)); // packed-direct decode, n_stream=2
+
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
@@ -9600,6 +10135,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+
+    // DSV4 union-gather padding repro: trailing fully-masked duplicate KV columns
+    // (union_idx padded with n_csa-1). n_pad=0 is the control. Total kv must be
+    // 256-aligned for CUDA FA; the real full-union case has padding starting
+    // MID-TILE (kv_real not 256-aligned), so cover both boundary and mid-tile.
+    for (int64_t n_pad : {(int64_t)0, (int64_t)7, (int64_t)64, (int64_t)167, (int64_t)512, (int64_t)2048}) {
+        for (bool fa_sinks : {false, true}) {
+            test_cases.emplace_back(new test_fa_pad(512, 4352 - n_pad, n_pad, 256, 64, 1, fa_sinks));
+        }
+    }
+    // tile-boundary-aligned padding (kv_real 256-aligned)
+    test_cases.emplace_back(new test_fa_pad(512, 4352, 512,  256, 64, 1, true));
+    test_cases.emplace_back(new test_fa_pad(512, 4352, 2048, 256, 64, 1, true));
+    // full prefill batch width (different mma ncols config than nb=256)
+    test_cases.emplace_back(new test_fa_pad(512, 4185, 167, 2048, 64, 1, true));
+    // per-tile B2 geometry: W=16 queries per tile, tiles batched in dim 3, mid-tile padding
+    test_cases.emplace_back(new test_fa_pad(512, 1017, 519, 16, 64, 8,   true));
+    test_cases.emplace_back(new test_fa_pad(512, 3777, 63,  16, 64, 128, true));
+
+    // FA with opt-in per-row log-sum-exp tail output (CUDA: mma kernel only, CPU is the reference).
+    // Generic head size, small/odd batch (partial-tile guards), with and without mask + softcap:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,  35, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  256,   8, false,  0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,  10.0f));
+    // long KV, few output tiles -> stream-k seams -> fixup kernels write the tail:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 1, {1, 1}, 8192,   4, true,   0.0f));
+    // MLA shape (DSV4: V is a sub-view of K), GQA, multiple sequences (tail indexing across ne3):
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 2}, 1024, 32, true,   0.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 1}, 4096,  1, true,   0.0f));
+    // DSV4 per-tile geometry: W=16 queries per tile, tiles batched in dim 3:
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 8}, 1024, 16, true,   0.0f));
+    // sinks fold into the LSE (raw half of the DSV4 split carries the sink):
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 4, {1, 1},  512,   8, true,   0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(128, 128, 1, {1, 1}, 8192,   4, true,   0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(576, 512, 1, {16, 2}, 1024, 32, true,   0.0f, true));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -9944,6 +10515,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
+    // DSV4 B2 per-tile probe: dense CSA FA vs W=16 tiled batched FA (T=128 tiles in dim 3)
+    // d32k:  dense kv = 2304 raw + 8192 csa;  tiled kv = 2304 + u_cap(1024)
+    // d131k: dense kv = 2304 raw + 32768 csa; tiled kv = 2304 + u_cap(1536|2048)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   10496, 2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 3328,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   35072, 2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 3840,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 128}, 4352,  16,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // W=64 variant (T=32): better Q-tile efficiency, weaker union cut (u_cap 3072)
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 32},  5376,  64,   true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // post-split production shapes (iter 27, LLAMA_DSV4_FA_SPLIT; nsys-confirmed
+    // instance flash_attn_ext_f16<512,512,8,8> for BOTH halves — k_rot hadamard keeps
+    // rope out of FA, so hd=512, V is a K-view): dense raw half (n_raw=2304, full
+    // ubatch, sinks in LSE) + remainder-only union half (u_cap=4096, W=16, T=128)
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 1},   2304, 2048, true, 0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_lse(512, 512, 1, {64, 128}, 4096, 16,   true, 0.0f, false));
+    // stall-attribution probes: separate short-kv amortization from ne3 batching
+    // (a) dense-style T=1 with tile-short kv: if ~12 TFLOPS, kv length is the cause
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1},   4352,  2048, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // (b) nb sweep at fixed total Q (2048) and fixed per-tile kv 4352
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 16},  4352,  128,  true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 4},   4352,  512,  true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
@@ -10079,6 +10673,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // DSV4 fused lightning-indexer score+topk at DS4-Flash serving depths
+    // (ub2048 prefill at depth 32k/131k -> n_lid = (depth+ub)/4; plus decode nt=1)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  8704, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000, 2048, 1, 512));  // multi-chunk, n_lid % SORT_N != 0
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 512));
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280, 2048, 1, 2048)); // production indexer_top_k (merge_group=2, deep tree)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_MXFP4, 128, 64, 33280, 2048, 1, 2048)); // fp4-mma probe: d131k serving shape, packed K
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 33280,    1, 1, 512));
 
     return test_cases;
 }
