@@ -1633,6 +1633,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "DIR",
+        "directory for the L2 on-disk prompt cache (default: disabled). Evicted or oversized slot "
+        "states are persisted here so a replayed token prefix (session resume, tree/fork jump, "
+        "server restart) resumes from cached KV instead of re-prefilling.",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-mb"}, "N",
+        string_format("on-disk prompt cache budget in MiB (default: %d, 0 - no limit); requires --cache-disk", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-tokens"}, "N",
+        string_format("smallest prompt (tokens) worth persisting to the disk cache (default: %d)", params.cache_disk_min_tokens),
+        [](common_params & params, int value) {
+            params.cache_disk_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-max-entry-mb"}, "N",
+        string_format("largest single slot state (MiB) to divert to the disk cache (default: %d)", params.cache_disk_max_entry_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_max_entry_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MAX_ENTRY_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -3083,7 +3113,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.parse_special = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--ids"},
         string_format("only print the token IDs, in a Python-parseable list form like [1, 2, 3] (default: %s)", params.tokenize_ids ? "true" : "false"),

@@ -1194,6 +1194,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_mtp_draft_meta = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1227,25 +1228,39 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+// the allocator's free path only checks the OUTPUT flag on the tensor it is
+// freeing: a flagged VIEW does not protect its source, whose buffer then gets
+// recycled by later nodes while the view still points into it (reads of the
+// view after graph execution return whatever was scribbled over it). flag the
+// whole view chain so the underlying buffer survives.
+static void graph_set_output(ggml_tensor * t) {
+    for (; t != nullptr; t = t->view_src) {
+        ggml_set_output(t);
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
-        ggml_set_output(t_logits);
+        graph_set_output(t_logits);
     }
     if (t_embd != nullptr) {
-        ggml_set_output(t_embd);
+        graph_set_output(t_embd);
     }
     if (t_embd_pooled != nullptr) {
-        ggml_set_output(t_embd_pooled);
+        graph_set_output(t_embd_pooled);
     }
     if (t_h_nextn != nullptr) {
-        ggml_set_output(t_h_nextn);
+        graph_set_output(t_h_nextn);
+    }
+    if (t_mtp_draft_meta != nullptr) {
+        graph_set_output(t_mtp_draft_meta);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
-                ggml_set_output(t_layer_inp[il]);
+                graph_set_output(t_layer_inp[il]);
             }
         }
     }

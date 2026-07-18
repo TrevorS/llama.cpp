@@ -1,0 +1,107 @@
+# DS4 flag inventory (everything we introduced on this branch)
+
+Single source of truth for every env gate and CLI flag added since the
+upstream base (e3546c794): default, what ON/OFF does, where it's gated, and
+validation status. Update this file in the SAME commit as any default change
+or new flag. (Motivation: HC_FUSED sat silently off for a full bench
+campaign; a missing FUSED_LID cost two crashed d65536 cycles.)
+
+Audit method: `git diff e3546c794..HEAD | grep getenv` + added `add_opt`
+CLI args. `LLAMA_DSV4_COMPRESS_DEBUG` is upstream (#24162), not ours.
+`GGML_NO_BACKTRACE`/`GGML_BACKTRACE_LLDB` are upstream debug knobs.
+
+Last audit: 2026-07-14 (commit 210a22df3 era).
+
+## Serving/bench-relevant flags
+
+| Flag | Default | ON does | OFF does | Notes / validation |
+| --- | --- | --- | --- | --- |
+| `LLAMA_DSV4_FUSED_LID` | **ON** (`=0` disables, since 2026-07-14 P4a) | fused score+top-k op; O(chunk×nt) working set | unfused 8-op chain; O(n_ctx×nt×n_head) relu intermediate | **MANDATORY at depth** — unfused OOMs ≥ d65536 ub2048 (~8.6 GB relu). Token-identical (index-set + greedy gates). |
+| `LLAMA_DSV4_FUSED_LID_TG_DEPTH` | 4096 | — | — | decode (nt=1) uses unfused below this n_lid (faster at bs1 shallow); 0 = always fuse, huge = never |
+| `LLAMA_DSV4_HC_FUSED` | **ON** (`=0` disables, since 2026-07-14) | fused HC weighted_sum/post/sinkhorn kernels | scalar per-stream/unrolled chains (~16k-node decode graphs) | weighted_sum/post token-identical (gate 2); sinkhorn mode 21183→5439 nodes. Campaign refs always ran ON. |
+| `LLAMA_DSV4_CSA_TILE` | **ON, W=16** (`=0` disables) | B2 per-tile union-gather CSA attention (prefill) | dense masked CSA FA | all gates passed (PPL, passkey 5/5, determinism). +12.2% pp@d65k → +61.9% @d262k IQ3. Self-gated: nt_s>W, n_stream==1, nt_s%W==0, n_csa≥TILE_MIN, 256-alignment |
+| `LLAMA_DSV4_FA_SPLIT` | **ON** (`=0` disables) | tile branch runs split attention: dense raw-window FA (ne3=1, full width) + union-only tiled FA, both `ggml_flash_attn_ext_with_lse`, merged by `GGML_OP_DSV4_FA_MERGE`; no `repeat_4d` raw replication | single concat FA per tile (raw window physically replicated T×) | math-identical softmax over the same KV union (class C fp-reassociation); sink lives in the raw half's LSE. Only active inside the CSA_TILE branch with `-fa on` and T ≤ hd. Gates PASSED 2026-07-14: det, A/B byte-identical @42k, passkey 5/5, PPL within noise; +7.1% pp@d65k / +6.1% pp@d131k (new records), tg neutral. See PROGRESS iter 27. |
+| `LLAMA_DSV4_CSA_TILE_UCAP` | 4096 | — | — | per-tile union cap; keep n_raw+u_cap 256-aligned; tail few % tiles truncate at d65k+ (passkey/PPL clean) |
+| `LLAMA_DSV4_CSA_TILE_MIN` | 12288 | — | — | min n_csa to activate (~d49k); below it tiled FA loses (12 vs 41 TFLOPS small-nb latency wall) |
+| `LLAMA_DSV4_CSA_GATHER` | **ON** (`=0` disables, since 2026-07-14 P4a) | B1 decode gather: attend raw window + 512 selected rows only | dense masked CSA FA at decode | +8.3% tg@d65k, grows with depth; decode FA share 2.5% @512k with it ON. First ~25 greedy tokens identical then fp-reassociation. |
+| `LLAMA_DSV4_LID_RADIX` | **ON** (`=0` reverts to bitonic) | radix top-k on the f16 scores buffer: 2x8-bit MSB histogram threshold, ordered-scan compaction (all >T + lowest-index fill at ==T), one small bitonic on the top_k selected — one kernel/token replaces the chunk+merge tree | bitonic chunk+merge tree (SORT_N 4096) | Selection bit-identical to bitonic (-0 canonicalized so key-eq == f32-value-eq; ordered compaction, not atomic-append). Active for half scores (d128), n_lid>top_k, and **now DECODE too** (see DEC_MIN). Expected topk 50.4 to ~5ms @prod shape (op -37%). See PROGRESS iter 34/35. |
+| `LLAMA_DSV4_LID_RADIX_DEC_MIN` | 4096 (`=SORT_N`) | **finding #3 (2026-07-19):** enable single-block radix at DECODE (nt<16) once `n_lid > DEC_MIN`. Radix is O(n_lid) vs bitonic chunk+merge O(n_lid·log²SORT_N), so on a wide decode row even one radix block crushes the bitonic tree — the old nt<16 gate needlessly kept the expensive path | below DEC_MIN, decode keeps bitonic single-chunk | **Validated: test-backend-ops matches CPU ref at the decode shape (n_lid=33280, nt=1); same proven kernel as prefill radix. Op-level topk 131→36µs (-73%) @d131k shape (whole indexer op 427→329µs, -23%); end-to-end tg128 +2.4% @d32k (grows with depth, ~+6% projected @d131k). A/B via `LLAMA_DSV4_LID_RADIX=0`.** Bit-identical selection (radix==bitonic). |
+| `LLAMA_DSV4_LID_FP4_MMA` | **ON, DEPTH-GATED** (`=0` disables; Blackwell + container; auto-int8 above `_MAX_NLID`) | register-resident-K block-scaled fp4 tensor-core score kernel: reads 68B block_mxfp4 rows direct (bypasses staging + int8 pre-quant), mma.sync kind::mxf4 m16n8k64, q packed to e2m1 per head, f16 score store → radix | int8 dp4a score path | **MEASURED WIN 2026-07-15**: op 74.3→38.8ms @33280×2048×2048 (−47.8%, score kernel ~71→~35ms — register-resident K converts the L1 bound). Class B numerics (on the official e2m1 grid). Off-Blackwell → int8 (one-shot warn). **On-model depth A/B 2026-07-15 (both arms CACHE_MXFP4=1, POWER=85): d65k +4.7%, d131k +8.6% — advantage grows with depth. FLIPPED DEFAULT-ON 2026-07-16: PPL 4.2350 vs 4.2352 int8 (identical), passkey@42k 3/3, determinism byte-identical. DEPTH GATE same day (wedges #9-#11): sustained fp4-mma at the d131k shape hard-locks GB10 even under a perfect 75% duty cycle — burst draw 98.3W peak vs int8 83.0W (op-level, watchdog-guarded); duty shapes average power, the firmware latch is burst-sensitive. `LLAMA_DSV4_LID_FP4_MMA_MAX_NLID` (default 24576) falls back to int8 above the cap: keeps +4.7% @d65k, forfeits the unusable +8.6% @d131k. Telemetry: experiments/profiles/wedge-hunt/.** |
+| `LLAMA_DSV4_LID_DEC` | **ON** (`=0` disables, since 2026-07-14 P4a) | dedicated nt=1 decode score kernel (warp-per-comp, int8) | 16-token-tile kernel with 15/16 padding waste at decode | 2.0x kernel, +5.2% tg (+10.8% with GATHER). Same int8 numerics class. |
+| `LLAMA_DSV4_LID_CACHE_MXFP4` | **ON** (`=0` disables; also auto-off when `FUSED_LID=0`) | lid cache stored as packed MXFP4 (68 B/row vs 256 B f16, 3.76×); writes via `GGML_OP_DSV4_QAT_SET_ROWS` (QAT rounding in the scatter); decode reads 68 B rows directly, prefill stages to f16 (bit-exact); transitively engages fp4-mma at shallow depth | f16/f32 lid cache per `-ctk` | P3b. Rows are QAT by construction (the official post-QAT numeric). Forces fused lid at decode. State ver 2. Price: pp −2~3.6%, tg neutral @d131k. **FLIPPED DEFAULT-ON 2026-07-17**: 3 getenv sites (deepseek4 read+write, kv-cache-dsv4 alloc) compute identically — default-on, off if `=0` or `FUSED_LID=0` (graceful, no assert). Gates: op suite zero-tolerance, coherence/determinism, prompt-cache round-trip, perf legs iter 26; shallow on-model smoke (c8192, coherent, clean exit) 2026-07-17. |
+| `GGML_CUDA_POWER_DEBUG` | OFF (`=1`) | governor telemetry at exit: computes / pairs measured / busy-skips / measured+slept ms / effective duty | — | stderr one-liner per device; proved duty accounting exact (85.0%, 0 skips) on both graph shapes 2026-07-16 |
+| `GGML_CUDA_PDL` | **ON** (`=0` disables; upstream env var, we now consume it) | Programmatic Dependent Launch on our 9 DS4 **decode** kernels (dsv4_hc_fused: sinkhorn/weighted_sum/post; dsv4_lid_topk: score_decode/topk_single/union/memb/fa_merge/qat_set_rows) — `<<<>>>` → `ggml_cuda_kernel_launch` wrapper (`cudaLaunchKernelEx` + programmaticStreamSerialization) with device `ggml_cuda_pdl_sync()` before the first producer-data read; hides kernel launch latency in the launch-bound decode regime | plain launches (no overlap) | Prefill scorers (score/int8/fp4mma/prequant/chunk/merge/radix) intentionally NOT converted (compute-bound, launch latency amortized); upstream `lightning-indexer.cu` left verbatim (off our fused path). PDL⊥`__restrict__` → converted kernels drop restrict (matches norm.cu). **Validated 2026-07-19 (finding #1): PPL bit-identical three-way (baseline ≡ PDL=0 ≡ PDL=1 = 5.0177 @ c512/chunks100/-fa on/-ngl 999), test-backend-ops all 6 DSV4 ops OK, tg128@d0 +4.8% (17.85 vs 17.04), MTP gen +2.0% (25.29 vs 24.80, draft-accept byte-identical). Engages only ptxVersion≥90 (CUDA 13, sm_121a) — env kill-switch + PTX-cache guard.** |
+
+| `LLAMA_DSV4_MOE_GATE_FUSE` | **ON** (`=0` disables) | fuse the DeepSeek-V4 `sqrt(softplus)` MoE gating chain into the existing `topk_moe_cuda` kernel — extends the fusion matcher (ggml-cuda.cu) to recognize the 2-op `SOFTPLUS→SQRT` gate (softmax/sigmoid are 1-op) + adds a `sqrt_softplus_warp_inplace` gate transform (replicates ggml `op_softplus`/`op_sqrt` exactly). Collapses ~11 unfused gating ops/layer (softplus/sqrt/reshape/add/argsort/view/get_rows/sum_rows/clamp/div/scale) → 1 kernel/layer (~660→60 launches/token @ 60 layers batch-1) | unfused ggml op chain (the pre-existing path) | **Validated 2026-07-19 (finding #2): fuse=0 bit-identical to baseline (5.0177), fuse=1 = 5.0301 (+0.16σ, within noise — norm-sum warp-reduce reassociation; gate transform + expert selection are bit-identical, only the 6-weight sum reassociates). tg128@d0 +1.0% (18.04 vs 17.86), stacks with PDL. DSV4 has no expert groups (n_expert_groups=0) so the simple gate path fuses cleanly.** NOTE: touches upstream `ggml-cuda.cu` + `topk-moe.cu/.cuh` (rebase-sensitive); kill-switch = clean revert. |
+
+## Power / box-protection (ggml-cuda, 2026-07-15)
+
+Duty-cycle governor targeting the GB10 pattern-#8 hard lockup (sustained deep prefill
+engages firmware SW Power Cap which never clears → wedge). Idea from antirez/ds4
+`--power N` (85% measured faster than 100% there under sustained load). Work intervals
+measured with cudaEvent pairs per graph compute; compensating host sleep before the
+next submit — no added syncs. Applies to every binary (bench/server/cli/tests).
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `GGML_CUDA_POWER` | unset (=100, off) | fixed duty cycle N% in [1,99]: sleep `work×(100−N)/N` between graph computes | throttles avg board power to ~N% of sustained; ring of 8 event pairs + debt accumulator since 2026-07-16 (v1 single-pair proven exact but starvation-prone in principle); `GGML_CUDA_POWER_DEBUG=1` prints accounting at exit. **SURVIVAL STAMPED 2026-07-15: POWER=85 completed 2× consecutive pp2048@d131072 (262/264 t/s) — the sequence that wedged the box 3/3 times at 100%. MANDATORY on deep legs.** |
+| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML distress, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear. Distress = thermal-slowdown/power-brake bits always; SwPowerCap only with GPU util ≥50% (bit is benign at idle on GB10 — parked clocks set it) |
+| `GGML_CUDA_POWER_MIN` | 60 | adaptive floor duty % | only read with ADAPT=1 |
+
+## Speculative decoding / MTP (server + common)
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `LLAMA_DSV4_SPEC_FRONTIER` | **ON** (`=0` disables) | the "frontier rewind" spec-decode rollback (server; code's own name for it) | part of the mtp-21.6 t/s recipe (d29e3b6); `atoi`, any non-zero = on |
+| `LLAMA_MTP_FUSED_DRAFT` | OFF (set = on) | fused MTP draft chain (only when !chain_heads && !is_mem_shared) | opt-in; backend-sampling interaction untested — see speculative.cpp comment |
+| `LLAMA_SPEC_TRACE` | OFF (set = on) | per-round SPECTRACE acc/draft log lines (server) | debug only |
+
+## Refusal ablation / control-vector (llama-adapter + deepseek4)
+
+| Flag | Default | Effect | Notes |
+| --- | --- | --- | --- |
+| `LLAMA_CVEC_ABLATE` | OFF (`=1` enables) | projection ablation `cur -= scale*<cur,dir>*dir` instead of additive steering | the working refusal recipe (bb2814b16): ablate + ffn-only + scale 2.0 |
+| `LLAMA_CVEC_ABLATE_SCALE` | 1.0 | ablation strength | float |
+| `LLAMA_CVEC_SCALE_FILE` | unset | live file re-read every graph build — runtime scale sweeps on one model load | added after the kill/relaunch hard-reset (crash memory #6) |
+| `LLAMA_CVEC_AT_FFN` | OFF (set = on) | apply cvec at FFN (and attn unless FFN_ONLY) | |
+| `LLAMA_CVEC_FFN_ONLY` | OFF (set = on) | restrict cvec to FFN — matches ds4.c exactly | required for the 100%-flip result |
+| `CAPTURE_PROMPTS` / `CAPTURE_OUT` / `CAPTURE_OUT_THINK` / `CAPTURE_TENSOR` | unset | activation-capture tool env (prompt list, output paths, tensor to capture) | relocated to ~/Projects/ds4-refusal/refusal-capture (2026-07-16); the runtime CVEC ablation mechanism stays in-branch (llama-adapter.cpp + deepseek4.cpp) |
+
+## Server CLI flags we added (pi-ds4-flash L2 KV tier, dcd503d94)
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--cache-disk DIR` | unset (tier off) | enables the disk KV-state tier in DIR |
+| `--cache-disk-mb` | 65536 | on-disk budget MiB (0 = unlimited) |
+| `--cache-disk-min-tokens` | 2048 | smallest prompt worth persisting |
+| `--cache-disk-max-entry-mb` | 4096 | largest single state diverted to disk |
+
+## Debug/instrumentation flags (never in perf runs)
+
+| Flag | Purpose |
+| --- | --- |
+| `LLAMA_DSV4_COMPRESS_DEBUG` | compressor debug prints |
+| `GGML_SCHED_DEBUG=2` + `-lv 9` | full graph/split dump (node-count attribution) |
+
+## Retired / superseded
+
+- `LLAMA_DSV4_CSA_UNION`, `LLAMA_DSV4_CSA_UNION_CAP`, `LLAMA_DSV4_CSA_UNION_FULL`
+  — whole-batch union path, replaced by `LLAMA_DSV4_CSA_TILE` (iter 18d/19).
+- `LLAMA_DSV4_LID_INT4` — negative result (compute-bound on nibble→int8 expansion, 1.6x slower than int8), reverted (iter 15).
+- `LLAMA_DSV4_LID_INT8` — flag retired 2026-07-17: int8 dp4a is now the unconditional d128 non-fp4 score path; the wmma128 fallback kernel it A/B'd against was removed (superseded, only reachable with `=0`).
+- `LLAMA_DSV4_LID_DUMP` / `_NLID`, `LLAMA_DSV4_UNION_STATS`, `LLAMA_DEBUG_NEXTN` — debug/oracle instrumentation removed 2026-07-17 (minimal-diff refinement pass).
+
+## Canonical bench/serving env
+
+As of P4a (2026-07-14) the fast profile IS the default — no env needed:
+FUSED_LID, CSA_GATHER, LID_DEC, CSA_TILE, HC_FUSED all ON (int8 dp4a scoring
+is unconditional since 2026-07-17). Since 2026-07-17 LID_CACHE_MXFP4 is also
+default-ON (packed lid container; also engages fp4-mma at shallow depth) —
+set `=0` to fall back to the f16 lid cache.
+
+Pre-P4a baseline reproduction (legacy flags off; `LID_INT8=0` retired — the
+int8 score path can no longer be disabled):
+
+```
+LLAMA_DSV4_FUSED_LID=0 LLAMA_DSV4_CSA_GATHER=0 LLAMA_DSV4_LID_DEC=0
+```

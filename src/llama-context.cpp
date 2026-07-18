@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -101,6 +102,14 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    // DSV4: clamp to its true 1-token rollback bound (and default to it) so it is
+    // classified RS. Deeper direct rollbacks trim only the raw cache and leave the
+    // compression state inconsistent (verified: greedy diverges within ~10 tokens);
+    // they are safe only after a checkpoint restore, which the RS classification
+    // routes them through.
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        cparams.n_rs_seq = cparams.n_rs_seq == 0 ? 1 : std::min(cparams.n_rs_seq, 1u);
+    }
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
@@ -116,12 +125,15 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.mtp_draft_chain      = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // one extra slot: index n_layer taps the final backbone output (the
+    // "input of layer n_layer"), which layer-tap drafts (EAGLE3/DFlash) need
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -933,6 +945,13 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
+const float * llama_context::get_mtp_draft_meta(uint32_t * count) {
+    if (count) {
+        *count = (uint32_t) mtp_draft_meta.size();
+    }
+    return mtp_draft_meta.empty() ? nullptr : mtp_draft_meta.data();
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -941,7 +960,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             throw std::runtime_error("no nextn embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd_out();
+        const uint32_t n_embd = model.hparams.n_embd_nextn();
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1156,12 +1175,18 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // without this reserve the export tensor is not part of the worst-case
+    // allocation: after a graph-shape change (e.g. an nt>1 verify followed by
+    // an nt=1 decode) its memory gets recycled and the extracted rows go
+    // stale - same failure mode as set_embeddings_layer_inp below
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1171,6 +1196,16 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_mtp_draft_chain(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    // no sched reserve: chain graphs are excluded from reserve-shape ubatches
+    // anyway (nt gate) and the meta tensor is protected by the OUTPUT-flag
+    // propagation in set_outputs. This keeps per-decode toggling free (the
+    // MTP driver flips it around each draft decode).
+    cparams.mtp_draft_chain = value;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1534,7 +1569,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_out();
+        const uint32_t n_embd = hparams.n_embd_nextn();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -1987,11 +2022,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
+                const uint32_t n_embd  = hparams.n_embd_nextn();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+            }
+        }
+
+        // extract MTP fused chained-draft meta (small: [K] token ids per chained ubatch)
+        if (cparams.mtp_draft_chain) {
+            auto * t_meta = res->get_mtp_draft_meta();
+            if (t_meta != nullptr) {
+                ggml_backend_t backend_meta = ggml_backend_sched_get_tensor_backend(sched.get(), t_meta);
+                GGML_ASSERT(backend_meta != nullptr);
+
+                mtp_draft_meta.resize(ggml_nelements(t_meta));
+                ggml_backend_tensor_get_async(backend_meta, t_meta, mtp_draft_meta.data(), 0, ggml_nbytes(t_meta));
+            } else {
+                mtp_draft_meta.clear();
             }
         }
 
@@ -2097,14 +2146,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
-    embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    const uint32_t n_embd_nextn = model.hparams.n_embd_nextn();
+
+    logits.size     = has_logits     ? n_vocab*n_outputs_max        : 0;
+    embd.size       = has_embd       ? n_embd_out*n_outputs_max     : 0;
+    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max   : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        embd_nextn.size = (size_t) n_embd_nextn * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2283,8 +2334,9 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            const uint64_t n_embd_nextn = model.hparams.n_embd_nextn();
+            for (uint64_t k = 0; k < n_embd_nextn; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
             }
         }
 
@@ -2340,8 +2392,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_DEEPSEEK4_MTP ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
+        // the 8*n_tensors default budget underestimates them badly
+        return std::max<uint32_t>(std::max(n_tokens * 40, 4096u), 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
@@ -3576,7 +3631,10 @@ llama_context * llama_init_from_model(
     }
 
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.n_layer_nextn == 0) {
+        model->hparams.n_layer_nextn == 0 &&
+        model->arch != LLM_ARCH_DEEPSEEK4_MTP) {
+        // standalone draft-head arches are ALL MTP with zero trunk layers, so
+        // they keep n_layer_nextn == 0 to preserve n_layer() accounting
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }
@@ -3725,6 +3783,38 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_mtp_draft_chain(llama_context * ctx, bool value) {
+    ctx->set_mtp_draft_chain(value);
+}
+
+bool llama_dsv4_spec_stash(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->synchronize();
+
+    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
+    if (kv == nullptr) {
+        return false;
+    }
+
+    return kv->spec_frontier_stash(seq_id, kv->seq_pos_max(seq_id));
+}
+
+bool llama_dsv4_spec_restore(llama_context * ctx, llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject) {
+    ctx->synchronize();
+
+    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
+    if (kv == nullptr) {
+        return false;
+    }
+
+    return kv->spec_frontier_restore(seq_id, p0_reject, p1_reject);
+}
+
+const float * llama_get_mtp_draft_meta(llama_context * ctx, uint32_t * count) {
+    ctx->synchronize();
+
+    return ctx->get_mtp_draft_meta(count);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
