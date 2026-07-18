@@ -1099,7 +1099,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 *Options:*
 
-`filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
+`filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter. Returns 404 if the file does not exist (fork extension; upstream reports a generic 400).
 
 **Response format**
 
@@ -1123,6 +1123,37 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 {
     "id_slot": 0,
     "n_erased": 1745
+}
+```
+
+### GET `/slots/saves`: List slot save files (fork extension)
+
+Lists the files in the `--slot-save-path` directory, sorted newest-first (ties broken by filename). Only filenames that would be accepted by a later `?action=restore` are included. This is a pure filesystem read - it does not go through the task queue, so it responds even while all slots are busy and does not wake a sleeping server.
+
+**Response format**
+
+```json
+{
+    "saves": [
+        {
+            "filename": "slot_save_file.bin",
+            "size_bytes": 14309796,
+            "mtime": 1783897130
+        }
+    ]
+}
+```
+
+### DELETE `/slots/saves?filename=...`: Delete a slot save file (fork extension)
+
+Deletes the named file from the `--slot-save-path` directory. Returns 404 if the file does not exist, 400 if the filename fails validation.
+
+**Response format**
+
+```json
+{
+    "success": true,
+    "filename": "slot_save_file.bin"
 }
 ```
 

@@ -90,6 +90,8 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    const float * get_mtp_draft_meta(uint32_t * count);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -116,6 +118,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_mtp_draft_chain(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -303,6 +306,11 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // MTP fused chained-draft export: [K] token ids as floats,
+    // populated per decode when cparams.mtp_draft_chain is enabled and the
+    // graph sets llm_graph_result::t_mtp_draft_meta
+    std::vector<float> mtp_draft_meta;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
