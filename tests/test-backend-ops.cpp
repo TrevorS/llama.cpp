@@ -10309,6 +10309,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // DSV4-Flash routed-expert shapes (256 experts, top-6): gate/up [4096->2048], down [2048->4096].
+    // n sweeps the decode (1) and MTP-verify (2..7) batch range covered by the mmvq moe kernel.
+    for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 2, 3, 6, 7}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
+        }
+    }
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;
