@@ -2746,7 +2746,6 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     args.sqrt_softplus   = false;
     args.softmax         = false;
     args.delayed_softmax = false;
-    args.sqrt_softplus   = false;
     args.prob_bias       = false;
     args.norm            = false;
 
