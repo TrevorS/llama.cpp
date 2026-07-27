@@ -2750,6 +2750,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         } else if (unary_op == GGML_UNARY_OP_SOFTPLUS && node_idx + 1 < n_nodes &&
                    nodes[node_idx + 1]->op == GGML_OP_SQRT && nodes[node_idx + 1]->src[0] == nodes[node_idx]) {
             // sqrt(softplus(x)) scoring (DeepSeek-V4)
+            // LLAMA_DSV4_MOE_GATE_FUSE=0 keeps the unfused gate chain (bisect lever, see experiments/ds4-tile/FLAGS.md)
+            static const bool dsv4_gate_fuse = getenv("LLAMA_DSV4_MOE_GATE_FUSE") == nullptr ||
+                                               std::atoi(getenv("LLAMA_DSV4_MOE_GATE_FUSE")) != 0;
+            if (!dsv4_gate_fuse) {
+                return false;
+            }
             args.sqrt_softplus = true;
             node_idx++;
         } else {
