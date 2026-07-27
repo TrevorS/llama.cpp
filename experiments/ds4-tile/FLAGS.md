@@ -43,7 +43,12 @@ stamp and are recorded in the PDL / MOE_GATE_FUSE / LID_RADIX_DEC_MIN rows.
 ## Power / box-protection (ggml-cuda, 2026-07-15)
 
 Duty-cycle governor targeting the GB10 pattern-#8 hard lockup (sustained deep prefill
-engages firmware SW Power Cap which never clears → wedge). Idea from antirez/ds4
+engages firmware SW Power Cap which never clears → wedge). **2026-07-27 revision:
+the depth-based trigger model is falsified — a #8-family wedge hit a SHALLOW c8192
+MTP serving leg with ADAPT=1 active (see the ADAPT row's negative finding). Working
+model is now burst structure: duty shapes average power, the firmware latch is
+burst-sensitive (first established in the fp4-mma depth-gating analysis, iter 42).**
+Idea from antirez/ds4
 `--power N` (85% measured faster than 100% there under sustained load). Work intervals
 measured with cudaEvent pairs per graph compute; compensating host sleep before the
 next submit — no added syncs. Applies to every binary (bench/server/cli/tests).
@@ -51,7 +56,7 @@ next submit — no added syncs. Applies to every binary (bench/server/cli/tests)
 | Flag | Default | Effect | Notes |
 | --- | --- | --- | --- |
 | `GGML_CUDA_POWER` | unset (=100, off) | fixed duty cycle N% in [1,99]: sleep `work×(100−N)/N` between graph computes | throttles avg board power to ~N% of sustained; ring of 8 event pairs + debt accumulator since 2026-07-16 (v1 single-pair proven exact but starvation-prone in principle); `GGML_CUDA_POWER_DEBUG=1` prints accounting at exit. **SURVIVAL STAMPED 2026-07-15: POWER=85 completed 2× consecutive pp2048@d131072 (262/264 t/s) — the sequence that wedged the box 3/3 times at 100%. MANDATORY on deep legs.** |
-| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML distress, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear. Distress = thermal-slowdown/power-brake bits always; SwPowerCap only with GPU util ≥50% (bit is benign at idle on GB10 — parked clocks set it) |
+| `GGML_CUDA_POWER_ADAPT` | OFF (`=1`) | closed loop: run at `GGML_CUDA_POWER` (or 100) until NVML distress, then drop to `GGML_CUDA_POWER_MIN` until clear 10 s | Linux-only (dlopen libnvidia-ml, no build dep); poll 500 ms; logs engage/clear. Distress = thermal-slowdown/power-brake bits always; SwPowerCap only with GPU util ≥50% (bit is benign at idle on GB10 — parked clocks set it). **NEGATIVE FINDING 2026-07-26 (logged 07-27): ADAPT=1 did NOT prevent a pattern-#8 wedge on a SHALLOW leg** — `-c 8192` MTP serving bench (session c4b77732), ~2 min into the MTP arm after ~1 h model-resident; journal-stop 15:25:47, no OOM/Xid, memory flat ~13 G avail; box down until power cycle 07-27 14:24. Falsifies depth-as-trigger. Mechanism hypothesis: MTP's draft/verify alternation is sub-graph-timescale burst variance that per-GRAPH granularity (ADAPT or fixed `GGML_CUDA_POWER=N`) samples too coarsely to smooth — a rerun that wedges at fixed 85 would confirm (same granularity). Next lever: per-layer granularity (`GGML_CUDA_POWER_GRANULARITY`, planned E2). Caveats: 07-26 recovery may not have been a true PD cold-drain, so a degraded-PD contribution isn't fully excluded (D0 07-27 passed healthy: 2333–2541 MHz, ≤99.9 W under load); pre-wedge speed-bench baseline 17.09 t/s discarded per the never-mix-legs-across-a-wedge rule. |
 | `GGML_CUDA_POWER_MIN` | 60 | adaptive floor duty % | only read with ADAPT=1 |
 
 ## Speculative decoding / MTP (server + common)
