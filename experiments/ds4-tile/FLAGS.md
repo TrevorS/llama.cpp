@@ -10,7 +10,13 @@ Audit method: `git diff e3546c794..HEAD | grep getenv` + added `add_opt`
 CLI args. `LLAMA_DSV4_COMPRESS_DEBUG` is upstream (#24162), not ours.
 `GGML_NO_BACKTRACE`/`GGML_BACKTRACE_LLDB` are upstream debug knobs.
 
-Last audit: 2026-07-14 (commit 210a22df3 era).
+Last audit: 2026-07-27 (tip 6f440a8f2 on upstream 1cbfd1988, post-rebase).
+Cross-check method: every `LLAMA_*`/`GGML_*`/`DS4_*`/`CAPTURE_*` token in this
+file grepped against ggml/ src/ common/ tools/. Result: 12 expected absences
+(documented retirements/relocations below), 1 drift bug — `LLAMA_DSV4_MOE_GATE_FUSE`
+consumed by upstream 846e991e during the 07-26 rebase, kill-switch restored
+2026-07-27 (see its row). Findings #1–#3 (2026-07-19) postdate the previous
+stamp and are recorded in the PDL / MOE_GATE_FUSE / LID_RADIX_DEC_MIN rows.
 
 ## Serving/bench-relevant flags
 
