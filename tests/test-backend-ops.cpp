@@ -6089,19 +6089,21 @@ struct test_dsv4_qat_set_rows : public test_case {
 struct test_dsv4_fa_merge : public test_case {
     const int64_t dv, nh, nq, ns;
     const int64_t wb, tb; // b-side tiling: b is [dv, nh, wb, tb+1] with nh*wb*tb == nh*nq*ns (0 = same shape as a)
-    const bool poison_b;  // NaN-poison the b leg (fully-masked -inf LSE) to exercise the 0-weight skip
+    const int poison;     // NaN-poison legs (fully-masked -inf LSE): bit0 = a, bit1 = b.
+                          // The per-leg 0-weight skip must not leak the NaN; both legs
+                          // poisoned (3) = m == -inf, output must be exact zeros.
 
     std::string vars() override {
         return "dv=" + std::to_string(dv) + ",nh=" + std::to_string(nh) +
                ",nq=" + std::to_string(nq) + ",ns=" + std::to_string(ns) +
                ",wb=" + std::to_string(wb) + ",tb=" + std::to_string(tb) +
-               ",poison_b=" + std::to_string(poison_b);
+               ",poison=" + std::to_string(poison);
     }
 
     double max_nmse_err() override { return 1e-6; }
 
-    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0, bool poison_b = false)
-        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb), poison_b(poison_b) {}
+    test_dsv4_fa_merge(int64_t dv, int64_t nh, int64_t nq, int64_t ns, int64_t wb = 0, int64_t tb = 0, int poison = 0)
+        : dv(dv), nh(nh), nq(nq), ns(ns), wb(wb), tb(tb), poison(poison) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // srcs carry the LSE tail slice: [DV, H, Q, S+1]; uniform init doubles
@@ -6120,7 +6122,9 @@ struct test_dsv4_fa_merge : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t);
-            if (poison_b && strcmp(t->name, "b") == 0) {
+            const bool poison_this = (poison & 1 && strcmp(t->name, "a") == 0) ||
+                                     (poison & 2 && strcmp(t->name, "b") == 0);
+            if (poison_this) {
                 // fully-masked part: NaN values with a -inf LSE tail — the
                 // merge must skip it entirely (0-weight x NaN must not leak)
                 std::vector<float> buf(ggml_nelements(t), std::numeric_limits<float>::quiet_NaN());
@@ -9865,9 +9869,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128));
     test_cases.emplace_back(new test_dsv4_fa_merge(128, 8, 64, 1, 16, 4));
     // NaN-poison the b leg (fully-masked -inf LSE): the 0-weight skip must not leak
-    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, true));
-    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, true));
-    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, true));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, 2));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, 2));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, 2));
+    // a-leg poison: the skip is written per-leg (wa/wb independently), exercise the wa half too
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, 1));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, 1));
+    // both legs fully masked (m == -inf): must emit exact zeros, never NaN
+    // (the elementwise NaN check is the assertion; an all-zero reference makes nmse vacuous)
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 64, 16, 8, 0, 0, 3));
+    test_cases.emplace_back(new test_dsv4_fa_merge(512, 16, 2048, 1, 16, 128, 3));
+    test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, 3));
 
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row
