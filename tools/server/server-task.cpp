@@ -1642,6 +1642,28 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::~server_prompt_cache() {
+    // spill the surviving RAM tier to the disk tier so it outlives the process. Spilling only
+    // queues (pure moves of already-serialized bytes, no llama_context access) — the disk cache
+    // dtor, which runs after this body as a member destructor, drains the write queue before
+    // joining its writer thread, so every queued state lands on disk before shutdown completes.
+    if (!disk) {
+        return;
+    }
+
+    const size_t n_total = states.size();
+
+    size_t n_spilled = 0;
+    for (auto & state : states) {
+        if (disk->spill(std::move(state))) {
+            n_spilled++;
+        }
+    }
+    states.clear();
+
+    SRV_INF("prompt cache: shutdown spill queued %zu/%zu RAM-tier prompts to the disk cache\n", n_spilled, n_total);
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1894,7 +1916,16 @@ void server_prompt_cache::update() {
 
 namespace {
 
-constexpr uint32_t DKV_MAGIC   = 0x31564B44; // "DKV1"
+// .dkv fixed header layout (v2 — all fields little-endian, written back-to-back, no padding):
+//   off  0  u32 magic          "DKV2"
+//   off  4  u64 compat_hash
+//   off 12  u32 hits           \ rewritten in place on every hit (ds4_kvstore_touch_file
+//   off 16  i64 last_hit_unix  / semantics) so the decay score survives restarts
+//   off 24  u64 n_tokens, then tokens + blobs (see write_entry)
+// v1 files lack the hits/last_hit fields; the magic gate skips them and a later spill of
+// the same prefix overwrites the file in place (self-healing, no back-compat reader).
+constexpr uint32_t DKV_MAGIC   = 0x32564B44; // "DKV2"
+constexpr std::streamoff DKV_OFF_HITS = sizeof(uint32_t) + sizeof(uint64_t); // = 12, after magic + compat_hash
 constexpr double   DKV_HALFLIFE_SECONDS = 6.0 * 3600.0; // 6h hit half-life (ds4_kvstore)
 // cap the pending-spill queue: each entry is a full (main+drft) state blob,
 // GiB-scale at long context. Unbounded, it would hold in RAM the very states
@@ -1963,6 +1994,19 @@ bool dkv_r_blob(std::istream & is, std::vector<uint8_t> & b) {
     return true;
 }
 
+// rewrite just the hits/last_hit_unix header fields of an existing entry in place —
+// a full-file rewrite would be GiB-scale I/O for a counter bump. Best-effort: a lost
+// update (entry replaced/removed concurrently) only costs decay-score accuracy.
+void dkv_touch_file(const std::string & path, uint32_t hits, int64_t last_hit_unix) {
+    std::fstream fs(path, std::ios::binary | std::ios::in | std::ios::out);
+    if (!fs) {
+        return;
+    }
+    fs.seekp(DKV_OFF_HITS);
+    dkv_w(fs, hits);
+    dkv_w(fs, last_hit_unix);
+}
+
 } // namespace
 
 server_prompt_disk_cache::server_prompt_disk_cache(std::string dir, std::string compat_desc,
@@ -2016,10 +2060,10 @@ double server_prompt_disk_cache::score(const entry & e, int64_t now_unix) const 
     return (eff_hits + 1.0) * double(e.tokens.size()) / std::max<size_t>(1, e.file_size);
 }
 
-void server_prompt_disk_cache::spill(server_prompt_cache_state && state) {
+bool server_prompt_disk_cache::spill(server_prompt_cache_state && state) {
     // only text-token prompts can be keyed/replayed by token prefix
     if (state.prompt.tokens.has_mtmd || state.prompt.tokens.size() < min_tokens || state.data.size() == 0) {
-        return;
+        return false;
     }
 
     std::lock_guard<std::mutex> lk(mtx);
@@ -2028,7 +2072,7 @@ void server_prompt_disk_cache::spill(server_prompt_cache_state && state) {
     const llama_tokens & toks = state.prompt.tokens.get_tokens();
     for (const auto & e : index) {
         if (dkv_common_prefix(e.tokens, toks) == toks.size()) {
-            return;
+            return false;
         }
     }
 
@@ -2038,6 +2082,8 @@ void server_prompt_disk_cache::spill(server_prompt_cache_state && state) {
     }
     write_q.push_back(std::move(state));
     cv.notify_one();
+
+    return true;
 }
 
 void server_prompt_disk_cache::writer_loop() {
@@ -2066,6 +2112,33 @@ bool server_prompt_disk_cache::write_entry(const server_prompt_cache_state & p) 
     const std::string path = path_for(toks);
     const std::string tmp  = path + ".tmp";
 
+    // the serialization below is deterministic, so the entry's on-disk size is known exactly
+    // up front: reserve it by evicting BEFORE the write lands — evicting after would
+    // transiently overshoot the budget by up to a full (GiB-scale) entry
+    size_t bytes_new = 2*sizeof(uint32_t) + 2*sizeof(uint64_t)              // magic, compat_hash, hits, last_hit_unix
+                     + sizeof(uint64_t) + toks.size()*sizeof(llama_token)   // n_toks + tokens
+                     + sizeof(uint64_t) + p.data.main.size()                // main blob
+                     + sizeof(uint64_t) + p.data.drft.size()                // drft blob
+                     + sizeof(uint32_t);                                    // n_ckpt
+    for (const auto & c : p.prompt.checkpoints) {
+        bytes_new += sizeof(int64_t) + 2*sizeof(int32_t)
+                   + sizeof(uint64_t) + c.data_tgt.size()
+                   + sizeof(uint64_t) + c.data_dft.size()
+                   + sizeof(uint64_t) + c.data_spec.size();
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (limit_bytes > 0 && bytes_new > limit_bytes) {
+            SRV_WRN("disk prompt cache: %zu-token entry (%.3f MiB) exceeds the disk budget (%zu MiB), skipping\n",
+                    toks.size(), bytes_new / (1024.0 * 1024.0), limit_bytes / (1024 * 1024));
+            return false;
+        }
+        evict_locked(bytes_new);
+    }
+
+    const int64_t now = (int64_t) std::time(nullptr);
+
     {
         std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
         if (!os) {
@@ -2075,6 +2148,8 @@ bool server_prompt_disk_cache::write_entry(const server_prompt_cache_state & p) 
 
         dkv_w(os, DKV_MAGIC);
         dkv_w(os, compat_hash);
+        dkv_w(os, (uint32_t) 0); // hits — rewritten in place on each hit (DKV_OFF_HITS)
+        dkv_w(os, now);          // last_hit_unix
 
         uint64_t n_toks = toks.size();
         dkv_w(os, n_toks);
@@ -2123,10 +2198,11 @@ bool server_prompt_disk_cache::write_entry(const server_prompt_cache_state & p) 
         e.tokens        = toks;
         e.file_size     = fsize;
         e.hits          = 0;
-        e.last_hit_unix = (int64_t) std::time(nullptr);
+        e.last_hit_unix = now;
         index.push_back(std::move(e));
 
-        evict_locked();
+        // no post-write evict: the pre-write reserve above is exact, and only load() can
+        // touch the index between the reserve and here (it only shrinks it)
     }
 
     SRV_TRC("disk prompt cache: wrote %zu-token entry (%.3f MiB) -> %s\n",
@@ -2134,12 +2210,12 @@ bool server_prompt_disk_cache::write_entry(const server_prompt_cache_state & p) 
     return true;
 }
 
-void server_prompt_disk_cache::evict_locked() {
+void server_prompt_disk_cache::evict_locked(size_t bytes_incoming) {
     if (limit_bytes == 0) {
         return;
     }
     const int64_t now = (int64_t) std::time(nullptr);
-    while (disk_size() > limit_bytes && !index.empty()) {
+    while (disk_size() + bytes_incoming > limit_bytes && !index.empty()) {
         // drop the lowest-scoring entry
         auto worst = index.begin();
         double worst_score = score(*worst, now);
@@ -2165,6 +2241,8 @@ bool server_prompt_disk_cache::load(server_prompt & prompt, const server_tokens 
     }
 
     std::string path;
+    uint32_t hits_new     = 0;
+    int64_t  last_hit_new = 0;
     {
         std::lock_guard<std::mutex> lk(mtx);
         if (index.empty()) {
@@ -2202,7 +2280,13 @@ bool server_prompt_disk_cache::load(server_prompt & prompt, const server_tokens 
         path = it_best->path;
         it_best->hits         += 1;
         it_best->last_hit_unix = (int64_t) std::time(nullptr);
+
+        hits_new     = it_best->hits;
+        last_hit_new = it_best->last_hit_unix;
     }
+
+    // persist the hit bump into the file header so the decay score survives restarts
+    dkv_touch_file(path, hits_new, last_hit_new);
 
     // read + restore without the lock
     std::ifstream is(path, std::ios::binary);
@@ -2222,6 +2306,12 @@ bool server_prompt_disk_cache::load(server_prompt & prompt, const server_tokens 
         index.erase(std::remove_if(index.begin(), index.end(),
                         [&](const entry & e) { return e.path == path; }), index.end());
         std::error_code ec; std::filesystem::remove(path, ec);
+        return true;
+    }
+
+    uint32_t f_hits     = 0; // the in-RAM index is authoritative while running —
+    int64_t  f_last_hit = 0; // these are only consumed by scan_existing() at startup
+    if (!dkv_r(is, f_hits) || !dkv_r(is, f_last_hit)) {
         return true;
     }
 
@@ -2313,11 +2403,14 @@ void server_prompt_disk_cache::scan_existing() {
         std::ifstream is(de.path(), std::ios::binary);
         if (!is) { continue; }
 
-        uint32_t magic = 0;
-        uint64_t chash = 0;
-        uint64_t n_toks = 0;
+        uint32_t magic    = 0;
+        uint64_t chash    = 0;
+        uint32_t hits     = 0;
+        int64_t  last_hit = 0;
+        uint64_t n_toks   = 0;
         if (!dkv_r(is, magic) || magic != DKV_MAGIC ||
             !dkv_r(is, chash) || chash != compat_hash ||
+            !dkv_r(is, hits)  || !dkv_r(is, last_hit) ||
             !dkv_r(is, n_toks)) {
             continue; // foreign / incompatible / truncated — leave the file, just skip
         }
@@ -2336,8 +2429,11 @@ void server_prompt_disk_cache::scan_existing() {
         e.path          = de.path().string();
         e.tokens        = std::move(toks);
         e.file_size     = (size_t) std::filesystem::file_size(de.path(), ec);
-        e.hits          = 0;
-        e.last_hit_unix = (int64_t) std::time(nullptr);
+        // restore the persisted hit counters — resetting them here would make the
+        // decay-based eviction score meaningless across restarts. A bogus/future
+        // last_hit is harmless: score() clamps the age at 0.
+        e.hits          = hits;
+        e.last_hit_unix = last_hit;
         index.push_back(std::move(e));
     }
 
