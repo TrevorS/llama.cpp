@@ -658,6 +658,12 @@ static __global__ void dsv4_union_kernel(
                 word &= word - 1;
             }
         }
+        // pad with n_csa-1: the MAXIMUM representable index, so ascending order
+        // is preserved and dsv4_memb_kernel's lower_bound (first match) resolves
+        // each index to exactly one slot — if n_csa-1 is genuinely in the union
+        // it sits at the last real slot and wins the search; if not, no query
+        // selected it and the pad slots are never unmasked. Padding with any
+        // OTHER value (or unsorted) would double-count via duplicate matches.
         for (; pos < u_max; pos++) o[pos] = n_csa - 1;
     }
 }
@@ -1253,6 +1259,12 @@ static void dsv4_topk_launch(
         sets = (sets + merge_group - 1) / merge_group;
         scratch_per_token += (int64_t) sets * top_k;
     }
+    // CUDA-graph capture invariant: this RAII scratch is released back to the
+    // pool on return while a captured graph keeps the raw pointer. Safe only
+    // because (a) the size derives from tensor ne (covered by the property
+    // scan) and (b) every scratch buffer is WRITTEN by a kernel inside the
+    // same captured graph before any kernel reads it. A scratch whose producer
+    // runs outside the captured graph would silently break replay.
     ggml_cuda_pool_alloc<uint32_t> scratch_alloc(pool, (size_t) n_tokens * scratch_per_token);
     uint32_t * scratch = scratch_alloc.get();
 
