@@ -1105,9 +1105,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_FUSED",
     "DSV4_QAT_SET_ROWS",
     "DSV4_FA_MERGE",
+    "DSV4_UNION_GATHER",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1227,9 +1228,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_fused(x,a,b,c)",
     "dsv4_qat_set_rows(a,b,c)",
     "dsv4_fa_merge(a,b)",
+    "dsv4_union_gather(src,idx)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5639,6 +5641,32 @@ struct ggml_tensor * ggml_dsv4_fa_merge(
     result->op     = GGML_OP_DSV4_FA_MERGE;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_dsv4_union_gather
+
+struct ggml_tensor * ggml_dsv4_union_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * idx,
+        enum ggml_type        dst_type) {
+    GGML_ASSERT(src);
+    GGML_ASSERT(idx);
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst_type == GGML_TYPE_F16 || dst_type == GGML_TYPE_F32);
+    // rows may be strided (cache view) but elements within a row must be dense
+    GGML_ASSERT(src->nb[0] == sizeof(float));
+    GGML_ASSERT(src->ne[2] == 1 && src->ne[3] == 1);
+    GGML_ASSERT(idx->ne[2] == 1 && idx->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, dst_type, src->ne[0], 1, idx->ne[0], idx->ne[1]);
+
+    result->op     = GGML_OP_DSV4_UNION_GATHER;
+    result->src[0] = src;
+    result->src[1] = idx;
 
     return result;
 }
