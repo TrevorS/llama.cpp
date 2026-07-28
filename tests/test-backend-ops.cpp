@@ -10317,6 +10317,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, n, 4096));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 4096, n, 2048));
         }
+        // sequential-stream control: one dense GEMV over the same total weight bytes as the
+        // n=7 gathered sweep above (42 expert slabs x 4096x2048) — gather-vs-sequential reference
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 86016, 1, 4096, {1, 1}, {1, 1}));
     }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
