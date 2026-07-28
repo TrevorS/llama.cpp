@@ -79,9 +79,11 @@ def test_cache_disk_persists_across_restart(tmp_path):
     server.log_path = str(log2)
     server.start()
 
+    # NO id_slot pin here: selecting a slot by id bypasses the prompt-cache
+    # save/load path entirely (only LRU/similarity selection sets update_cache) —
+    # the restore can only fire on an unpinned request
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of France?",
-        "id_slot": 0,
         "cache_prompt": True,
         "n_predict": 4,
     })
