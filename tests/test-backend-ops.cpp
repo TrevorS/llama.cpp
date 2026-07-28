@@ -5934,19 +5934,24 @@ struct test_dsv4_lid_topk : public test_case {
     const int64_t nt_s;
     const int64_t n_stream;
     const int top_k;
+    const int64_t n_past;  // causal mask: row t keeps keys [0, n_past+t], -INF above.
+                           // -1 = uniform-random mask, i.e. NO masked rows at all —
+                           // the score kernels' mask-probe early-out never fires.
 
     std::string vars() override {
         return std::string("k_type=") + ggml_type_name(k_type) +
                ",d_idx=" + std::to_string(d_idx) + ",n_head=" + std::to_string(n_head) +
                ",n_lid=" + std::to_string(n_lid) + ",nt_s=" + std::to_string(nt_s) +
-               ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k);
+               ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k) +
+               ",n_past=" + std::to_string(n_past);
     }
 
     test_dsv4_lid_topk(ggml_type k_type = GGML_TYPE_F32,
             int64_t d_idx = 128, int64_t n_head = 64, int64_t n_lid = 2048,
-            int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512)
+            int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512,
+            int64_t n_past = -1)
         : k_type(k_type), d_idx(d_idx), n_head(n_head), n_lid(n_lid),
-          nt_s(nt_s), n_stream(n_stream), top_k(top_k) {}
+          nt_s(nt_s), n_stream(n_stream), top_k(top_k), n_past(n_past) {}
 
     // Output is index sets per row; compare order-independently (top-k selection
     // is a set — the downstream mask does not care about intra-row order).
@@ -5994,6 +5999,37 @@ struct test_dsv4_lid_topk : public test_case {
         ggml_tensor * out = ggml_dsv4_lid_topk(ctx, q, k, w, mask, top_k);
         ggml_set_name(out, "out");
         return out;
+    }
+
+    // n_past >= 0 builds a production-shaped causal mask: exactly -INFINITY
+    // above the diagonal (the value set_input_kq_mask writes as mask_drop), so
+    // the CUDA score kernels' mask-probe early-out fires on the same rows it
+    // fires on in serving. The early-out skips the score COMPUTE but must still
+    // STORE -INF — the top-k scans the whole [0, n_lid) range — so a case where
+    // top_k exceeds a row's live-key count doubles as the guard on that: the
+    // selection is forced to fill from the -INF tail (lowest index wins on ties,
+    // same rule on both sides) and any skipped store would surface as stale
+    // scratch in the selected set.
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (n_past < 0 || strcmp(t->name, "mask") != 0) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+            std::vector<float> m((size_t) n_lid * nt_s * n_stream);
+            for (int64_t s = 0; s < n_stream; s++) {
+                for (int64_t r = 0; r < nt_s; r++) {
+                    float * row = m.data() + (s*nt_s + r)*n_lid;
+                    const int64_t keep = std::min(n_past + r + 1, n_lid);
+                    for (int64_t j = 0;    j < keep;  j++) row[j] = dis(gen);
+                    for (int64_t j = keep; j < n_lid; j++) row[j] = -INFINITY;
+                }
+            }
+            ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+        }
     }
 };
 
@@ -9896,6 +9932,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1500,   20, 2, 128));  // n_stream = 2, per-stream launch
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 1, 512));  // decode kernel: d_idx=128, nt_s=1
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512));  // decode kernel: nt_s=1, n_stream=2
+    // causal mask (n_past >= 0) -> masked key rows exercise the score kernels'
+    // mask-probe early-out; every case above leaves the mask fully finite.
+    //                                       k_type,          d_idx, n_head, n_lid, nt_s, n_stream, top_k, n_past
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 256,  300));  // int8 tile: ~85% masked, whole dead tiles + diagonal band, partial token tile
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1024,   32, 1, 512,  200));  // int8 tile: top_k > live keys -> selection fills from the -INF tail
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512,  300));  // decode kernel: ~93% masked, -INF tail fill, n_stream=2
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  5000,    4, 1, 128, 1000));  // scalar path (exact gate): ~80% masked, multi-chunk topk
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    8, 1, 512,  200));  // scalar path (exact gate): -INF tail fill
 
     // B2 union + membership (top_k -> union_idx / membership mask)
     for (bool memb : { false, true }) {
