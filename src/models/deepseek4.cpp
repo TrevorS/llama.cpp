@@ -601,6 +601,28 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     GGML_ASSERT(inp_lid.k_rot);
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
 
+    ggml_tensor * indexer_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
+    const int64_t n_lid = inp_lid.kq_mask->ne[0];
+    GGML_ASSERT(n_lid > 0);
+    GGML_ASSERT(n_lid <= indexer_k->ne[2]);
+
+    // Identity shortcut (default ON; LLAMA_DSV4_LID_SHORTCUT=0 disables): with
+    // n_lid <= top_k, top-k over exactly n_lid candidates selects every row, so
+    // the selection mask reduces to the plain CSA mask (set_rows writes 0 into
+    // ALL rows; x + 0 == x, and invalid cells keep their -inf from the mask
+    // itself). Skip the whole indexer chain — q/proj matmuls, rope, hadamard,
+    // score, top-k — and return null; the consumer attends the full CSA window
+    // directly. Bit-exact by that algebra, not an approximation. The n_lid
+    // boundary crossing (once per sequence, monotone) lands on a 256-pad step
+    // that already rebuilds the graph, so no extra recaptures.
+    static const bool dsv4_lid_shortcut = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_SHORTCUT");
+        return !e || e[0] != '0';
+    }();
+    if (dsv4_lid_shortcut && n_lid <= (int64_t) hparams.indexer_top_k) {
+        return nullptr;
+    }
+
     ggml_tensor * indexer_q = build_lora_mm(layer.indexer_attn_q_b, qr);
     indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, nt);
     cb(indexer_q, "lid_q", il);
@@ -626,11 +648,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     ggml_tensor * indexer_weights = build_lora_mm(layer.indexer_proj, cur);
     indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f/sqrtf(float(n_embd_indexer_head*n_indexer_head)));
     cb(indexer_weights, "lid_weights", il);
-
-    ggml_tensor * indexer_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
-    const int64_t n_lid = inp_lid.kq_mask->ne[0];
-    GGML_ASSERT(n_lid > 0);
-    GGML_ASSERT(n_lid <= indexer_k->ne[2]);
 
     indexer_k = ggml_view_4d(ctx0, indexer_k,
             indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
@@ -799,9 +816,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         const char * e = getenv("LLAMA_DSV4_CSA_GATHER");
         return !e || e[0] != '0';
     }();
-    const int64_t nt_s     = top_k->ne[1];
-    const int64_t n_top_k  = top_k->ne[0];
-    const int64_t n_stream = top_k->ne[3];
+    // top_k == nullptr: identity regime (n_lid <= indexer_top_k, every CSA row
+    // selected — see the shortcut in build_lid_top_k)
+    const int64_t nt_s     = top_k ? top_k->ne[1] : 0;
+    const int64_t n_top_k  = top_k ? top_k->ne[0] : 0;
+    const int64_t n_stream = top_k ? top_k->ne[3] : 0;
     // B2 per-tile union gather (LLAMA_DSV4_CSA_TILE=W): split the ubatch into
     // T = nt_s/W tiles of W consecutive tokens; per tile, gather the union of
     // the tokens' top-k CSA cells (padded to u_cap) and attend raw window +
@@ -836,7 +855,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * split_out = nullptr; // set by the split-attention path (bypasses build_attn_mha)
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     const int64_t n_raw = raw_k->ne[2];
-    if (dsv4_tile_w > 0 && nt_s > dsv4_tile_w && n_stream == 1 &&
+    if (top_k && dsv4_tile_w > 0 && nt_s > dsv4_tile_w && n_stream == 1 &&
             nt_s % dsv4_tile_w == 0 && n_csa >= dsv4_tile_min && dsv4_tile_ucap < n_csa &&
             (n_raw + dsv4_tile_ucap) % 256 == 0 && raw_mask->ne[1] == nt_s) {
         const int64_t W_t   = dsv4_tile_w;
@@ -916,7 +935,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
                     raw_mask->ne[0], W_t, 1, T_t);
             kq_mask = ggml_concat(ctx0, raw_mask_t, memb, 0); // [n_raw+u_cap, W, 1, T]
         }
-    } else if (dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
+    } else if (top_k && dsv4_csa_gather && nt_s == 1 && n_csa > n_top_k) {
         // present csa_k [hd,1,n_csa,n_stream] as [hd, n_csa, n_stream, 1] and
         // the indices [n_top_k,1,1,n_stream] as [n_top_k, n_stream, 1, 1].
         ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
@@ -941,11 +960,22 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
                 n_top_k, raw_mask->ne[1], raw_mask->ne[2], raw_mask->ne[3]);
         csa_mask = ggml_fill(ctx0, csa_mask, 0.0f);
         kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
-    } else {
+    } else if (top_k) {
         k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
 
         ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
         kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    } else {
+        // identity regime: every CSA row is selected, the top-k mask reduces to
+        // the plain CSA mask (see build_lid_top_k shortcut). Re-check the
+        // predicate on the CONSUMER's width — the skip decision was made on
+        // n_lid, and n_lid == n_csa is an invariant (same reserve plan, same
+        // 256-pad), not a guarantee.
+        GGML_ASSERT(n_csa <= (int64_t) hparams.indexer_top_k);
+        GGML_ASSERT(inp_dsv4->get_lid().kq_mask->ne[0] == n_csa);
+
+        k_all   = ggml_concat(ctx0, raw_k, csa_k, 2);
+        kq_mask = ggml_concat(ctx0, raw_mask, inp_csa.kq_mask, 0);
     }
     ggml_tensor * out;
     if (split_out) {
