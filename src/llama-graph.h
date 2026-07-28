@@ -772,6 +772,13 @@ struct llm_graph_params {
             return false;
         }
 
+        // chained-draft graphs have different topology (no inp_out_ids, early
+        // return before the shared tail) — a chain graph reused for a non-chain
+        // decode replays silently wrong through the backend uid fast path
+        if (cparams.mtp_draft_chain != other.cparams.mtp_draft_chain) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
