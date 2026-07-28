@@ -648,7 +648,8 @@ struct server_prompt_cache_state {
 //   - The in-RAM index keeps only each entry's token vector (~1 MiB at 256k) for prefix matching;
 //     the heavy state blobs live on disk and are streamed in only on a hit.
 //   - Eviction uses a decaying-hit score (ds4_kvstore semantics): (hits+1) * n_tokens / file_size
-//     with a 6h hit half-life, so hot, large, token-dense entries are kept.
+//     with a 6h hit half-life, so hot, large, token-dense entries are kept. The hit counters are
+//     persisted in each file's header (rewritten in place on hit) so the decay survives restarts.
 struct server_prompt_disk_cache {
     // desc: model/ctx compatibility key (mismatched files are ignored). limit_bytes: on-disk budget.
     server_prompt_disk_cache(std::string dir, std::string compat_desc,
@@ -656,7 +657,8 @@ struct server_prompt_disk_cache {
     ~server_prompt_disk_cache();
 
     // queue an evicted/oversize prompt for asynchronous write to disk (takes ownership).
-    void spill(server_prompt_cache_state && state);
+    // returns false if the state was not queued (ineligible or an equal/longer prefix is already persisted).
+    bool spill(server_prompt_cache_state && state);
 
     // try to restore the best on-disk prefix for tokens_new into `prompt`/the contexts.
     // returns true and moves the loaded state into `prompt` on a hit; false on miss/error.
@@ -698,7 +700,9 @@ private:
     void        scan_existing();       // startup: rebuild index from files on disk
     void        writer_loop();         // background: drain write_q to disk
     bool        write_entry(const server_prompt_cache_state & p); // serialize one prompt -> file (writer thread)
-    void        evict_locked();        // drop lowest-score files until under limit_bytes (mtx held)
+    // drop lowest-score files until bytes_incoming more fit under limit_bytes (mtx held).
+    // called with the exact entry size BEFORE a write lands, so the budget is never overshot.
+    void        evict_locked(size_t bytes_incoming = 0);
     double      score(const entry & e, int64_t now_unix) const;
     std::string path_for(const llama_tokens & toks) const;
 };
@@ -708,6 +712,9 @@ struct server_prompt_cache {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
+
+    // spills the surviving RAM tier to the disk tier (if enabled) so it outlives the process.
+    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
 
