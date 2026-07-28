@@ -842,6 +842,67 @@ void ggml_cuda_op_dsv4_lid_memb(ggml_backend_cuda_context & ctx, ggml_tensor * d
 }
 
 // ---------------------------------------------------------------------------
+// fused union gather + type convert (GGML_OP_DSV4_UNION_GATHER): one block per
+// gathered row, dst[:, 0, u, t] = (T) src[:, idx[u, t]]. src rows may be
+// strided (CSA cache view) — nb1_src honored. Prefill-only consumer (tile
+// union path is gated on n_csa >= 12288, never captured) -> plain launch,
+// no PDL (matches the deliberate non-conversion of the prefill scorers).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+static __global__ void dsv4_union_gather_kernel(
+        T * dst, const float * src, const int32_t * idx,
+        int64_t nb1_src, int64_t nb1_idx, int64_t nb2_dst, int64_t nb3_dst,
+        int hd) {
+    const int u = blockIdx.x;
+    const int t = blockIdx.y;
+    const int64_t r = idx[(int64_t) u + (int64_t) t * nb1_idx];
+    const float * s = src + r * nb1_src;
+    T * d = dst + (int64_t) u * nb2_dst + (int64_t) t * nb3_dst;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        d[i] = (T) s[i];
+    }
+}
+
+void ggml_cuda_op_dsv4_union_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0]; // [hd, n_rows_src, 1, 1] F32 (rows may be strided)
+    const ggml_tensor * idx = dst->src[1]; // [u_cap, T, 1, 1] I32
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->nb[0] == sizeof(float));
+    GGML_ASSERT(idx->nb[0] == sizeof(int32_t)); // kernel indexes dim 0 flat
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int     hd    = dst->ne[0];
+    const int64_t u_cap = dst->ne[2];
+    const int64_t n_t   = dst->ne[3];
+    if (u_cap == 0 || n_t == 0) {
+        return;
+    }
+
+    const int64_t nb1_src = src->nb[1] / sizeof(float);
+    const int64_t nb1_idx = idx->nb[1] / sizeof(int32_t);
+    const size_t  ts_dst  = ggml_type_size(dst->type);
+    const int64_t nb2_dst = dst->nb[2] / ts_dst;
+    const int64_t nb3_dst = dst->nb[3] / ts_dst;
+
+    const dim3 grid((unsigned) u_cap, (unsigned) n_t, 1);
+    cudaStream_t stream = ctx.stream();
+    if (dst->type == GGML_TYPE_F16) {
+        dsv4_union_gather_kernel<half><<<grid, 128, 0, stream>>>(
+                (half *) dst->data, (const float *) src->data, (const int32_t *) idx->data,
+                nb1_src, nb1_idx, nb2_dst, nb3_dst, hd);
+    } else {
+        dsv4_union_gather_kernel<float><<<grid, 128, 0, stream>>>(
+                (float *) dst->data, (const float *) src->data, (const int32_t *) idx->data,
+                nb1_src, nb1_idx, nb2_dst, nb3_dst, hd);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
 // top-k (bitonic, descending, lower-index tie-break) — ported from ds4_cuda.cu
 // ---------------------------------------------------------------------------
 
