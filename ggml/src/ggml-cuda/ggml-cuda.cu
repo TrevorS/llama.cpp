@@ -3898,6 +3898,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static void ggml_cuda_power_chunk_node(ggml_backend_cuda_context * cuda_ctx);
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4048,6 +4050,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     i += nodes_to_skip;
+                    if (!use_cuda_graph && !is_concurrent_event_active) {
+                        ggml_cuda_power_chunk_node(cuda_ctx);
+                    }
                     continue;
                 }
 #ifndef NDEBUG
@@ -4068,6 +4073,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (!use_cuda_graph && !is_concurrent_event_active) {
+                    ggml_cuda_power_chunk_node(cuda_ctx);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4165,6 +4174,15 @@ struct ggml_cuda_power_dev {
     uint64_t n_full    = 0; // pre-hooks where the ring was full (span unmeasured)
     double   meas_ms   = 0.0;
     double   sleep_ms  = 0.0;
+    // GGML_CUDA_POWER_GRANULARITY=layer[N]: chunked pacing state (direct-exec path only)
+    cudaEvent_t chunk_start = nullptr;
+    cudaEvent_t chunk_stop  = nullptr;
+    bool     chunk_started = false;
+    bool     chunk_paced   = false; // this compute was chunk-paced -> skip the whole-graph pair
+    int      chunk_n_nodes = 0;
+    uint64_t n_chunks      = 0;
+    double   chunk_meas_ms  = 0.0;
+    double   chunk_sleep_ms = 0.0;
 };
 
 struct ggml_cuda_power_state {
@@ -4172,6 +4190,7 @@ struct ggml_cuda_power_state {
     bool adapt    = false;
     int  base_pct = 100;
     int  min_pct  = 60;
+    int  chunk_nodes = 0; // 0 = per-graph pacing (default); >0 = pace every N launched nodes in direct-exec
     std::atomic<int>  cur_pct{100};
     std::atomic<bool> stop_poller{false};
     std::thread poller;
@@ -4202,6 +4221,14 @@ struct ggml_cuda_power_state {
                         i, (unsigned long long) dev[i].n_pre, (unsigned long long) dev[i].n_meas,
                         (unsigned long long) dev[i].n_full, dev[i].meas_ms, dev[i].sleep_ms,
                         dev[i].debt_ms, 100.0*duty);
+                if (dev[i].n_chunks > 0) {
+                    const double cduty = dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms > 0.0
+                        ? dev[i].chunk_meas_ms / (dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms) : 1.0;
+                    fprintf(stderr, "[cuda-power] dev%d: chunks=%llu chunk-meas=%.0fms chunk-slept=%.0fms "
+                            "chunk-duty=%.1f%%\n",
+                            i, (unsigned long long) dev[i].n_chunks, dev[i].chunk_meas_ms,
+                            dev[i].chunk_sleep_ms, 100.0*cduty);
+                }
             }
         }
     }
@@ -4304,9 +4331,19 @@ static ggml_cuda_power_state & ggml_cuda_power(void) {
         if (!ps.enabled) {
             return;
         }
+        // GGML_CUDA_POWER_GRANULARITY: "graph" (default) pays the duty tax between graph
+        // submits; "layer" (=96 nodes) or "layerN" paces every N launched nodes on the
+        // direct-exec path, shortening the sustained-draw window the firmware latch sees.
+        // Replayed CUDA graphs (decode) are unaffected - they cannot be paced mid-graph.
+        const char * env_gran = getenv("GGML_CUDA_POWER_GRANULARITY");
+        if (env_gran != nullptr && strncmp(env_gran, "layer", 5) == 0) {
+            const int n = atoi(env_gran + 5);
+            ps.chunk_nodes = n >= 8 && n <= 4096 ? n : 96;
+        }
         ps.cur_pct.store(ps.base_pct, std::memory_order_relaxed);
-        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%%\n",
-                      ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct);
+        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s\n",
+                      ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct,
+                      ps.chunk_nodes > 0 ? "layer" : "graph");
 #ifdef __linux__
         if (ps.adapt) {
             ps.poller = std::thread(ggml_cuda_power_poller, &ps);
@@ -4320,6 +4357,47 @@ static ggml_cuda_power_state & ggml_cuda_power(void) {
     return ps;
 }
 
+// GGML_CUDA_POWER_GRANULARITY=layer[N]: called after each launched node on the direct-exec
+// path. Every chunk_nodes launches: sync the chunk span, sleep the duty complement, restart.
+// The sync is deliberate - it is what turns submission-side pacing into a real GPU idle gap.
+// Never called while capturing (sync illegal) or inside a concurrent multi-stream region.
+static void ggml_cuda_power_chunk_node(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled || ps.chunk_nodes <= 0) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    if (d.chunk_start == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&d.chunk_start));
+        CUDA_CHECK(cudaEventCreate(&d.chunk_stop));
+    }
+    if (!d.chunk_started) {
+        CUDA_CHECK(cudaEventRecord(d.chunk_start, cuda_ctx->stream()));
+        d.chunk_started = true;
+        d.chunk_n_nodes = 0;
+        return;
+    }
+    if (++d.chunk_n_nodes < ps.chunk_nodes) {
+        return;
+    }
+    const int pct = ps.cur_pct.load(std::memory_order_relaxed);
+    if (pct >= 1 && pct <= 99) {
+        CUDA_CHECK(cudaEventRecord(d.chunk_stop, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(d.chunk_stop));
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, d.chunk_start, d.chunk_stop) == cudaSuccess && ms > 0.05f) {
+            const double pay = std::min((double) ms * (100 - pct) / pct, 5000.0);
+            std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(pay * 1000.0)));
+            d.n_chunks++;
+            d.chunk_meas_ms  += ms;
+            d.chunk_sleep_ms += pay;
+            d.chunk_paced     = true;
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(d.chunk_start, cuda_ctx->stream()));
+    d.chunk_n_nodes = 0;
+}
+
 static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
     ggml_cuda_power_state & ps = ggml_cuda_power();
     if (!ps.enabled) {
@@ -4327,6 +4405,8 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
     }
     ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
     d.n_pre++;
+    d.chunk_started = false;
+    d.chunk_paced   = false;
     if (d.ev_start[0] == nullptr) {
         for (int i = 0; i < ggml_cuda_power_dev::RING; i++) {
             CUDA_CHECK(cudaEventCreate(&d.ev_start[i]));
@@ -4386,6 +4466,13 @@ static void ggml_cuda_power_post_compute(ggml_backend_cuda_context * cuda_ctx) {
     }
     ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
     if (d.started) {
+        if (d.chunk_paced) {
+            // chunk pacing already settled this compute inline, and the whole-graph span
+            // now contains the chunk sleeps - recording it would double-tax the duty.
+            // Drop the pending pair; the start slot is simply re-recorded next compute.
+            d.started = false;
+            return;
+        }
         CUDA_CHECK(cudaEventRecord(d.ev_stop[d.head], cuda_ctx->stream()));
         d.head = (d.head + 1) % ggml_cuda_power_dev::RING;
         d.count++;
