@@ -711,6 +711,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+#ifdef USE_CUDA_GRAPH
+    if (cuda_graphs_hwm > 0) {
+        GGML_LOG_INFO("%s: cuda graph cache high-water %zu entries (at exit: %zu)\n",
+                __func__, cuda_graphs_hwm, cuda_graphs.size());
+    }
+#endif
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
