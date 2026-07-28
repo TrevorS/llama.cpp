@@ -3806,6 +3806,38 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
+bool llama_is_swa_only(const llama_context * ctx, int32_t * n_swa) {
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    const auto & hparams = ctx->get_model().hparams;
+
+    if (n_swa) {
+        *n_swa = (int32_t) hparams.n_swa;
+    }
+
+    // only the standard window has the "reads exactly the last n_swa positions"
+    // shape - chunked/symmetric masks read outside it
+    if (hparams.swa_type != LLAMA_SWA_TYPE_STANDARD || hparams.n_swa == 0) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (!hparams.is_swa(il)) {
+            return false;
+        }
+
+        // a DSV4 compressor layer carries ring state that is written from rows
+        // outside the window - the per-row-projection argument does not hold
+        if (hparams.dsv4_compress_ratios[il] != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
