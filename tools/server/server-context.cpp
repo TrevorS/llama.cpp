@@ -3100,7 +3100,10 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                // keep the fused boundary cell (if any) - wipe only above it
+                const llama_pos keep_pos = common_speculative_dft_keep_pos(spec.get(), slot.id);
+
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, std::max(ckpt.pos_max + 1, keep_pos + 1), -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }

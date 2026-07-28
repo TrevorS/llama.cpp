@@ -174,6 +174,9 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
+    // (optional) pos of a draft-context KV cell that must survive the post-draft cleanup (-1 = none)
+    virtual llama_pos dft_keep_pos(llama_seq_id /*seq_id*/) const { return -1; }
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -1281,6 +1284,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // ingest fusion (LLAMA_MTP_FUSE_INGEST): process() defers the catch-up decode by
+    // stashing the batch rows; the next draft() decodes them fused with its seed row.
+    // h pairing: stashed row 0 pairs with pend_h0, row j with verify_h row j-1.
+    bool fuse_ingest = false;
+
+    std::vector<llama_tokens>       verify_tok; // [n_seq] stashed batch tokens (empty = no stash)
+    std::vector<llama_pos>          pend_pos0;  // [n_seq] pos of stashed row 0
+    std::vector<int32_t>            pend_n_acc; // [n_seq] rows accepted by the target, -1 = unadjudicated
+    std::vector<std::vector<float>> pend_h0;    // [n_seq] h paired with stashed row 0
+    std::vector<llama_pos>          keep_pos;   // [n_seq] fused seed cell to keep across the server's post-draft seq_rm
+
+    int32_t batch_cap = 0;
+
     // fused chained draft: all K draft steps run in ONE decode with in-graph
     // greedy argmax feedback (ds4.c combined-forward analog); greedy-only
     bool fused_chain = false;
@@ -1319,6 +1335,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        batch_cap = n_b;
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
@@ -1339,6 +1357,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // with backend sampling), so this stays opt-in.
         fused_chain = !chain_heads && !is_mem_shared &&
                       std::getenv("LLAMA_MTP_FUSED_DRAFT") != nullptr;
+
+        // ingest fusion: defer the verify-batch catch-up decode into the next
+        // draft()'s seed decode (eagle3's deferred-boundary pattern). Default ON,
+        // LLAMA_MTP_FUSE_INGEST=0 reverts to the standalone catch-up decode.
+        static const bool fuse_env = [] {
+            const char * v = std::getenv("LLAMA_MTP_FUSE_INGEST");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+
+        fuse_ingest = fuse_env && !chain_heads && !is_mem_shared;
+        if (fuse_ingest && fused_chain) {
+            // the chain graph assumes batch row 0 is the real seed
+            SPC_WRN("%s", "LLAMA_MTP_FUSED_DRAFT is set - disabling ingest fusion\n");
+            fuse_ingest = false;
+        }
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -1376,6 +1409,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        verify_tok.assign(n_seq, {});
+        pend_pos0.assign(n_seq, -1);
+        pend_n_acc.assign(n_seq, -1);
+        pend_h0.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        keep_pos.assign(n_seq, -1);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1398,6 +1437,72 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    void drop_pending(llama_seq_id seq_id) {
+        verify_tok[seq_id].clear();
+        pend_pos0[seq_id]  = -1;
+        pend_n_acc[seq_id] = -1;
+    }
+
+    // decode the stashed ingest rows standalone (the deferred equivalent of the
+    // catch-up decode in process()). rows already in the draft KV are skipped and
+    // rows at pos >= pos_lim are dropped (rejected drafts, or positions the caller
+    // is about to re-decode); if the remainder does not start right at the KV
+    // boundary it cannot be decoded and is dropped instead
+    bool flush_pending(llama_seq_id seq_id, llama_pos pos_lim) {
+        auto & tok = verify_tok[seq_id];
+        if (tok.empty()) {
+            return true;
+        }
+
+        auto * ctx_dft = params.ctx_dft;
+
+        const llama_pos pos0 = pend_pos0[seq_id];
+
+        int32_t n_rows = (int32_t) tok.size();
+        if (pend_n_acc[seq_id] >= 0) {
+            n_rows = std::min(n_rows, pend_n_acc[seq_id] + 1);
+        }
+        if (pos_lim >= 0) {
+            n_rows = std::min(n_rows, (int32_t) (pos_lim - pos0));
+        }
+
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        const int32_t j0 = pos_max + 1 > pos0 ? (int32_t) (pos_max + 1 - pos0) : 0;
+
+        bool ok = true;
+
+        if (j0 < n_rows) {
+            if (pos0 + j0 == pos_max + 1) {
+                GGML_ASSERT(n_rows <= verify_h_rows[seq_id] + 1);
+
+                const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+                common_batch_clear(batch);
+
+                for (int32_t j = j0; j < n_rows; ++j) {
+                    common_batch_add(batch, tok[j], pos0 + j, { seq_id }, false);
+                    const float * h = j == 0 ? pend_h0[seq_id].data()
+                                             : verify_h[seq_id].data() + (size_t) (j - 1) * n_embd;
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h, row_bytes);
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    SPC_ERR("flush llama_decode(ctx_dft) failed rc=%d (pos0=%d, n=%d)\n", (int) rc, (int) pos0, n_rows - j0);
+                    ok = false;
+                }
+            } else {
+                SPC_DBG("dropping stale ingest stash (seq_id=%d, pos0=%d, n=%d, dft pos_max=%d)\n",
+                        (int) seq_id, (int) pos0, n_rows, (int) pos_max);
+            }
+        }
+
+        drop_pending(seq_id);
+
+        return ok;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1405,6 +1510,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
+
+        if (fuse_ingest) {
+            // called right after prefill: the stash holds the last prompt ubatch
+            flush_pending(seq_id, N);
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
         if (pos_max < N - 1 && !is_mem_shared) {
@@ -1451,7 +1562,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && fuse_ingest) {
+            // deferred ingest: flush any unconsumed stash first (its h rows live in
+            // verify_h, which is overwritten below), then stash this batch's rows;
+            // the next draft() decodes them together with its seed row
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const int32_t beg = i_batch_beg[seq_id];
+                if (beg < 0) {
+                    continue;
+                }
+
+                if (!flush_pending(seq_id, batch_in.pos[beg])) {
+                    return false;
+                }
+
+                const int32_t end = i_batch_end[seq_id];
+
+                verify_tok[seq_id].assign(batch_in.token + beg, batch_in.token + end + 1);
+                pend_pos0[seq_id]  = batch_in.pos[beg];
+                pend_n_acc[seq_id] = -1;
+                pend_h0[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+            }
+        } else if (!is_mem_shared) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -1537,6 +1669,69 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        // ingest fusion: guard the stashed rows, then ride them into the seed decode.
+        // fuse_beg/fuse_end select the guarded stash row window per seq (end 0 = none)
+        std::vector<int32_t> fuse_beg;
+        std::vector<int32_t> fuse_end;
+
+        if (fuse_ingest) {
+            fuse_beg.assign(n_seq, 0);
+            fuse_end.assign(n_seq, 0);
+
+            auto * mem_dft = llama_get_memory(ctx_dft);
+
+            int32_t n_free = batch_cap - (int32_t) n_seq; // reserve one seed row per seq
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & dp  = dparams[seq_id];
+                const auto & tok = verify_tok[seq_id];
+
+                if (!dp.drafting || tok.empty()) {
+                    continue;
+                }
+
+                const llama_pos pos0 = pend_pos0[seq_id];
+
+                int32_t n_rows = (int32_t) tok.size();
+                if (pend_n_acc[seq_id] >= 0) {
+                    n_rows = std::min(n_rows, pend_n_acc[seq_id] + 1);
+                }
+                // never decode stashed rows at or above the seed position
+                n_rows = std::min(n_rows, (int32_t) (dp.n_past - pos0));
+
+                const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+
+                // skip rows already in the draft KV (e.g. the kept boundary cell)
+                const int32_t j0 = pos_max + 1 > pos0 ? (int32_t) (pos_max + 1 - pos0) : 0;
+
+                if (j0 >= n_rows) {
+                    drop_pending(seq_id);
+                    continue;
+                }
+
+                if (pos0 + j0 != pos_max + 1 || pos0 + n_rows != dp.n_past) {
+                    // hole below the stash or between the stash and the seed
+                    SPC_DBG("abandoning ingest fusion (seq_id=%d, pos0=%d, n=%d, j0=%d, dft pos_max=%d, n_past=%d)\n",
+                            (int) seq_id, (int) pos0, n_rows, j0, (int) pos_max, (int) dp.n_past);
+                    drop_pending(seq_id);
+                    continue;
+                }
+
+                if (n_rows - j0 > n_free) {
+                    // does not fit next to the seed rows - ingest standalone instead
+                    flush_pending(seq_id, dp.n_past);
+                    continue;
+                }
+
+                GGML_ASSERT(n_rows <= verify_h_rows[seq_id] + 1);
+
+                fuse_beg[seq_id] = j0;
+                fuse_end[seq_id] = n_rows;
+
+                n_free -= n_rows - j0;
+            }
+        }
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -1556,10 +1751,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            if (fuse_ingest && fuse_end[seq_id] > 0) {
+                // the deferred ingest rows ride ahead of the seed, h pairing as in
+                // the standalone catch-up decode
+                const auto & tok = verify_tok[seq_id];
+
+                const llama_pos pos0 = pend_pos0[seq_id];
+
+                for (int32_t j = fuse_beg[seq_id]; j < fuse_end[seq_id]; ++j) {
+                    common_batch_add(batch, tok[j], pos0 + j, { seq_id }, false);
+                    const float * h = j == 0 ? pend_h0[seq_id].data()
+                                             : verify_h[seq_id].data() + (size_t) (j - 1) * n_embd;
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h, row_bytes);
+                }
+
+                drop_pending(seq_id);
+            }
+
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
+
+            // with fusion armed the seed cell doubles as the next round's boundary
+            // row - the server must not wipe it after this draft
+            keep_pos[seq_id] = fuse_ingest ? dp.n_past : -1;
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
@@ -1743,6 +1959,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        // adjudicate the stashed ingest rows: row 0 (boundary) plus the accepted
+        // drafts stay decodable, rejected rows must never reach the draft KV
+        if (fuse_ingest && !verify_tok[seq_id].empty()) {
+            pend_n_acc[seq_id] = std::min<int32_t>(n_accepted, (int32_t) verify_tok[seq_id].size() - 1);
+        }
+
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
@@ -1771,10 +1993,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+        // a rollback realigns the draft KV; the deferred ingest rows no longer apply
+        drop_pending(seq_id);
         if (data.size() != (size_t) n_embd * sizeof(float)) {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+    }
+
+    llama_pos dft_keep_pos(llama_seq_id seq_id) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return -1;
+        }
+        return keep_pos[seq_id];
     }
 
     bool need_embd() const override {
@@ -2804,6 +3035,20 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+llama_pos common_speculative_dft_keep_pos(common_speculative * spec, llama_seq_id seq_id) {
+    llama_pos res = -1;
+
+    if (spec == nullptr) {
+        return res;
+    }
+
+    for (const auto & impl : spec->impls) {
+        res = std::max(res, impl->dft_keep_pos(seq_id));
+    }
+
+    return res;
 }
 
 // TODO: support the case of more than one speculative implementations having a state
