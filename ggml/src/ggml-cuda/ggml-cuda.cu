@@ -2569,12 +2569,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // GGML_CUDA_GRAPH_SHAPE_KEY=1: fold a shape signature into the cache key so graphs that
-    // alternate shapes on the same first-node address (MTP draft: ingest batch=accepted+1 vs
-    // generate batch=1) land on distinct cache slots instead of re-capturing every alternation.
-    // The key is only ever used as a map key, never dereferenced. Stale-replay safety is
-    // unchanged: the per-slot property scan still guards capture. See experiments/ds4-tile/FLAGS.md.
-    static const bool shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") != nullptr &&
+    // Fold a shape signature into the cache key so graphs that alternate shapes on the same
+    // first-node address (MTP draft: ingest batch=accepted+1 vs generate batch=1) land on
+    // distinct cache slots instead of re-capturing every alternation. GGML_CUDA_GRAPH_SHAPE_KEY=0
+    // reverts to the raw nodes[0] key. The key is only ever used as a map key, never dereferenced.
+    // Stale-replay safety is unchanged: the per-slot property scan still guards capture.
+    // Default ON since 2026-07-27 (all gates passed). See experiments/ds4-tile/FLAGS.md.
+    static const bool shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") == nullptr ||
                                   atoi(getenv("GGML_CUDA_GRAPH_SHAPE_KEY")) != 0;
     if (!shape_key) {
         return cgraph->nodes[0];
