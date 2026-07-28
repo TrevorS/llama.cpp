@@ -28,6 +28,20 @@
 // score kernel
 // ---------------------------------------------------------------------------
 
+// Mask-probe early-out (variant i, LLAMA_DSV4_LID_MASK_PROBE / kill-switch
+// DS4_CUDA_NO_MASK_PROBE=1). A key row whose mask entry is -INF contributes
+// -INF to the score no matter what the dot products are, so the score COMPUTE
+// (K load + quant + the n_head-deep dot loop) is dead work. The probe reads the
+// mask FIRST and, for masked rows, skips the compute but ALWAYS STORES -INF:
+// the top-k scans the full [0, n_lid) row range, so a skipped store would leave
+// stale scratch in the scores buffer and corrupt the selection.
+//
+// Bit-exactness: acc is a finite sum (relu(dot) * weight) and the mask carries
+// only {0, -INF} — the same invariant the radix top-k already relies on — so
+// acc + (-INF) == -INF, and writing -INF directly reproduces the exact encoding
+// (f32 0xFF800000 / f16 0xFC00) the full-compute path stores. Comparison is
+// against -INFINITY exactly, so a merely very-negative finite mask (alibi) never
+// trips the early-out.
 static __device__ __forceinline__ float dsv4_ldk(const float * p) { return *p; }
 static __device__ __forceinline__ float dsv4_ldk(const half  * p) { return __half2float(*p); }
 
@@ -126,7 +140,8 @@ static __global__ void dsv4_score_kernel(
         const float * __restrict__ mask,     // strided view
         int64_t nbk2, int64_t nbk3,          // k element strides (per j, per stream)
         int64_t nbm1, int64_t nbm3,          // mask element strides (per t_local, per stream)
-        int nt, int nt_s, int n_lid, int d_idx, int n_head, int j_tile) {
+        int nt, int nt_s, int n_lid, int d_idx, int n_head, int j_tile,
+        bool mask_probe) {
     extern __shared__ float smem[];
     float * sq = smem;                 // [d_idx * n_head]
     float * sw = smem + d_idx*n_head;  // [n_head]
@@ -153,6 +168,17 @@ static __global__ void dsv4_score_kernel(
     for (int jj = warp; jj < j_tile; jj += nwarps) {
         const int j = j0 + jj;
         if (j >= n_lid) continue;
+        // mask probe: WARP-uniform (one warp owns one j, and s/t_local are
+        // block-uniform), so every lane loads the same address — one broadcast
+        // sector, the load the epilogue used to do — and the branch never
+        // diverges within the warp.
+        const float mv = mask[(int64_t)s*nbm3 + (int64_t)t_local*nbm1 + (int64_t)j];
+        if (mask_probe && mv == -INFINITY) {
+            if (lane == 0) {
+                scores[(int64_t)t*n_lid + j] = mv; // store, never skip
+            }
+            continue;
+        }
         const KT * kj = k + (int64_t)s*nbk3 + (int64_t)j*nbk2;
         float acc = 0.0f;
         for (int h = 0; h < n_head; h++) {
@@ -167,7 +193,6 @@ static __global__ void dsv4_score_kernel(
             acc += fmaxf(dot, 0.0f) * sw[h];
         }
         if (lane == 0) {
-            const float mv = mask[(int64_t)s*nbm3 + (int64_t)t_local*nbm1 + (int64_t)j];
             scores[(int64_t)t*n_lid + j] = acc + mv;
         }
     }
@@ -231,7 +256,7 @@ static __global__ void dsv4_score_int8_kernel(
         const float  * __restrict__ k_sc,     // [j] per-comp scale
         const float  * __restrict__ mask,     // [t*nbm1 + j]
         int64_t nbm1,
-        int n_tokens, int n_lid, int n_head) {
+        int n_tokens, int n_lid, int n_head, bool mask_probe) {
     const int tile_c = blockIdx.x * 128;
     const int tile_t = blockIdx.y * 16;
     const int tid    = threadIdx.x;
@@ -243,6 +268,49 @@ static __global__ void dsv4_score_int8_kernel(
     __shared__ int8_t qs[16  * 128];  // q tile int8 [token][dim]      2 KB
     __shared__ float  sk[128];        // per-comp  scale
     __shared__ float  sq[16];         // per-token scale
+
+    const int my_t     = tid & 15;            // 0..15 token within tile
+    const int my_c0    = (tid >> 4) * 8;      // 0,8,..,120 comp base
+    const int token    = tile_t + my_t;
+    const bool tok_ok  = token < n_tokens;
+
+    // --- mask probe (early-out) ---------------------------------------------
+    // The thread's 8 mask values are hoisted out of the epilogue (SAME global
+    // traffic — the epilogue no longer reloads them; at depth this row is
+    // nt_s*n_lid*4 B, so re-reading it would not be free) and kept in
+    // registers across the head loop. Two granularities:
+    //   block-uniform — if all 16x128 mask entries are -INF the tile is dead:
+    //       return before the 16 KB K-tile smem load and the whole head loop.
+    //       __syncthreads_and gives a block-uniform predicate, so every thread
+    //       takes the same branch (no divergence, no orphaned barrier).
+    //   per-(thread,comp) — partial tiles (the causal diagonal band) skip just
+    //       the masked comps' dp4a chains. The mask is per-(query,key) and one
+    //       thread owns 8 DIFFERENT keys of one query, so there is no coarser
+    //       uniform unit here; the skip rides the already-serial cc loop, so a
+    //       diverged warp costs at most the union of its lanes' live comps.
+    // acc[cc] stays 0.0f for a skipped comp and the epilogue stores
+    // acc[cc] + mv[cc] == 0 + (-INF) == -INF: the exact bit pattern the
+    // full-compute path would have stored.
+    float mv[8];
+    bool  all_masked = true;
+#pragma unroll
+    for (int cc = 0; cc < 8; cc++) {
+        const int comp = tile_c + my_c0 + cc;
+        mv[cc] = (tok_ok && comp < n_lid) ? mask[(int64_t) token * nbm1 + comp] : -INFINITY;
+        all_masked = all_masked && (mv[cc] == -INFINITY);
+    }
+    if (__syncthreads_and(all_masked) && mask_probe) {
+        if (tok_ok) {
+#pragma unroll
+            for (int cc = 0; cc < 8; cc++) {
+                const int comp = tile_c + my_c0 + cc;
+                if (comp < n_lid) {
+                    scores[(int64_t) token * n_lid + comp] = __float2half(mv[cc]); // store, never skip
+                }
+            }
+        }
+        return;
+    }
 
     // --- load pre-quantized K tile into smem (shared across heads) ---
     for (int c = warp; c < 128; c += nwarps) {
@@ -256,10 +324,6 @@ static __global__ void dsv4_score_int8_kernel(
         }
     }
 
-    const int my_t     = tid & 15;            // 0..15 token within tile
-    const int my_c0    = (tid >> 4) * 8;      // 0,8,..,120 comp base
-    const int token    = tile_t + my_t;
-    const bool tok_ok  = token < n_tokens;
     float acc[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) acc[i] = 0.0f;
@@ -295,6 +359,9 @@ static __global__ void dsv4_score_int8_kernel(
         const int * qp = (const int *) (qs + my_t * 128);
 #pragma unroll
         for (int cc = 0; cc < 8; cc++) {
+            if (mask_probe && mv[cc] == -INFINITY) {
+                continue; // masked comp: acc[cc] stays 0 -> epilogue stores -INF
+            }
             const int * kp = (const int *) (ks + (my_c0 + cc) * 128);
             int dot = 0;
 #pragma unroll
@@ -309,7 +376,7 @@ static __global__ void dsv4_score_int8_kernel(
         for (int cc = 0; cc < 8; cc++) {
             const int comp = tile_c + my_c0 + cc;
             if (comp < n_lid) {
-                scores[(int64_t) token * n_lid + comp] = __float2half(acc[cc] + mask[(int64_t) token * nbm1 + comp]);
+                scores[(int64_t) token * n_lid + comp] = __float2half(acc[cc] + mv[cc]);
             }
         }
     }
@@ -337,7 +404,7 @@ static __global__ void dsv4_score_int8_kernel(
 #ifdef GGML_USE_HIP
 static __global__ void dsv4_score_fp4mma_kernel(
         half *, const float *, const float *, const uint8_t *, const float *,
-        int64_t, int64_t, int, int, int) { NO_DEVICE_CODE; }
+        int64_t, int64_t, int, int, int, bool) { NO_DEVICE_CODE; }
 #else
 using namespace ggml_cuda_mma;
 
@@ -353,7 +420,7 @@ static __global__ void dsv4_score_fp4mma_kernel(
         const uint8_t * __restrict__ k,       // packed block_mxfp4 rows, BYTE strides
         const float  * __restrict__ mask,     // [t*nbm1 + j]
         int64_t nbk2, int64_t nbm1,
-        int n_tokens, int n_lid, int n_head) {
+        int n_tokens, int n_lid, int n_head, bool mask_probe) {
 #ifdef BLACKWELL_MMA_AVAILABLE
     typedef tile<16, 8, int>   tile_A; // q: 16 tokens x k64
     typedef tile<8,  8, int>   tile_B; // K:  8 comps  x k64
@@ -373,6 +440,57 @@ static __global__ void dsv4_score_fp4mma_kernel(
 
     __shared__ int q_sm[16 * DSV4_FP4_ROW];   // A tile: 16 tokens
     __shared__ int k_sm[128 * DSV4_FP4_ROW];  // B tiles: 128 comps
+
+    // ---- mask probe (early-out) --------------------------------------------
+    // The mma produces a whole 16-token x 8-comp tile at once, so the finest
+    // skippable unit is one ct tile — which is also exactly 128 mask entries =
+    // 4 per lane, i.e. one __all_sync makes the skip WARP-uniform (no
+    // divergence, unlike a per-element test that the mma could not honour
+    // anyway). A skipped ct drops its 2 mma ops + relu drain for EVERY head and
+    // leaves acc[ct][] at 0, which the epilogue turns into 0 + (-INF) == the
+    // same -INF the full path stores. If every ct in the block is masked the
+    // tile is dead: return before the K pack, the resident B fragment loads and
+    // the head loop (the per-head q pack is the dominant cost). Probe layout is
+    // independent of the epilogue's mma lane map — it only has to COVER the
+    // same 16x8 rectangle, which lane*4+i does.
+    // Unlike the int8 kernel this does NOT hoist the mask values into registers
+    // for the epilogue: K lives in registers here (Bk[2][2] is the whole point
+    // of this kernel), so 8 more live floats across the head loop is the wrong
+    // trade. Only the 2 skip bits survive, and the epilogue re-reads the mask —
+    // but only for the ct's that were NOT skipped, since a skipped ct already
+    // knows its tile is -INF. So a fully-masked block reads the mask once, and
+    // only a mixed block pays the second read.
+    bool skip_ct[2];
+    #pragma unroll
+    for (int ct = 0; ct < 2; ct++) {
+        const int cbase = tile_c + warp * 16 + ct * 8;
+        bool am = true;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int idx  = lane * 4 + i;        // 0..127 over the ct tile
+            const int tok  = tile_t + (idx >> 3); // 16 tokens
+            const int comp = cbase + (idx & 7);   //  8 comps
+            if (tok < n_tokens && comp < n_lid &&
+                mask[(int64_t) tok * nbm1 + comp] != -INFINITY) {
+                am = false;
+            }
+        }
+        skip_ct[ct] = __all_sync(0xffffffffu, am) && mask_probe;
+    }
+    if (__syncthreads_and(skip_ct[0] && skip_ct[1])) {
+        #pragma unroll
+        for (int ct = 0; ct < 2; ct++) {
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                const int tok  = tile_t + ((l / 2) * 8) + (lane / 4);
+                const int comp = tile_c + warp * 16 + ct * 8 + ((lane % 4) * 2) + (l % 2);
+                if (tok < n_tokens && comp < n_lid) {
+                    scores[(int64_t) tok * n_lid + comp] = __float2half(-INFINITY); // store, never skip
+                }
+            }
+        }
+        return;
+    }
 
     // ---- pack this block's 128 K rows to smem ONCE (resident across heads) --
     // one warp per 16 comps; lane owns 8 comps? No: cooperative over 128 rows.
@@ -497,6 +615,9 @@ static __global__ void dsv4_score_fp4mma_kernel(
 
         #pragma unroll
         for (int ct = 0; ct < 2; ct++) {
+            if (skip_ct[ct]) {
+                continue; // masked comp-tile: acc stays 0 -> epilogue stores -INF
+            }
             tile_C C = {};
             mma_block_scaled_fp4<GGML_TYPE_MXFP4>(C, Aq[0], Bk[ct][0], scA[0], scB[ct][0]);
             mma_block_scaled_fp4<GGML_TYPE_MXFP4>(C, Aq[1], Bk[ct][1], scA[1], scB[ct][1]);
@@ -517,13 +638,15 @@ static __global__ void dsv4_score_fp4mma_kernel(
             const int tok  = tile_t + ((l / 2) * 8) + (lane / 4);
             const int comp = tile_c + warp * 16 + ct * 8 + ((lane % 4) * 2) + (l % 2);
             if (tok < n_tokens && comp < n_lid) {
-                scores[(int64_t) tok * n_lid + comp] =
-                        __float2half(acc[ct][l] + mask[(int64_t) tok * nbm1 + comp]);
+                // a skipped ct already proved every entry of its tile is -INF,
+                // so it stores without re-reading the mask (acc is still 0)
+                const float mv = skip_ct[ct] ? -INFINITY : mask[(int64_t) tok * nbm1 + comp];
+                scores[(int64_t) tok * n_lid + comp] = __float2half(acc[ct][l] + mv);
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(scores, q, weights, k, mask, nbk2, nbm1, n_tokens, n_lid, n_head);
+    GGML_UNUSED_VARS(scores, q, weights, k, mask, nbk2, nbm1, n_tokens, n_lid, n_head, mask_probe);
     NO_DEVICE_CODE;
 #endif // BLACKWELL_MMA_AVAILABLE
 }
@@ -549,7 +672,7 @@ static __global__ void dsv4_score_decode_kernel(
         const float * weights,  // [h]
         const KT    * k,        // [j*nbk2 + d]
         const float * mask,     // [j]
-        int64_t nbk2, int n_lid, int n_head) {
+        int64_t nbk2, int n_lid, int n_head, bool mask_probe) {
     extern __shared__ char smem_dec[];
     int8_t * qs   = (int8_t *) smem_dec;                 // [n_head*128]
     float  * sq   = (float *) (qs + (size_t) n_head * 128); // [n_head]
@@ -579,6 +702,16 @@ static __global__ void dsv4_score_decode_kernel(
 
     // grid-stride over comps, one warp per comp
     for (int j = blockIdx.x * nwarps + warp; j < n_lid; j += gridDim.x * nwarps) {
+        // mask probe: WARP-uniform (one warp owns one comp j), every lane loads
+        // the same address. Skips the whole 68B/256B K row read + quant + the
+        // n_head dp4a chain; the store still happens.
+        const float mv = mask[j];
+        if (mask_probe && mv == -INFINITY) {
+            if (lane == 0) {
+                scores[j] = __float2half(mv); // store, never skip
+            }
+            continue;
+        }
         int8_t kq[4];
         float amax = 0.0f;
         float kv[4];
@@ -618,7 +751,7 @@ static __global__ void dsv4_score_decode_kernel(
             const float d = (float) dot * sq[h] * ksc;
             acc += fmaxf(d, 0.0f) * sw[h];
         }
-        if (lane == 0) scores[j] = __float2half(acc + mask[j]);
+        if (lane == 0) scores[j] = __float2half(acc + mv);
     }
 }
 
@@ -1436,6 +1569,18 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         const char * e = getenv("LLAMA_DSV4_LID_FP4_MMA_MAX_NLID");
         return e ? atoll(e) : (long long) 24576;
     }();
+    // mask-probe early-out (see the note above dsv4_ldk): masked key rows skip
+    // the score compute but still store -INF. Bit-exact, so default ON.
+    // DS4_CUDA_NO_MASK_PROBE=1 is the kill-switch; LLAMA_DSV4_LID_MASK_PROBE=0
+    // is the same switch in this file's own flag idiom (either disables).
+    static const bool dsv4_lid_mask_probe = []() {
+        const char * off = getenv("DS4_CUDA_NO_MASK_PROBE");
+        if (off && off[0] != '0') {
+            return false;
+        }
+        const char * e = getenv("LLAMA_DSV4_LID_MASK_PROBE");
+        return !e || e[0] != '0';
+    }();
     bool fp4_mma_active = dsv4_lid_fp4_mma && k_is_mxfp4 && d_idx == 128 && nt_s > 1 &&
                           n_lid <= dsv4_lid_fp4_mma_max_nlid;
     if (fp4_mma_active) {
@@ -1494,13 +1639,13 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             const float * m_s  = m_d + (int64_t) s * nbm3;
             if (k_packed_direct) {
                 ggml_cuda_kernel_launch(dsv4_score_decode_kernel<float, true>, lp,
-                        sc_s, q_s, w_s, (const float *) ((const uint8_t *) k->data + (int64_t) s * nbk3), m_s, nbk2, n_lid, n_head);
+                        sc_s, q_s, w_s, (const float *) ((const uint8_t *) k->data + (int64_t) s * nbk3), m_s, nbk2, n_lid, n_head, dsv4_lid_mask_probe);
             } else if (k_is_f16) {
                 ggml_cuda_kernel_launch(dsv4_score_decode_kernel<half>, lp,
-                        sc_s, q_s, w_s, k_h_d + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
+                        sc_s, q_s, w_s, k_h_d + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head, dsv4_lid_mask_probe);
             } else {
                 ggml_cuda_kernel_launch(dsv4_score_decode_kernel<float>, lp,
-                        sc_s, q_s, w_s, (const float *) k->data + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head);
+                        sc_s, q_s, w_s, (const float *) k->data + (int64_t) s * nbk3, m_s, nbk2, n_lid, n_head, dsv4_lid_mask_probe);
             }
         }
     } else if (d_idx == 128) {
@@ -1541,12 +1686,12 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 dsv4_score_fp4mma_kernel<<<grid, block_mma, 0, stream>>>(
                         sc_s, q_s, w_s,
                         (const uint8_t *) k->data + (int64_t) s * nbk3, m_s,
-                        nbk2, nbm1, nt_s, n_lid, n_head);
+                        nbk2, nbm1, nt_s, n_lid, n_head, dsv4_lid_mask_probe);
             } else {
                 dsv4_score_int8_kernel<<<grid, block, 0, stream>>>(
                         sc_s, q_s, w_s,
                         k_i8 + (int64_t) s * n_lid * 128, k_sc + (int64_t) s * n_lid,
-                        m_s, nbm1, nt_s, n_lid, n_head);
+                        m_s, nbm1, nt_s, n_lid, n_head, dsv4_lid_mask_probe);
             }
         }
     } else {
@@ -1557,11 +1702,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         if (k_is_f16) {
             dsv4_score_kernel<half><<<grid_score, block, smem, stream>>>(
                     scores, q_d, w_d, k_h_d, m_d,
-                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile, dsv4_lid_mask_probe);
         } else {
             dsv4_score_kernel<float><<<grid_score, block, smem, stream>>>(
                     scores, q_d, w_d, (const float *) k->data, m_d,
-                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile);
+                    nbk2, nbk3, nbm1, nbm3, nt, nt_s, n_lid, d_idx, n_head, j_tile, dsv4_lid_mask_probe);
         }
     }
 
