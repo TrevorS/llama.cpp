@@ -872,12 +872,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * csa_src = ggml_view_4d(ctx0, csa_k,
                 csa_k->ne[0], n_csa, 1, 1,
                 csa_k->nb[2], csa_k->nb[3], csa_k->nb[3], 0);
-        ggml_tensor * uidx = ggml_reshape_4d(ctx0, uni, u_cap*T_t, 1, 1, 1);
-        ggml_tensor * gathered = ggml_get_rows(ctx0, csa_src, uidx); // [hd, u_cap*T, 1, 1]
-        if (gathered->type != raw_k->type) {
-            gathered = ggml_cast(ctx0, gathered, raw_k->type);
+        // Fused gather + convert (LLAMA_DSV4_UNION_GATHER, default ON): one op
+        // instead of get_rows (always F32) -> cast -> reshape, skipping the
+        // full-F32 intermediate round-trip. =0 reverts to the composition.
+        static const bool dsv4_union_gather = []() {
+            const char * e = getenv("LLAMA_DSV4_UNION_GATHER");
+            return !e || e[0] != '0';
+        }();
+        ggml_tensor * gathered;
+        if (dsv4_union_gather && csa_src->type == GGML_TYPE_F32 &&
+                (raw_k->type == GGML_TYPE_F16 || raw_k->type == GGML_TYPE_F32)) {
+            gathered = ggml_dsv4_union_gather(ctx0, csa_src, uni, raw_k->type); // [hd, 1, u_cap, T]
+        } else {
+            ggml_tensor * uidx = ggml_reshape_4d(ctx0, uni, u_cap*T_t, 1, 1, 1);
+            gathered = ggml_get_rows(ctx0, csa_src, uidx); // [hd, u_cap*T, 1, 1]
+            if (gathered->type != raw_k->type) {
+                gathered = ggml_cast(ctx0, gathered, raw_k->type);
+            }
+            gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, u_cap, T_t);
         }
-        gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], 1, u_cap, T_t);
         cb(gathered, "csa_tile_k", il);
 
         if (memb->type != raw_mask->type) {

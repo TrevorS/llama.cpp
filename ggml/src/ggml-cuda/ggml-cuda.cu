@@ -2349,6 +2349,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_FA_MERGE:
             ggml_cuda_op_dsv4_fa_merge(ctx, dst);
             break;
+        case GGML_OP_DSV4_UNION_GATHER:
+            ggml_cuda_op_dsv4_union_gather(ctx, dst);
+            break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -5612,6 +5615,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_UNION_GATHER:
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_I32;
         case GGML_OP_DSV4_HC_FUSED: {
             // the CUDA kernels bound hc <= GGML_DSV4_HC_MAX; hc lives in a
             // different dim per mode. Reject over-cap hc so the scheduler can
