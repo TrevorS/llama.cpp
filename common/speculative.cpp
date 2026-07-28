@@ -1279,6 +1279,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
+    // batch row whose target h pairs with a suffix-truncated first row (-1 = none,
+    // i.e. the first row pairs with the carried-over pending_h as usual)
+    std::vector<int32_t> i_batch_h0;
+
     // Hidden rows from the most recent target verification batch, grouped by seq.
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
@@ -1294,6 +1298,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t>            pend_n_acc; // [n_seq] rows accepted by the target, -1 = unadjudicated
     std::vector<std::vector<float>> pend_h0;    // [n_seq] h paired with stashed row 0
     std::vector<llama_pos>          keep_pos;   // [n_seq] fused seed cell to keep across the server's post-draft seq_rm
+
+    // suffix-truncated prompt ingest (LLAMA_MTP_SUFFIX_INGEST): see process()
+    bool    suffix_ingest = false;
+    int32_t n_swa_dft     = 0;
 
     int32_t batch_cap = 0;
 
@@ -1373,6 +1381,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             fuse_ingest = false;
         }
 
+        // suffix-truncated ingest: a pure-SWA draft over raw KV rows only ever
+        // reads the last n_swa rows, so ingesting a long span can skip
+        // everything below its tail (see process()). Default ON,
+        // LLAMA_MTP_SUFFIX_INGEST=0 ingests every row of every span.
+        static const bool suffix_env = [] {
+            const char * v = std::getenv("LLAMA_MTP_SUFFIX_INGEST");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+
+        suffix_ingest = suffix_env && !chain_heads && !is_mem_shared &&
+                        llama_is_swa_only(ctx_dft, &n_swa_dft) && n_swa_dft > 0;
+
+        SPC_TRC("- fuse_ingest=%d, suffix_ingest=%d (dft n_swa=%d)\n",
+                (int) fuse_ingest, (int) suffix_ingest, n_swa_dft);
+
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling && !fused_chain) {
@@ -1406,6 +1429,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
+        i_batch_h0.assign(n_seq, -1);
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
@@ -1518,6 +1542,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
+        // note: a suffix-truncated ingest drops rows *below* the SWA window but
+        // always writes the span's last row, so the frontier still lands on N-1
+        // and this stays a real "the hook did not run" diagnostic
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
@@ -1542,6 +1569,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+        std::fill(i_batch_h0 .begin(), i_batch_h0 .end(), -1);
 
         for (int k = 0; k < n_tokens; ++k) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1561,8 +1589,77 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // the target's h_nextn rows for this batch, read once. ctx_tgt is set
+        // unmasked in the ctor, so these are dense and indexed by raw batch row
+        // (same assumption the shifted memcpy below has always made). one
+        // llama_get_* sync for the whole batch instead of one per row.
+        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+        // h paired with a sequence's first ingested row: normally the carryover
+        // from the previous call, but a suffix-truncated span starts mid-batch
+        // and pairs with the target h of the row just below its window instead
+        auto h0_row = [&](llama_seq_id seq_id) {
+            return i_batch_h0[seq_id] >= 0
+                ? h_tgt + (size_t) i_batch_h0[seq_id] * n_embd
+                : (const float *) pending_h[seq_id].data();
+        };
+
+        // suffix-truncated ingest (LLAMA_MTP_SUFFIX_INGEST). The draft is a
+        // single pure-SWA block over raw KV rows, and a draft cache row is a
+        // projection of that row's own (token, h) input alone - no cross-row
+        // dependence at write time (models/deepseek4.cpp build_eh_init + the
+        // ratio-0 raw attention path). With LLAMA_SWA_TYPE_STANDARD, attention
+        // at position q reads only rows [q - n_swa + 1, q]. So once a span is
+        // longer than n_swa + n_max rows, every row below its last
+        // n_swa + n_max is unreachable for good: the earliest position any
+        // later decode can query is (span end) - n_max + 1, even after a
+        // full-draft rejection rewind, which walks back at most n_max
+        // positions. Dropping those rows is EXACT - the rows we do write are
+        // bit-identical either way, and the ingest outputs are discarded.
+        //
+        // llama_batch_allocr requires consecutive positions, so the draft KV
+        // below the new window is wiped rather than left as a hole; that also
+        // makes the frontier match the suffix start. A truncated span always
+        // ingests immediately through the non-fused path below - a deferred
+        // stash starting above the wiped frontier does not pass the cold-start
+        // byte-identity gate, and the span is only ~n_swa + n_max rows anyway,
+        // so there is nothing left for the deferral to save. Fusion still
+        // defers verify rows as usual.
+        if (suffix_ingest) {
+            const int32_t n_keep = n_swa_dft + std::max(1, params.n_max);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const int32_t beg = i_batch_beg[seq_id];
+                const int32_t end = i_batch_end[seq_id];
+
+                // only truncate a span that carries a full window on its own -
+                // shorter spans (every generation batch) are ingested whole and
+                // keep extending the run already in the draft KV
+                if (beg < 0 || end - beg + 1 <= n_keep) {
+                    continue;
+                }
+
+                i_batch_beg[seq_id] = end - n_keep + 1;
+                i_batch_h0 [seq_id] = i_batch_beg[seq_id] - 1;
+
+                // whatever is cached for this seq sits below the new window
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                drop_pending(seq_id);
+                keep_pos[seq_id] = -1;
+
+                SPC_DBG("suffix ingest (seq_id=%d): %d rows -> %d (pos %d..%d)\n",
+                        (int) seq_id, end - beg + 1, n_keep,
+                        (int) batch_in.pos[i_batch_beg[seq_id]], (int) batch_in.pos[end]);
+            }
+        }
+
+        bool truncated_any = false;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            truncated_any = truncated_any || i_batch_h0[seq_id] >= 0;
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared && fuse_ingest) {
+        if (!is_mem_shared && fuse_ingest && !truncated_any) {
             // deferred ingest: flush any unconsumed stash first (its h rows live in
             // verify_h, which is overwritten below), then stash this batch's rows;
             // the next draft() decodes them together with its seed row
@@ -1576,41 +1673,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     return false;
                 }
 
-                const int32_t end = i_batch_end[seq_id];
+                const int32_t end   = i_batch_end[seq_id];
+                const float * h_beg = h0_row(seq_id);
 
                 verify_tok[seq_id].assign(batch_in.token + beg, batch_in.token + end + 1);
                 pend_pos0[seq_id]  = batch_in.pos[beg];
                 pend_n_acc[seq_id] = -1;
-                pend_h0[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                pend_h0[seq_id].assign(h_beg, h_beg + n_embd);
             }
         } else if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
+            // shift the tgt embeddings to the right by one position: batch row k
+            // pairs with the target h of row k-1, and the first row of each
+            // sequence pairs with the h carried over from the previous call (or,
+            // for a suffix-truncated span, with the h of the row below the window)
             // assumes that the tokens in the batch are sequential for each sequence
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
+            for (int k = 0; k < n_tokens; ++k) {
+                const llama_seq_id seq_id = batch_in.seq_id[k][0];
 
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
+                // the i_batch_beg/end scan above already assumes this
+                GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
 
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                if (k < i_batch_beg[seq_id]) {
+                    continue; // dropped by the suffix truncation above
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
+
+                const float * h_row = k == i_batch_beg[seq_id]
+                    ? h0_row(seq_id)
+                    : h_tgt + (size_t) (k - 1) * n_embd;
+
+                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1654,10 +1752,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            // one bulk copy off the already-synced h_tgt block - the per-row
+            // accessor would sync ctx_tgt once per row
+            std::memcpy(verify_h[seq_id].data(),
+                    h_tgt + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
@@ -1883,15 +1981,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
-
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->size == 0) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
+                }
+
+                // the draft is always the most likely candidate - rank by LOGIT, not
+                // by .p. a backend chain that selects a token short-circuits the CPU
+                // chain in common_sampler_sample(), which leaves .p unset (all zeros)
+                // and makes the p-sort in common_sampler_get_candidates() a no-op.
+                size_t i_top = 0;
+                for (size_t k = 1; k < cur_p->size; ++k) {
+                    if (cur_p->data[k].logit > cur_p->data[i_top].logit) {
+                        i_top = k;
+                    }
+                }
+
+                // add drafted token for each sequence
+                const llama_token id = cur_p->data[i_top].id;
+
+                // only collect very high-confidence draft tokens
+                if (params.p_min > 0.0f) {
+                    float p_top = cur_p->data[i_top].p;
+
+                    if (p_top <= 0.0f) {
+                        // no probabilities on the candidates (see above): a raw
+                        // .p check would read 0 and silently never draft. softmax
+                        // the candidate logits to recover a real confidence.
+                        double sum = 0.0;
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            sum += std::exp((double) (cur_p->data[k].logit - cur_p->data[i_top].logit));
+                        }
+
+                        p_top = sum > 0.0 ? (float) (1.0/sum) : 0.0f;
+                    }
+
+                    if (p_top < params.p_min) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
