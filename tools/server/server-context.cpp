@@ -969,6 +969,13 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
+    // prefill guard: refuse after N consecutive large prompt re-computations with no
+    // meaningful cache reuse (runaway client prefix instability; sustained bulk prefill
+    // has hard-locked this host twice). 0 disables.
+    int prefill_guard_n       = 3;
+    int prefill_guard_min     = 8192;
+    int prefill_guard_strikes = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1392,6 +1399,18 @@ private:
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
             }
+        }
+
+        {
+            const char * s = getenv("LLAMA_SERVER_PREFILL_GUARD");
+            if (s) {
+                prefill_guard_n = atoi(s);
+            }
+            if ((s = getenv("LLAMA_SERVER_PREFILL_GUARD_MIN")) != nullptr) {
+                prefill_guard_min = atoi(s);
+            }
+            SRV_INF("prefill guard: %s (n = %d, min tokens = %d)\n",
+                    prefill_guard_n > 0 ? "enabled" : "disabled", prefill_guard_n, prefill_guard_min);
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -3455,6 +3474,40 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                        }
+
+                        // prefill guard: a run of large prompt re-computations with no meaningful
+                        // reuse means the client's prompt prefix is unstable; sustained bulk
+                        // re-prefill has hard-locked this host. Refuse before decoding, not after.
+                        if (prefill_guard_n > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            const int n_to_process = slot.task->n_tokens() - n_past;
+
+                            if (!slot.prompt.tokens.empty() && n_to_process >= prefill_guard_min && n_past <= n_to_process / 4) {
+                                if (prefill_guard_strikes < prefill_guard_n) {
+                                    prefill_guard_strikes++;
+                                }
+
+                                SRV_WRN("prefill guard: strike %d/%d — re-computing %d of %d prompt tokens (n_past = %d), client prompt prefix is not stable\n",
+                                        prefill_guard_strikes, prefill_guard_n, n_to_process, slot.task->n_tokens(), n_past);
+
+                                if (prefill_guard_strikes >= prefill_guard_n) {
+                                    send_error(slot, string_format(
+                                                "prefill guard tripped: %d consecutive requests re-computed >= %d prompt tokens with no cache reuse. "
+                                                "This host cannot sustain bulk re-prefill; fix client prompt-prefix stability "
+                                                "or set LLAMA_SERVER_PREFILL_GUARD=0.",
+                                                prefill_guard_strikes, prefill_guard_min),
+                                            ERROR_TYPE_UNAVAILABLE);
+
+                                    // drop the stale slot state so a fresh conversation can cold-start
+                                    // (cold prefills on an empty slot never strike)
+                                    slot.prompt.tokens.keep_first(0);
+
+                                    slot.release();
+                                    return;
+                                }
+                            } else {
+                                prefill_guard_strikes = 0;
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
