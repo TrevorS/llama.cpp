@@ -210,6 +210,34 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+// LLAMA_DSV4_HASHIFY: token -> expert-set table that replaces a layer's learned
+// routing DECISION (the gating weights still come from the real router, so this
+// isolates the selection). Rows for tokens the table does not cover are filled by
+// the builder, so lookup here is a plain copy.
+struct llama_hashify_table {
+    uint32_t n_vocab        = 0;
+    uint32_t n_expert_used  = 0;
+    std::map<int32_t, std::vector<int32_t>> layers; // il -> [n_expert_used * n_vocab]
+
+    bool has(int il) const { return layers.find(il) != layers.end(); }
+};
+
+// loads once from the path in LLAMA_DSV4_HASHIFY (nullptr when unset/unreadable)
+const llama_hashify_table * llama_hashify_get();
+
+class llm_graph_input_hashify : public llm_graph_input_i {
+public:
+    llm_graph_input_hashify(const llama_hashify_table * tbl, int il) : tbl(tbl), il(il) {}
+    virtual ~llm_graph_input_hashify() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * sel = nullptr; // I32 [n_expert_used, n_tokens]
+
+    const llama_hashify_table * tbl;
+    const int il;
+};
+
 class llm_graph_input_out_ids : public llm_graph_input_i {
 public:
     llm_graph_input_out_ids(
@@ -1069,6 +1097,10 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+
+    // LLAMA_DSV4_HASHIFY: I32 [n_expert_used, n_tokens] table lookup for layer il,
+    // or nullptr when this layer is not hashified
+    ggml_tensor * build_inp_hashify(int il) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

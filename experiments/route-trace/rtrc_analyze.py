@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 MAGIC = 0x43525452
 
 
-def read_records(path):
+def read_records(path, n_expert=256):
     """Yield (seq, toks, poss, {il: [set(expert_ids) per row]}) grouped per eval."""
     with open(path, "rb") as f:
         hdr = f.read(8)
@@ -67,8 +67,8 @@ def read_records(path):
                     if cur is None or cur[0] != seq:
                         print(f"warn: layer record seq {seq} without token block", file=sys.stderr)
                         continue
-                    # top-k selection always yields k DISTINCT expert ids, so a row with
-                    # fewer is a readback that missed the real write (this happened under
+                    # top-k selection always yields k DISTINCT in-range expert ids, so a
+                    # row failing either test is a readback that missed the real write (this happened under
                     # CUDA graph replay, before the hook forced graphs off). Keep positional
                     # alignment with the token list and mark such rows None so the analyses
                     # skip them instead of letting expert 0 dominate the statistics.
@@ -76,7 +76,7 @@ def read_records(path):
                     n_bad = 0
                     for i in range(n):
                         chunk = ids[i * k:(i + 1) * k]
-                        if len(set(chunk)) < k:
+                        if len(set(chunk)) < k or min(chunk) < 0 or max(chunk) >= n_expert:
                             rows.append(None)
                             n_bad += 1
                         else:
