@@ -77,6 +77,28 @@ is the whole point of this section: **validate MoE changes with same-top-1 again
 logits, not with perplexity.** It costs one 2-minute leg and it distinguishes a genuinely exact
 kernel from a merely PPL-neutral one, which perplexity provably cannot.
 
+### Which side of the gate fusion is correct: attempted, not settled
+
+`MOE_GATE_FUSE` differs from the unfused path on 5.3% of top-1 predictions, but that says
+nothing about which is *right* — neither is ground truth. A CPU reference adjudicates it in
+principle, so one was built: DS4-Flash on `-ngl 0` with 20 threads, `-c 512 -ub 512`, 10 chunks
+(about 35 minutes, most of it loading 90 GB without mmap). Both CUDA paths were then scored
+against it at matching settings.
+
+| CUDA path | Mean KLD vs CPU | same top-1 vs CPU | RMS Δp |
+| --- | --- | --- | --- |
+| fused *(shipped default)* | 0.022578 ± 0.001284 | 95.647% ± 0.404 | 5.715% |
+| unfused | 0.019784 ± 0.001060 | 95.686% ± 0.402 | 5.387% |
+
+The unfused path is nominally closer to CPU, but the gap is 0.0028 against a combined error of
+0.0017 — about 1.7σ — and same-top-1 cannot separate them at all. **This does not settle it.**
+The direction favours the unfused reference, which is also the prior one would hold from the
+fusion being the thing that changed, but at 10 chunks it is suggestive only.
+
+Making it decisive means 100 CPU chunks, roughly six hours on this box for one of the three
+runs. Recorded as attempted-and-open rather than quietly dropped, because the 5.3% divergence is
+in a shipped default and the question of which side is right is the one that matters for it.
+
 ### The effect is one-shot
 
 | layers permuted | Mean KLD | same top-1 |
