@@ -65,11 +65,15 @@ compound — unlike routing content, which does (§3).
 | --- | --- | --- |
 | L0–2 | 0.021317 | 94.431% |
 | L3 | 0.018963 | 94.761% |
+| L10 | 0.013801 | 95.533% |
+| L16 | 0.010165 | 96.263% |
 | L19 | 0.008723 | 96.510% |
 | L27 | 0.002242 | 98.043% |
+| L35 | 0.000950 | 98.941% |
 
-Fewer layers left for the nudge to grow through. Per-layer damage is therefore **not
-comparable across depths without its matched floor**.
+Monotone across seven depths, a 20× decay from L3 to L35 — fewer layers left for the nudge to
+grow through. Per-layer damage is therefore **not comparable across depths without its matched
+floor**.
 
 ## 2. Per-layer sensitivity vs. observational predictability
 
@@ -77,21 +81,31 @@ comparable across depths without its matched floor**.
 --split 0.9`), measured *before* the legs ran. The ordering L19 < L3 < L16 < L27 was
 pre-registered.
 
-| layer | P | hashify KLD | same top-1 | ln PPL ratio | matched floor |
-| --- | --- | --- | --- | --- | --- |
-| L19 | 0.570 | 0.024264 | 94.392% | +0.00272 | 0.008723 |
-| L3 | 0.449 | 0.041405 | 92.529% | +0.00129 | 0.018963 |
-| L4 | 0.484 | 0.042603 | 92.639% | +0.00713 | — |
-| L16 | 0.364 | 0.044486 | 92.251% | +0.01308 | — |
-| L27 | 0.251 | 0.149494 | 87.702% | +0.09538 | 0.002242 |
+| layer | P | hashify KLD | same top-1 | ln PPL ratio | floor | excess | ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| L19 | 0.570 | 0.024264 | 94.392% | +0.00272 | 0.008723 | 0.0155 | 2.8× |
+| L35 | 0.460 | 0.029576 | 94.875% | +0.01153 | 0.000950 | 0.0286 | 31× |
+| L3 | 0.449 | 0.041405 | 92.529% | +0.00129 | 0.018963 | 0.0224 | 2.2× |
+| L4 | 0.484 | 0.042603 | 92.639% | +0.00713 | — | — | — |
+| L10 | 0.484 | 0.043719 | 92.278% | +0.00804 | 0.013801 | 0.0299 | 3.2× |
+| L16 | 0.364 | 0.044486 | 92.251% | +0.01308 | 0.010165 | 0.0343 | 4.4× |
+| L27 | 0.251 | 0.149494 | 87.702% | +0.09538 | 0.002242 | 0.1473 | 67× |
 
-Prediction confirmed, 6.2× spread. Two things to state carefully:
+The pre-registered ordering held, over a 6.2× spread in raw damage. Three things to state
+carefully:
 
-- L3 and L4 are a near-tie (1.7σ). The relation is **flat at the high-P end and explosive at
-  the low-P end**, not a clean rank correlation.
-- L27 has the *smallest* floor of the three measured and the *largest* damage — 67× its own
-  floor, against 2–3× for L3 and L19. Routing becomes genuinely context-dependent with depth;
-  early and mid layers sit close to token-determined.
+- L3, L4 and L10 are within 5% of each other. The relation is **flat at the high-P end and
+  explosive at the low-P end**, not a clean rank correlation (Spearman ρ ≈ 0.71 on raw damage
+  across seven layers, ≈ 0.81 on floor-excess).
+- L27 has a *smaller* floor than L3 and 3.6× the damage — 67× its own floor, against 2–3× for
+  L3 and L19. Routing becomes genuinely context-dependent with depth.
+- **The two normalisations disagree, and L35 is where they break.** Its absolute damage is
+  near the bottom (0.0296) but its floor is 20× smaller than L3's, so by ratio it looks like
+  L27. A multiplicative model — damage = propagation gain × intrinsic routing difference —
+  would justify the ratio, but an infinitesimal rounding nudge and an O(1) routing change do
+  not have to propagate with the same gain, so that model is an assumption, not a measurement.
+  Report raw damage (what deployment feels) alongside the floor (a separate fact about
+  perturbation propagation), and do not derive a single score from them.
 
 L19's perplexity ratio (+0.002720) is indistinguishable from the null bias (+0.002733): the
 most token-predictable learned layer in the model is free to hashify by that measure, and it
