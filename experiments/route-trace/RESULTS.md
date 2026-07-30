@@ -164,7 +164,7 @@ stack, and rolling them returns exactly the null, confirming the hook only pertu
 Effect size does *not* transfer between models — 3% to 25% — and near-tie density explains only
 part of that (§2c). Structure transfers; magnitude does not.
 
-### What predicts the magnitude: one constant, 84 legs, three architectures
+### What predicts the magnitude: one constant, 88 legs, three architectures
 
 Effect sizes ranged 1%–25% and looked unpredictable. They are not. Every leg reports RMS Δp —
 how far the output distribution moved — alongside the top-1 flip rate. For each leg, take the
@@ -174,15 +174,15 @@ size, `t/RMS` is one number everywhere:
 
 | group | legs | t / RMS (logit per %RMS) | spread |
 | --- | --- | --- | --- |
-| gpt-oss-20b / wiki | 3 | 0.0381 | 0.037–0.039 |
+| gpt-oss-20b / wiki | 7 | 0.0376 | 0.033–0.039 |
 | gpt-oss-20b / code | 6 | 0.0425 | 0.041–0.044 |
 | Nemotron-30B / wiki | 11 | 0.0329 | 0.030–0.037 |
 | DS4-Flash / wiki | 46 | 0.0313 | 0.024–0.036 |
 | DS4-Flash / code | 18 | 0.0401 | 0.034–0.051 |
-| **all** | **84** | **0.0344** | **sd 0.0052 = 15%** |
+| **all** | **88** | **0.0345** | **sd 0.0052 = 15%** |
 
 **A perturbation of RMS Δp = r% flips the tokens whose top-1 margin is below ≈ 0.034·r logits.**
-One constant, 84 legs, three architectures, five model+corpus pairs, near-tie densities varying
+One constant, 88 legs, three architectures, five model+corpus pairs, near-tie densities varying
 5.7×, and causes as different as a rounding no-op, a static routing table, uniform-random
 routing, a kernel fusion and a batch-size change.
 
@@ -223,9 +223,10 @@ beats a noise model over the whole distribution is open.
    absorb that curvature and **does not** — the raw ratio gives r = −0.261, this one −0.257. A
    ~10% sub-linearity over a 6× range is real; near-tie depletion is the natural explanation and
    is not demonstrated here.
-3. gpt-oss/wiki still rests on 3 legs. Nemotron is the check on whether that matters: widening
-   it from 4 legs to 11 moved its mean by 0.0001, so these per-group means look converged rather
-   than under-sampled.
+3. Sample size is no longer the worry it was. Both thin groups were deliberately widened —
+   Nemotron 4 → 11 legs and gpt-oss/wiki 3 → 7 — and neither mean moved by more than 2%
+   (0.0328 → 0.0329, 0.0381 → 0.0376). Every group now rests on ≥ 6 legs and the five group
+   means scatter by 11%.
 
 ### Closing the loop: the benchmark cannot see it either, and the arithmetic says why
 
