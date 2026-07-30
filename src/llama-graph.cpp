@@ -193,6 +193,108 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// .hsfy layout (little-endian): u32 magic "HSFY", u32 version=1, u32 n_vocab,
+// u32 n_expert_used, u32 n_layers, then per layer { i32 il, i32 ids[n_expert_used*n_vocab] }
+const llama_hashify_table * llama_hashify_get() {
+    static const llama_hashify_table * cached = [] () -> const llama_hashify_table * {
+        const char * path = getenv("LLAMA_DSV4_HASHIFY");
+        if (!path) {
+            return nullptr;
+        }
+
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            LLAMA_LOG_WARN("hashify: cannot open '%s'\n", path);
+            return nullptr;
+        }
+
+        auto * tbl = new llama_hashify_table();
+
+        uint32_t magic = 0, ver = 0, n_layers = 0;
+        bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x59465348 &&
+                  fread(&ver,   4, 1, f) == 1 && ver == 1 &&
+                  fread(&tbl->n_vocab,       4, 1, f) == 1 &&
+                  fread(&tbl->n_expert_used, 4, 1, f) == 1 &&
+                  fread(&n_layers, 4, 1, f) == 1;
+
+        for (uint32_t i = 0; ok && i < n_layers; ++i) {
+            int32_t il = 0;
+            ok = fread(&il, 4, 1, f) == 1;
+            if (!ok) {
+                break;
+            }
+
+            const size_t n = (size_t) tbl->n_vocab * tbl->n_expert_used;
+            auto & row = tbl->layers[il];
+            row.resize(n);
+            ok = fread(row.data(), sizeof(int32_t), n, f) == n;
+        }
+
+        fclose(f);
+
+        if (!ok) {
+            LLAMA_LOG_WARN("hashify: '%s' is malformed - ignoring\n", path);
+            delete tbl;
+            return nullptr;
+        }
+
+        // LLAMA_DSV4_HASHIFY_LAYERS=3,7-9 keeps only those layers from the file, so one
+        // table can drive per-layer legs without rebuilding it
+        if (const char * mask = getenv("LLAMA_DSV4_HASHIFY_LAYERS")) {
+            std::set<int32_t> keep;
+            int lo = -1, cur = -1;
+            for (const char * p = mask; ; ++p) {
+                if (*p >= '0' && *p <= '9') {
+                    cur = (cur < 0 ? 0 : cur*10) + (*p - '0');
+                } else {
+                    if (cur >= 0) {
+                        if (lo >= 0) {
+                            for (int i = lo; i <= cur; ++i) keep.insert(i);
+                            lo = -1;
+                        } else if (*p == '-') {
+                            lo = cur;
+                        } else {
+                            keep.insert(cur);
+                        }
+                        cur = -1;
+                    }
+                    if (*p == '\0') break;
+                }
+            }
+            for (auto it = tbl->layers.begin(); it != tbl->layers.end(); ) {
+                it = keep.count(it->first) ? std::next(it) : tbl->layers.erase(it);
+            }
+        }
+
+        std::string ils;
+        for (const auto & [il, _] : tbl->layers) {
+            ils += (ils.empty() ? "" : ",") + std::to_string(il);
+        }
+        LLAMA_LOG_INFO("hashify: %s - n_vocab %u, n_expert_used %u, layers [%s]\n",
+                path, tbl->n_vocab, tbl->n_expert_used, ils.c_str());
+
+        return tbl;
+    } ();
+
+    return cached;
+}
+
+void llm_graph_input_hashify::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(sel && ubatch->token);
+    GGML_ASSERT(ggml_backend_buffer_is_host(sel->buffer));
+
+    const auto & row = tbl->layers.at(il);
+    const int64_t k  = tbl->n_expert_used;
+
+    int32_t * data = (int32_t *) sel->data;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const int32_t tok = ubatch->token[i];
+        GGML_ASSERT(tok >= 0 && (uint32_t) tok < tbl->n_vocab);
+        memcpy(data + i*k, row.data() + (size_t) tok*k, k*sizeof(int32_t));
+    }
+}
+
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -2309,6 +2411,24 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     auto & cur = inp->out_ids;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+    ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_hashify(int il) const {
+    const auto * tbl = llama_hashify_get();
+    if (!tbl || !tbl->has(il)) {
+        return nullptr;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_hashify>(tbl, il);
+
+    auto & cur = inp->sel;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, tbl->n_expert_used, n_tokens);
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
