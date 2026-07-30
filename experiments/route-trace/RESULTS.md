@@ -70,10 +70,12 @@ compound — unlike routing content, which does (§3).
 | L19 | 0.008723 | 96.510% |
 | L27 | 0.002242 | 98.043% |
 | L35 | 0.000950 | 98.941% |
+| L39 | 0.000538 | 99.220% |
+| L42 | 0.000124 | 99.961% |
 
-Monotone across seven depths, a 20× decay from L3 to L35 — fewer layers left for the nudge to
-grow through. Per-layer damage is therefore **not comparable across depths without its matched
-floor**.
+Monotone across nine depths and decaying to exactly the null floor at the last layer, where
+there is nothing downstream for the nudge to grow through. Per-layer damage is therefore **not
+comparable across depths without its matched floor**.
 
 ## 2. Per-layer sensitivity vs. observational predictability
 
@@ -110,6 +112,44 @@ carefully:
 L19's perplexity ratio (+0.002720) is indistinguishable from the null bias (+0.002733): the
 most token-predictable learned layer in the model is free to hashify by that measure, and it
 is also the top-ranked layer on an unrelated code corpus.
+
+## 2b. Both ends of the stack are token-driven, and the top is cheapest
+
+The original wiki trace's L37–42 were corrupt (collected before the CUDA-graph fix), so a
+fresh 14-chunk leg was collected. Held-out predictability at the deep end:
+
+L34 0.228 · L35 0.462 · L36 0.310 · L37 0.319 · L38 0.308 · **L39 0.485** · L40 0.409 ·
+L41 0.400 · **L42 0.497**
+
+L42 and L39 rank behind only L19 (0.570) across the whole model, and the code corpus shows the
+same rise at the top. Predictability is **U-shaped in depth** — both ends route by token
+identity, the middle does not.
+
+Interventionally (this table is distilled from 28674 rows, ~93% instance coverage, so `d19` is
+run with the *same* table to calibrate the table-quality penalty):
+
+| leg | layer | P | table | Mean KLD | same top-1 | ln PPL ratio | floor |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| d19 | L19 | 0.570 | deep | 0.034049 | 93.624% | +0.00850 | 0.008723 |
+| d42 | L42 | 0.497 | deep | **0.021900** | 95.573% | +0.01886 | 0.000124 |
+| d39 | L39 | 0.485 | deep | 0.029992 | 95.090% | +0.01907 | 0.000538 |
+
+The calibration lands at 0.034049 / 0.024264 = **1.40×**, matching the 1.39× penalty implied
+independently by the row-matched control in §5. With table quality thus held fixed, **L42 and
+L39 are cheaper to hashify than L19**, which was the cheapest mid-stack layer — so the top of
+the stack is the cheapest place in the model to replace a router with a token table.
+
+Two observations that follow:
+
+- **At the top, damage shows up in perplexity; mid-stack it hides.** L19's perplexity ratio
+  sits exactly on the null bias while L42's is 10σ above it, even though L42's KLD is *lower*.
+  A late-layer change lands directly on the logits instead of diffusing through the remaining
+  stack.
+- **A token-table layer is prefetchable at any depth** — its expert ids depend only on the
+  input token, which is known before the forward pass begins. So the lookahead argument for
+  hash layers does not explain putting them at the *bottom*, where they are more expensive
+  than at the top. If there is a reason for the bottom, it is more likely training dynamics
+  than inference.
 
 ## 3. Cumulative curve
 
