@@ -151,6 +151,42 @@ Two observations that follow:
   than at the top. If there is a reason for the bottom, it is more likely training dynamics
   than inference.
 
+## 2c. Second corpus: the per-layer predictability relation does NOT replicate
+
+Same design on `rtrc-corpus-code.txt` with its own base logits (PPL 2.0105), in-domain
+code-distilled table (91.6% instance coverage, so these carry a table-quality penalty relative
+to §2 — but a common multiplicative one, which leaves the *ordering* and the *spread* intact).
+
+**The floor on code is exactly zero**: the null leg gives KLD −0.000001 and same top-1
+**100.000%**. Wiki's 0.000124 floor is stored-logit precision flipping near-ties; on code the
+model is confident enough that nothing flips at all.
+
+| layer | code P | KLD | same top-1 | floor | excess |
+| --- | --- | --- | --- | --- | --- |
+| L42 | 0.392 | 0.012156 | 98.027% | −0.000001 | 0.0122 |
+| L27 | 0.294 | 0.015126 | 97.169% | 0.001128 | 0.0140 |
+| L25 | 0.214 | 0.020141 | 97.020% | 0.001539 | 0.0186 |
+| L19 | 0.448 | 0.023658 | 96.898% | 0.002625 | 0.0210 |
+
+Damage and excess are both **monotone decreasing with depth** and show no relation to `P` —
+the most predictable layer (L19) is the most expensive here, and the second most predictable
+(L42) the cheapest. On this corpus depth explains everything and predictability explains
+nothing.
+
+What differs: wiki PPL 5.03 against code PPL 2.01. The damage spread collapses from 6× to 2×
+and the `P` spread from 0.235–0.570 to 0.214–0.448. The likely reading is that on wiki the
+damage is dominated by how many near-ties a layer's perturbation can flip, and `P` correlates
+with that; on code there are few near-ties left to flip, so only raw propagation depth
+survives.
+
+**So the §2 relation is a wikitext result, not a law.** It was pre-registered and it held there
+over a 6× spread, but one corpus of replication is enough to show it does not generalise. Two
+things do replicate across both corpora:
+
+- the floor's monotone decay with depth, reaching exactly the null at the last layer;
+- **L42 being the cheapest layer to hashify** (lowest on wiki at 0.021900, lowest on code at
+  0.012156).
+
 ## 3. Cumulative curve
 
 | n | layers | Mean KLD | same top-1 | ln PPL ratio |
@@ -204,8 +240,8 @@ averages out while an out-of-domain table concentrates confidently on a narrow w
 
 ## Caveats
 
-- One eval corpus (wikitext). The code corpus is used for table-building and for the
-  observational profile, not as an evaluation set.
+- Two eval corpora, and they disagree about §2 — see §2c. The per-layer predictability
+  relation is reported as a wikitext result, not a general one.
 - Tables are distilled from traces of the *same* text the eval draws from, so instance
   coverage is 100% and the costs here are **lower bounds** on what an out-of-sample table
   would cost. §5's transfer row is the upper bound.
