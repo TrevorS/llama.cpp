@@ -215,6 +215,92 @@ writes require equal sequence lengths" — the fused attention path requires equ
 lengths and the multiple-choice harness batches ragged ones. That is a real limitation of our
 tree, and it means the standard llama.cpp task harnesses have never been run against it.)*
 
+### What predicts the magnitude: one constant, 75 legs, three architectures
+
+Effect sizes ranged 1%–25% and looked unpredictable. They are not. Every leg reports RMS Δp —
+how far the output distribution moved — alongside the top-1 flip rate. For each leg, take the
+margin threshold `t` whose CDF in that model+corpus's *own* base logits equals the observed flip
+rate. If a perturbation simply flips whatever sits inside a margin band proportional to its
+size, `t/RMS` is one number everywhere:
+
+| group | legs | t / RMS (logit per %RMS) | spread |
+| --- | --- | --- | --- |
+| gpt-oss-20b / wiki | 3 | 0.0384 | 0.038–0.039 |
+| gpt-oss-20b / code | 6 | 0.0443 | 0.041–0.046 |
+| Nemotron-30B / wiki | 2 | 0.0324 | 0.031–0.034 |
+| DS4-Flash / wiki | 48 | 0.0330 | 0.025–0.039 |
+| DS4-Flash / code | 16 | 0.0402 | 0.034–0.054 |
+| **all** | **75** | **0.0357** | **sd 0.0053 = 15%** |
+
+**A perturbation of RMS Δp = r% flips the tokens whose top-1 margin is below ≈ 0.036·r logits.**
+One constant, 75 legs, three architectures, five model+corpus pairs, near-tie densities varying
+5.7×, and causes as different as a rounding no-op, a static routing table, uniform-random
+routing, a kernel fusion and a batch-size change.
+
+That is why magnitudes never transfer: the same perturbation lands on a different margin
+distribution. gpt-oss-20b is the clean demonstration — the *same model* gives flip/RMS = 4.46 on
+wikitext (PPL 195, out of distribution) and 0.92 on code (PPL 2.33, in distribution), a 4.8×
+drop from nothing but the text. Predicted from its margin distribution before the legs ran: 0.71.
+
+**Two limits, stated rather than smoothed over.** First, the fit is one parameter over five
+groups whose per-group means still differ by ±25%, and two of those groups have only 2–3 legs.
+Second, `t/RMS` is *not* strictly constant within a group: on the 48 DS4/wiki legs it declines
+from 0.0348 to 0.0313 as RMS grows (Pearson r = −0.26 against perturbation size). This
+margin-matched formulation was expected to absorb that curvature and **does not** — the raw
+ratio gives r = −0.261 and the reformulated one r = −0.257. A ~10% sub-linearity over a 6×
+range is real. Near-tie depletion is the natural explanation and is not demonstrated here.
+
+### Closing the loop: the benchmark cannot see it either, and the arithmetic says why
+
+Perplexity being blind invites the obvious retort — *use a benchmark instead*. So: HellaSwag,
+2000 tasks, gpt-oss-20b, with and without the expert-list roll (still a mathematical no-op).
+
+| | accuracy | 95% CI |
+| --- | --- | --- |
+| base | 58.05% | [55.87%, 60.20%] |
+| roll @ L0–23 | 57.70% | [55.52%, 59.85%] |
+
+A change that moves **24.8% of top-1 predictions** moves HellaSwag by **0.35 points**, deep
+inside a ±2.2-point interval. But the headline number hides what happened. llama.cpp prints a
+running accuracy per task, so differencing the correct-count recovers each individual answer
+(2000 tasks, zero reconstruction anomalies — every difference was 0 or 1):
+
+| | tasks |
+| --- | --- |
+| individual answers changed | **139 / 2000 = 6.95%** |
+| right → wrong | 73 |
+| wrong → right | 66 |
+| net | −7 (−0.35 pp) |
+
+**The benchmark score is stable because the errors cancel, not because the model behaves the
+same.** Seven percent of its answers changed and the reported metric moved by a third of a
+point — an aggregate statistic averaging over precisely the thing that moved.
+
+Put end to end on one perturbation that is provably a no-op:
+
+| observable | change |
+| --- | --- |
+| perplexity ratio | at or below the null's own bias |
+| HellaSwag headline accuracy | −0.35 pp (inside CI) |
+| HellaSwag individual answers | 6.95% changed |
+| top-1 predictions | 24.8% changed |
+| greedy generation | diverges mid-derivation |
+
+The standard validation stack — perplexity plus a benchmark — is blind to a change that alters
+a quarter of the model's token-level decisions and 7% of its benchmark answers. Same-top-1
+against stored logits detects it in one 2-minute leg. That is the entire recommendation.
+
+A caveat worth stating in both directions: flat benchmark accuracy is *reassuring* about
+quality — the model is no worse — and *alarming* about validation, because it means the
+benchmark cannot distinguish a bit-exact kernel from an inexact one. In agentic or
+long-generation settings, where token-level divergence compounds rather than averages, the
+reassurance is weaker than the number suggests.
+
+*(DS4-Flash could not be measured here: `--hellaswag` aborts on our fork with "DSV4 coupled raw
+writes require equal sequence lengths" — the fused attention path requires equal sequence
+lengths and the multiple-choice harness batches ragged ones. That is a real limitation of our
+tree, and it means the standard llama.cpp task harnesses have never been run against it.)*
+
 ### What predicts the magnitude: one two-factor law across three models
 
 Effect sizes ranged from 3% to 25% and looked unpredictable. They are not. Every leg reports
