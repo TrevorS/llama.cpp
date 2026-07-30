@@ -895,6 +895,10 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // LLAMA_ROUTE_TRACE: (il, selected-expert ids [n_expert_used, n_tokens] I32) per MoE
+    // layer, kept as graph outputs so the context can spool them to disk after compute
+    std::vector<std::pair<int, ggml_tensor *>> t_route_topk;
+
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
     std::map<llama_seq_id, ggml_tensor *> t_sampled;

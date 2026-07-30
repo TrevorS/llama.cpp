@@ -13,6 +13,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -93,6 +94,27 @@ llama_context::llama_context(
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
+
+    // LLAMA_ROUTE_TRACE=<path-prefix>: spool per-layer selected-expert ids for every
+    // decoded ubatch. One file per context: <prefix>.<arch>.<n>.rtrc
+    // Format: u32 magic "RTRC", u32 version, then records:
+    //   type 0 (tokens): u8 0, u32 seq, u32 n_tokens, i32 tok[n], i32 pos[n]
+    //   type 1 (layer):  u8 1, u32 seq, i32 il, u32 k, u32 n_tokens, i32 ids[k*n]
+    if (const char * rt = getenv("LLAMA_ROUTE_TRACE")) {
+        static std::atomic<int> route_trace_idx{0};
+        char rt_path[1024];
+        snprintf(rt_path, sizeof(rt_path), "%s.%s.%d.rtrc", rt, llm_arch_name(model.arch), route_trace_idx++);
+        route_trace_f = fopen(rt_path, "wb");
+        if (route_trace_f) {
+            const uint32_t rt_magic = 0x43525452; // "RTRC"
+            const uint32_t rt_ver   = 1;
+            fwrite(&rt_magic, 4, 1, route_trace_f);
+            fwrite(&rt_ver,   4, 1, route_trace_f);
+            LLAMA_LOG_INFO("%s: route trace enabled: %s\n", __func__, rt_path);
+        } else {
+            LLAMA_LOG_WARN("%s: route trace: cannot open '%s'\n", __func__, rt_path);
+        }
+    }
 
     const auto & hparams = model.hparams;
 
@@ -505,6 +527,10 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    if (route_trace_f) {
+        fclose(route_trace_f);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1937,6 +1963,43 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // LLAMA_ROUTE_TRACE: spool this ubatch's tokens/positions and every traced
+        // layer's selected-expert ids (format documented at the ctor)
+        if (route_trace_f && !res->t_route_topk.empty() && ubatch.token != nullptr) {
+            const uint32_t rt_n = ubatch.n_tokens;
+
+            const uint8_t rt_tok = 0;
+            fwrite(&rt_tok,          1, 1,    route_trace_f);
+            fwrite(&route_trace_seq, 4, 1,    route_trace_f);
+            fwrite(&rt_n,            4, 1,    route_trace_f);
+            fwrite(ubatch.token, sizeof(llama_token), rt_n, route_trace_f);
+            fwrite(ubatch.pos,   sizeof(llama_pos),   rt_n, route_trace_f);
+
+            std::vector<int32_t> rt_ids;
+            for (const auto & [rt_il, rt_t] : res->t_route_topk) {
+                GGML_ASSERT(rt_t->type == GGML_TYPE_I32);
+                GGML_ASSERT(ggml_is_contiguous(rt_t));
+
+                const uint32_t rt_k  = rt_t->ne[0];
+                const uint32_t rt_nt = rt_t->ne[1];
+
+                rt_ids.resize((size_t) rt_k*rt_nt);
+
+                ggml_backend_tensor_get(rt_t, rt_ids.data(), 0, rt_ids.size()*sizeof(int32_t));
+
+                const uint8_t rt_lay  = 1;
+                const int32_t rt_il32 = rt_il;
+                fwrite(&rt_lay,          1, 1, route_trace_f);
+                fwrite(&route_trace_seq, 4, 1, route_trace_f);
+                fwrite(&rt_il32,         4, 1, route_trace_f);
+                fwrite(&rt_k,            4, 1, route_trace_f);
+                fwrite(&rt_nt,           4, 1, route_trace_f);
+                fwrite(rt_ids.data(),    4, rt_ids.size(), route_trace_f);
+            }
+
+            route_trace_seq++;
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
