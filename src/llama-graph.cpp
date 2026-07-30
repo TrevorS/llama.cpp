@@ -2007,8 +2007,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // context can read them back (routing-predictability / MTP-correspondence traces)
     static const bool route_trace = getenv("LLAMA_ROUTE_TRACE") != nullptr;
     if (route_trace) {
-        ggml_set_output(selected_experts);
-        res->t_route_topk.push_back({il, selected_experts});
+        // the top-k tensor is a strided view; the cast yields a fresh contiguous
+        // tensor on a proven CUDA path (same as the group-remap above), and expert
+        // ids are exact in f32 — converted back to i32 at spool time
+        ggml_tensor * rt = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        ggml_set_output(rt);
+        ggml_build_forward_expand(gf, rt);
+        res->t_route_topk.push_back({il, rt});
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
