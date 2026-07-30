@@ -151,65 +151,70 @@ Two observations that follow:
   than at the top. If there is a reason for the bottom, it is more likely training dynamics
   than inference.
 
-## 2c. Second corpus: the per-layer predictability relation does NOT replicate
+## 2c. Second corpus: two confounds, and the relation survives both
 
-Same design on `rtrc-corpus-code.txt` with its own base logits (PPL 2.0105), in-domain
-code-distilled table (91.6% instance coverage, so these carry a table-quality penalty relative
-to §2 — but a common multiplicative one, which leaves the *ordering* and the *spread* intact).
+The first attempt on `rtrc-corpus-code.txt` (own base logits, PPL 2.0105) said the §2 relation
+did not replicate — damage was monotone in depth and, if anything, *anti*-correlated with `P`.
+That conclusion was wrong, and finding out why produced the two controls this measurement
+actually needs.
 
-**The floor on code is exactly zero**: the null leg gives KLD −0.000001 and same top-1
-**100.000%**. Wiki's 0.000124 floor is stored-logit precision flipping near-ties; on code the
-model is confident enough that nothing flips at all.
+**Confound A — the layer set confounded predictability with depth.** L19/25/27/42 spans 23
+layers, over which the matched floor falls from 0.002625 to exactly zero, while `P` varies only
+2×. Propagation swamps predictability, so that comparison could never have shown one.
 
-| layer | code P | KLD | same top-1 | floor | excess |
-| --- | --- | --- | --- | --- | --- |
-| L42 | 0.392 | 0.012156 | 98.027% | −0.000001 | 0.0122 |
-| L27 | 0.294 | 0.015126 | 97.169% | 0.001128 | 0.0140 |
-| L25 | 0.214 | 0.020141 | 97.020% | 0.001539 | 0.0186 |
-| L19 | 0.448 | 0.023658 | 96.898% | 0.002625 | 0.0210 |
+**Confound B — table coverage dilutes the contrast.** The code table had 91.6% instance
+coverage, so ~8% of positions took the generic fallback *at every layer* — a common damage term
+that compresses any per-layer difference toward 1. A longer trace (`codefull`, 169 evals /
+86018 rows) rebuilt it at **99.88%**, matching the wiki setup.
 
-Damage and excess are both **monotone decreasing with depth** and show no relation to `P` —
-the most predictable layer (L19) is the most expensive here, and the second most predictable
-(L42) the cheapest. On this corpus depth explains everything and predictability explains
-nothing.
+**Control: adjacent layers, matched floors, matched coverage.** Two predictions were written
+down before these legs returned.
 
-What differs: wiki PPL 5.03 against code PPL 2.01. The damage spread collapses from 6× to 2×
-and the `P` spread from 0.235–0.570 to 0.214–0.448. The likely reading is that on wiki the
-damage is dominated by how many near-ties a layer's perturbation can flip, and `P` correlates
-with that; on code there are few near-ties left to flip, so only raw propagation depth
-survives.
+Prediction 1 — L20 is half as predictable as L19 at the same depth (`P` 0.220 vs 0.447), so it
+should cost *more*. The 91.6%-coverage run had it backwards:
 
-**So the §2 relation is a wikitext result, not a law.** It was pre-registered and it held there
-over a 6× spread, but one corpus of replication is enough to show it does not generalise. Two
-things do replicate across both corpora:
+| pair | table coverage | L19 | L20 | ratio |
+| --- | --- | --- | --- | --- |
+| c19 / c20 | 91.6% | 0.023658 | 0.020829 | 0.88 ✗ |
+| cf19 / cf20 | 99.88% | 0.013982 | **0.017095** | **1.22 ✓** |
 
-- the floor's monotone decay with depth, reaching exactly the null at the last layer;
-- **L42 being the cheapest layer to hashify** (lowest on wiki at 0.021900, lowest on code at
-  0.012156).
+Fixing coverage flips the sign, and both damages drop — the fallback term was large and shared.
 
-### Why it does not replicate: near-tie density, measured from the base logits
+Prediction 2 — the strongest design available. Take the *same two layers* on both corpora. On
+wiki L34/L35 sit at `P` 0.228 vs 0.462; on code they are equal (0.318 vs 0.325). So the same
+physical pair should differ on wiki and not on code:
 
-The proposed reason — a routing perturbation can only flip a prediction where the top two are
-close — is a claim about the *base* distribution, so it is testable with no GPU at all.
-`margin_stats.py` decodes the stored `--kl-divergence-base` file and reports the top-1 margin.
+| corpus | L34 `P` | L35 `P` | L34 KLD | L35 KLD | ratio | floors |
+| --- | --- | --- | --- | --- | --- | --- |
+| wiki | 0.228 | 0.462 | 0.062967 | 0.029576 | **2.13×** | 0.001041 / 0.000950 |
+| code | 0.318 | 0.325 | 0.013091 | 0.013041 | **1.004×** | 0.000618 / 0.000505 |
+
+Identical to 0.4% on code — inside the error bars — and 2.13× apart on wiki. Same layers, same
+weights, matched floors; only the text differs, and the damage follows each corpus's own
+observational profile in both directions.
+
+### The magnitude scale is a property of the corpus, not the intervention
+
+Measured directly from the stored base logits with `margin_stats.py`, no GPU required:
 
 | P(top-1 margin < …) | 0.01 | 0.05 | 0.1 | 0.25 | 0.5 | 1.0 | median |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | wiki | 0.33% | 1.70% | 3.33% | 8.48% | 16.53% | 30.08% | 2.06 |
 | code | 0.10% | 0.68% | 1.45% | 4.03% | 7.05% | 12.55% | 5.95 |
 
-Near-ties are ~2.3× rarer on code and its median margin is 2.9× wider. Calibrating a margin
-threshold on the wiki `roll@L19` flip rate (3.490% → 0.106 logits) and applying it unchanged to
-the code margin distribution **predicts a 1.575% flip rate on code against 1.145% observed** —
-a zero-free-parameter cross-corpus prediction landing within 1.38×, using the pure-rounding
-perturbation that is identical in nature on both corpora.
+Near-ties are 2.3× rarer on code and the median margin is 2.9× wider. Calibrate a margin
+threshold on wiki's `roll@L19` flip rate (3.490% → 0.106 logits) and apply it unchanged to the
+code distribution: **predicted 1.575% flip rate, observed 1.145%** — zero free parameters,
+within 1.38×, using the pure-rounding perturbation that is identical on both corpora.
 
-So the absolute damage scale is set by the corpus, not by the intervention: KLD scales the same
-way (0.008723 wiki vs 0.002625 code at the same roll, 3.3×, against the 3.05× flip-rate ratio).
-**"Same top-1 %" is not a corpus-independent measure of perturbation severity**, and neither is
-KLD — only comparisons *within* one corpus and one base-logits file are meaningful. That alone
-explains the magnitude collapse in §2c; whether it also explains the ordering reversal needs a
-depth-controlled pair, which is what the adjacent-layer legs test.
+So neither same-top-1 nor KLD is a corpus-independent measure of severity, and cross-corpus
+*magnitudes* mean nothing. Within-corpus, layer-relative comparisons are the only valid ones —
+and those track predictability once depth and coverage are matched.
+
+**Net:** the observational proxy predicts interventional damage, conditional on two controls
+that are easy to miss. Reported without them it produces a null (Confound A), a sign flip
+(Confound B), or an unreplicable magnitude (near-tie density). The §2 table is a wiki-only
+ranking for exactly that reason: its layers span 24 depths.
 
 ## 3. Cumulative curve
 
