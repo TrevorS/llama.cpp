@@ -16,7 +16,9 @@ BASE=${5:-/home/trevor/models/ds4/kld/base-udiq3-c512-n100.kld}
 CHUNKS=${6:-100}
 DUTY=${7:-85}
 
-MODEL=/home/trevor/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf
+# MODEL is overridable so the same leg runs on any MoE - the order-roll hook lives in the
+# shared build_moe_ffn path, not in the DeepSeek model code
+MODEL=${MODEL:-/home/trevor/models/ds4/DeepSeek-V4-Flash-GGUF/UD-IQ3_XXS/DeepSeek-V4-Flash-UD-IQ3_XXS-00001-of-00004.gguf}
 BIN=$(dirname "$0")/../../build/bin/llama-perplexity
 OUT=/home/trevor/.cache/hashify-kld
 mkdir -p "$OUT"
@@ -47,6 +49,12 @@ echo "ts,watts,clock,gpu_c,soc_c" > "$CSV"
 SAMPLER=$!
 
 ENVV=(GGML_CUDA_POWER="$DUTY" GGML_CUDA_POWER_GRANULARITY=layer)
+# EXTRA_ENV="K=V K=V" - lets a leg toggle a shipped kernel flag, so the same harness that
+# measures a synthetic reordering can measure what one of our own kernels actually does
+if [ -n "${EXTRA_ENV:-}" ]; then
+    # shellcheck disable=SC2206
+    ENVV+=(${EXTRA_ENV})
+fi
 case "$HSFY" in
     none) ;;
     # pass "roll" instead of a table to rotate the live routing at those layers - the
@@ -57,7 +65,7 @@ case "$HSFY" in
 esac
 
 env "${ENVV[@]}" \
-    "$BIN" -m "$MODEL" --no-mmap -fa on -c 512 -ub 2048 -b 2048 -ngl 999 \
+    "$BIN" -m "$MODEL" --no-mmap -fa on -c 512 -ub "${UB:-2048}" -b 2048 -ngl 999 \
     --chunks "$CHUNKS" -f "$CORPUS" \
     --kl-divergence-base "$BASE" --kl-divergence > "$LOG" 2>&1
 RC=$?

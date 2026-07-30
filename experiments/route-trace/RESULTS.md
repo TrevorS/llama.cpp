@@ -46,6 +46,37 @@ predictions change**, and every one of these legs has a perplexity ratio *below*
 `sortid` is the one that matters in practice: sorting the expert list by id is exactly what
 grouped-GEMM and tile-packing dispatch do.
 
+### The same magnitude arrives from three unrelated causes, and PPL sees none of them
+
+The interesting question is not whether a synthetic permutation matters — it is whether things
+people actually do land in the same place. Three do, measured on the same base logits:
+
+| perturbation | what it is | Mean KLD | same top-1 | ln PPL ratio |
+| --- | --- | --- | --- | --- |
+| null | nothing | 0.000124 | 99.961% | +0.00273 |
+| `LLAMA_DSV4_UNION_GATHER=0` | shipped kernel, off | 0.000124 | 99.961% | +0.00273 |
+| `LLAMA_DSV4_LID_SHORTCUT=0` | shipped kernel, off | 0.000124 | 99.961% | +0.00273 |
+| roll expert list @ L3 | mathematical no-op | 0.018963 | 94.761% | +0.00232 |
+| **`LLAMA_DSV4_MOE_GATE_FUSE=0`** | **shipped kernel, off** | **0.018895** | **94.718%** | **+0.00110** |
+| sort expert list by id @ L0–2 | mathematical no-op | 0.020999 | 94.624% | +0.00243 |
+| **`-ub 2048` → `-ub 512`** | **serving parameter** | **0.021657** | **94.510%** | **+0.00246** |
+
+Two of our three shipped kernels are **bit-exact** — they reproduce the stored logits to every
+printed digit, and this instrument proves it in about two minutes. The third, the fused
+sqrt-softplus MoE gate, is not: it differs from the unfused reference on **5.3% of top-1
+predictions**. All three shipped as "no PPL regression", and on the perplexity ratio the
+inexact one looks *better* than the null.
+
+Changing the micro-batch from 2048 to 512 — no code change, a scheduling decision a server
+makes under load — moves **5.5%** of top-1 predictions. That is the same magnitude as
+deliberately scrambling the expert order.
+
+So a mathematical no-op, a kernel fusion, and a batch-size knob all land within 15% of each
+other in divergence, and perplexity separates none of them from the null. The practical rule
+is the whole point of this section: **validate MoE changes with same-top-1 against stored
+logits, not with perplexity.** It costs one 2-minute leg and it distinguishes a genuinely exact
+kernel from a merely PPL-neutral one, which perplexity provably cannot.
+
 ### The effect is one-shot
 
 | layers permuted | Mean KLD | same top-1 |
