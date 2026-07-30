@@ -80,7 +80,12 @@ def read_records(path, n_expert=256):
                             rows.append(None)
                             n_bad += 1
                         else:
-                            rows.append(frozenset(chunk))
+                            # keep the emitted ORDER: the model lists top-k by descending
+                            # router probability and the MoE output is accumulated in that
+                            # order, so a table built from order-blind sets reproduces the
+                            # right experts with the wrong rounding. load() sets-ifies for
+                            # the overlap analyses, which genuinely do not care.
+                            rows.append(tuple(chunk))
                     if n_bad:
                         dropped[il] = dropped.get(il, 0) + n_bad
                     if n_bad == n:
@@ -102,7 +107,10 @@ def read_records(path, n_expert=256):
 
 
 def load(path):
-    evals = list(read_records(path))
+    evals = [(seq, toks, poss,
+              {il: [None if r is None else frozenset(r) for r in rows]
+               for il, rows in lys.items()})
+             for seq, toks, poss, lys in read_records(path)]
     print(f"{path}: {len(evals)} evals, "
           f"{sum(len(e[1]) for e in evals)} token-rows, "
           f"layers: {sorted({il for e in evals for il in e[3]})[:5]}..."
