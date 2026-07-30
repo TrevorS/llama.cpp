@@ -227,10 +227,10 @@ size, `t/RMS` is one number everywhere:
 | --- | --- | --- | --- |
 | gpt-oss-20b / wiki | 3 | 0.0381 | 0.037–0.039 |
 | gpt-oss-20b / code | 6 | 0.0425 | 0.041–0.044 |
-| Nemotron-30B / wiki | 4 | 0.0328 | 0.030–0.037 |
+| Nemotron-30B / wiki | 11 | 0.0329 | 0.030–0.037 |
 | DS4-Flash / wiki | 46 | 0.0313 | 0.024–0.036 |
 | DS4-Flash / code | 18 | 0.0401 | 0.034–0.051 |
-| **all** | **77** | **0.0346** | **sd 0.0054 = 16%** |
+| **all** | **84** | **0.0344** | **sd 0.0052 = 15%** |
 
 Two selection rules, both needed and both principled. A leg is kept only if its RMS Δp exceeds
 3× *its own group's* null RMS — an earlier flat cutoff of 1.0 was tuned to DS4/wiki's
@@ -253,7 +253,9 @@ drop from nothing but the text. Predicted from its margin distribution before th
 code groups sit high (0.0425, 0.0401) and both well-fitted wiki groups sit low (0.0313, 0.0328),
 so a ~±15% systematic tracks *corpus type* rather than model. A refinement probably needs more
 of the margin distribution's shape than a single quantile. Second, gpt-oss/wiki still has only
-3 legs.
+3 legs — though Nemotron is now a check on whether that matters: widening it from 4 legs to 11
+moved its mean by 0.0001 (0.0328 → 0.0329), so these per-group means look stable rather than
+under-sampled.
 Second, `t/RMS` is *not* strictly constant within a group: on the 48 DS4/wiki legs it declines
 from 0.0348 to 0.0313 as RMS grows (Pearson r = −0.26 against perturbation size). This
 margin-matched formulation was expected to absorb that curvature and **does not** — the raw
