@@ -187,6 +187,30 @@ things do replicate across both corpora:
 - **L42 being the cheapest layer to hashify** (lowest on wiki at 0.021900, lowest on code at
   0.012156).
 
+### Why it does not replicate: near-tie density, measured from the base logits
+
+The proposed reason — a routing perturbation can only flip a prediction where the top two are
+close — is a claim about the *base* distribution, so it is testable with no GPU at all.
+`margin_stats.py` decodes the stored `--kl-divergence-base` file and reports the top-1 margin.
+
+| P(top-1 margin < …) | 0.01 | 0.05 | 0.1 | 0.25 | 0.5 | 1.0 | median |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| wiki | 0.33% | 1.70% | 3.33% | 8.48% | 16.53% | 30.08% | 2.06 |
+| code | 0.10% | 0.68% | 1.45% | 4.03% | 7.05% | 12.55% | 5.95 |
+
+Near-ties are ~2.3× rarer on code and its median margin is 2.9× wider. Calibrating a margin
+threshold on the wiki `roll@L19` flip rate (3.490% → 0.106 logits) and applying it unchanged to
+the code margin distribution **predicts a 1.575% flip rate on code against 1.145% observed** —
+a zero-free-parameter cross-corpus prediction landing within 1.38×, using the pure-rounding
+perturbation that is identical in nature on both corpora.
+
+So the absolute damage scale is set by the corpus, not by the intervention: KLD scales the same
+way (0.008723 wiki vs 0.002625 code at the same roll, 3.3×, against the 3.05× flip-rate ratio).
+**"Same top-1 %" is not a corpus-independent measure of perturbation severity**, and neither is
+KLD — only comparisons *within* one corpus and one base-logits file are meaningful. That alone
+explains the magnitude collapse in §2c; whether it also explains the ordering reversal needs a
+depth-controlled pair, which is what the adjacent-layer legs test.
+
 ## 3. Cumulative curve
 
 | n | layers | Mean KLD | same top-1 | ln PPL ratio |
