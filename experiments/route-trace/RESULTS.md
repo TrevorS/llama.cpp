@@ -194,6 +194,52 @@ writes require equal sequence lengths" — the fused attention path requires equ
 lengths and the multiple-choice harness batches ragged ones. That is a real limitation of our
 tree, and it means the standard llama.cpp task harnesses have never been run against it.)*
 
+### What predicts the magnitude: one two-factor law across three models
+
+Effect sizes ranged from 3% to 25% and looked unpredictable. They are not. Every leg reports
+RMS Δp — how far the output distribution moved — alongside the top-1 flip rate. Their ratio
+
+    k = flip% / RMS Δp%
+
+is **constant within a (model, corpus) pair and varies 7× between them**:
+
+| group | legs | k (observed) | spread | F(0.1) = P(top-1 margin < 0.1 logit) | k / F |
+| --- | --- | --- | --- | --- | --- |
+| DS4-Flash / wiki | 48 | 1.090 | 0.85–1.23 | 3.33% | 0.328 |
+| DS4-Flash / code | 16 | 0.641 | 0.55–0.77 | 1.45% | 0.442 |
+| Nemotron-30B / wiki | 2 | 1.748 | 1.69–1.81 | 5.27% | 0.331 |
+| gpt-oss-20b / wiki | 3 | 4.464 | 4.36–4.59 | 12.28% | 0.364 |
+
+Those 48 DS4/wiki legs span a 6× range of perturbation size and include a rounding no-op, a
+static routing table, uniform-random routing, a shipped kernel fusion and a batch-size change —
+**the flip rate does not care what caused the perturbation, only how large it is.**
+
+And `k` is itself predicted by the base distribution's near-tie density, measured independently
+from the stored logits with no reference to any leg. Normalising to DS4/wiki:
+
+| group | k ratio | near-tie ratio | error |
+| --- | --- | --- | --- |
+| Nemotron-30B / wiki | 1.60 | 1.59 | **1.1%** |
+| gpt-oss-20b / wiki | 4.09 | 3.69 | 10.9% |
+| DS4-Flash / code | 0.59 | 0.44 | 34.9% |
+
+The Nemotron row was an **out-of-sample prediction**: its `k` implied F(0.1) ≈ 5.35% before the
+margin distribution was computed, and the measurement returned 5.27%.
+
+So the two-factor law is
+
+    flip% ≈ 0.33 · F(0.1) · RMS Δp%
+
+— a perturbation term you measure once, and a model/corpus term you can compute from stored
+logits alone. It is not tautological: RMS Δp is average probability movement while same-top-1
+is an argmax event, and a perturbation can do either without the other. The content is that
+their ratio is fixed by near-tie density, which is why magnitudes never transfer across corpora
+or models but *do* transfer once divided by it.
+
+The code corpus is the weak row at 35% error — its margin distribution is the least like the
+others (median 5.95 logits) and F(0.1) rests on few samples there. Report the law as holding to
+~10% on three of four groups, not as exact.
+
 ## 2. Per-layer sensitivity vs. observational predictability
 
 `P` is the precision of a held-out static token→top-6 table (`rtrc_analyze.py --marginal
