@@ -1199,6 +1199,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_route_topk.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1931,6 +1933,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // LLAMA_ROUTE_TRACE: keep the selected-expert ids alive past graph compute so the
+    // context can read them back (routing-predictability / MTP-correspondence traces)
+    static const bool route_trace = getenv("LLAMA_ROUTE_TRACE") != nullptr;
+    if (route_trace) {
+        ggml_set_output(selected_experts);
+        res->t_route_topk.push_back({il, selected_experts});
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
