@@ -101,6 +101,13 @@ llama_context::llama_context(
     //   type 0 (tokens): u8 0, u32 seq, u32 n_tokens, i32 tok[n], i32 pos[n]
     //   type 1 (layer):  u8 1, u32 seq, i32 il, u32 k, u32 n_tokens, i32 ids[k*n]
     if (const char * rt = getenv("LLAMA_ROUTE_TRACE")) {
+        // the traced top-k copies are extra graph outputs that nothing inside the graph
+        // consumes. Under CUDA graph replay their writes do not land in the buffer we read
+        // back (measured: deep layers return all-zeros from the second eval onward, while
+        // early layers stay valid), which would silently corrupt a corpus. Force graphs off
+        // for any traced context - slower decode, but the alternative is bad data.
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+
         static std::atomic<int> route_trace_idx{0};
         char rt_path[1024];
         snprintf(rt_path, sizeof(rt_path), "%s.%s.%d.rtrc", rt, llm_arch_name(model.arch), route_trace_idx++);
@@ -110,7 +117,7 @@ llama_context::llama_context(
             const uint32_t rt_ver   = 1;
             fwrite(&rt_magic, 4, 1, route_trace_f);
             fwrite(&rt_ver,   4, 1, route_trace_f);
-            LLAMA_LOG_INFO("%s: route trace enabled: %s\n", __func__, rt_path);
+            LLAMA_LOG_INFO("%s: route trace enabled: %s (CUDA graphs forced off)\n", __func__, rt_path);
         } else {
             LLAMA_LOG_WARN("%s: route trace: cannot open '%s'\n", __func__, rt_path);
         }
