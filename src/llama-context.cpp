@@ -1976,17 +1976,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
             fwrite(ubatch.token, sizeof(llama_token), rt_n, route_trace_f);
             fwrite(ubatch.pos,   sizeof(llama_pos),   rt_n, route_trace_f);
 
+            std::vector<float>   rt_f;
             std::vector<int32_t> rt_ids;
             for (const auto & [rt_il, rt_t] : res->t_route_topk) {
-                GGML_ASSERT(rt_t->type == GGML_TYPE_I32);
+                GGML_ASSERT(rt_t->type == GGML_TYPE_F32);
                 GGML_ASSERT(ggml_is_contiguous(rt_t));
 
                 const uint32_t rt_k  = rt_t->ne[0];
                 const uint32_t rt_nt = rt_t->ne[1];
 
+                rt_f.resize((size_t) rt_k*rt_nt);
                 rt_ids.resize((size_t) rt_k*rt_nt);
 
-                ggml_backend_tensor_get(rt_t, rt_ids.data(), 0, rt_ids.size()*sizeof(int32_t));
+                ggml_backend_tensor_get(rt_t, rt_f.data(), 0, rt_f.size()*sizeof(float));
+                for (size_t i = 0; i < rt_f.size(); ++i) {
+                    rt_ids[i] = (int32_t) rt_f[i];
+                }
 
                 const uint8_t rt_lay  = 1;
                 const int32_t rt_il32 = rt_il;
@@ -1999,6 +2004,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
 
             route_trace_seq++;
+            fflush(route_trace_f);
         }
 
         auto * t_logits  = res->get_logits();
