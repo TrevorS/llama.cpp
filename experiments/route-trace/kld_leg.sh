@@ -31,10 +31,13 @@ echo "ts,watts,clock,gpu_c,soc_c" > "$CSV"
         soc=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)
         soc=$((soc/1000))
         echo "$(date +%H:%M:%S),${smi},${soc}" >> "$CSV"
-        # runaway backstop only - duration is the real control (see collect_leg.sh)
-        if [ "$soc" -ge 97 ]; then hot=$((hot+1)); else hot=0; fi
-        if [ "$hot" -ge 2 ]; then
-            echo "SOC ABORT: >=97 C x2" >> "$CSV"
+        # runaway backstop only. 92-97 C is the NORMAL prefill band on this box, so a
+        # trigger inside it just truncates good legs - back-to-back legs pushed a 97x2
+        # rule into firing at chunk 84. Accumulation is controlled by duty and cooldown;
+        # this only catches something genuinely running away.
+        if [ "$soc" -ge 99 ]; then hot=$((hot+1)); else hot=0; fi
+        if [ "$hot" -ge 3 ]; then
+            echo "SOC ABORT: >=99 C x3" >> "$CSV"
             pkill -f llama-perplexity
             break
         fi
