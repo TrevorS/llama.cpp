@@ -193,6 +193,32 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// "3,7-9" -> {3,7,8,9}. Shared by the routing-experiment env vars so a leg can target
+// any layer subset without rebuilding anything.
+static std::set<int32_t> llama_parse_layer_mask(const char * spec) {
+    std::set<int32_t> keep;
+    int lo = -1, cur = -1;
+    for (const char * p = spec; ; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            cur = (cur < 0 ? 0 : cur*10) + (*p - '0');
+        } else {
+            if (cur >= 0) {
+                if (lo >= 0) {
+                    for (int i = lo; i <= cur; ++i) keep.insert(i);
+                    lo = -1;
+                } else if (*p == '-') {
+                    lo = cur;
+                } else {
+                    keep.insert(cur);
+                }
+                cur = -1;
+            }
+            if (*p == '\0') break;
+        }
+    }
+    return keep;
+}
+
 // .hsfy layout (little-endian): u32 magic "HSFY", u32 version=1, u32 n_vocab,
 // u32 n_expert_used, u32 n_layers, then per layer { i32 il, i32 ids[n_expert_used*n_vocab] }
 const llama_hashify_table * llama_hashify_get() {
@@ -241,26 +267,7 @@ const llama_hashify_table * llama_hashify_get() {
         // LLAMA_DSV4_HASHIFY_LAYERS=3,7-9 keeps only those layers from the file, so one
         // table can drive per-layer legs without rebuilding it
         if (const char * mask = getenv("LLAMA_DSV4_HASHIFY_LAYERS")) {
-            std::set<int32_t> keep;
-            int lo = -1, cur = -1;
-            for (const char * p = mask; ; ++p) {
-                if (*p >= '0' && *p <= '9') {
-                    cur = (cur < 0 ? 0 : cur*10) + (*p - '0');
-                } else {
-                    if (cur >= 0) {
-                        if (lo >= 0) {
-                            for (int i = lo; i <= cur; ++i) keep.insert(i);
-                            lo = -1;
-                        } else if (*p == '-') {
-                            lo = cur;
-                        } else {
-                            keep.insert(cur);
-                        }
-                        cur = -1;
-                    }
-                    if (*p == '\0') break;
-                }
-            }
+            const std::set<int32_t> keep = llama_parse_layer_mask(mask);
             for (auto it = tbl->layers.begin(); it != tbl->layers.end(); ) {
                 it = keep.count(it->first) ? std::next(it) : tbl->layers.erase(it);
             }
@@ -2116,6 +2123,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_set_output(rt);
         ggml_build_forward_expand(gf, rt);
         res->t_route_topk.push_back({il, rt});
+    }
+
+    // LLAMA_MOE_ORDER_ROLL=<layers> rotates the selected-expert list by one slot on those
+    // layers. The expert SET is untouched and the weights are gathered by id, so this is a
+    // mathematical no-op - the only thing that changes is the order the k expert outputs are
+    // accumulated in, i.e. the floating-point rounding. Measuring it separates "the router
+    // picked differently" from "the arithmetic landed differently", which perplexity cannot
+    // do: at 3 of 43 layers this moves 5.4% of top-1 predictions and leaves PPL below the
+    // eval harness's own bias. ggml_roll is F32-only on CUDA, hence the cast round trip
+    // (expert ids are small integers, exact in F32).
+    static const char * const order_roll = getenv("LLAMA_MOE_ORDER_ROLL");
+    if (order_roll) {
+        static const std::set<int32_t> roll_layers = llama_parse_layer_mask(order_roll);
+        if (roll_layers.count(il)) {
+            ggml_tensor * f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+            f = ggml_roll(ctx0, f, 1, 0, 0, 0);
+            selected_experts = ggml_cast(ctx0, f, GGML_TYPE_I32);
+            cb(selected_experts, "ffn_moe_topk_rolled", il);
+        }
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
