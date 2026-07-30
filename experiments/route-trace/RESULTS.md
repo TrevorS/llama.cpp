@@ -143,6 +143,57 @@ stack, and rolling them returns exactly the null, confirming the hook only pertu
 Effect size does *not* transfer between models — 3% to 25% — and near-tie density explains only
 part of that (§2c). Structure transfers; magnitude does not.
 
+### Closing the loop: the benchmark cannot see it either, and the arithmetic says why
+
+Perplexity being blind invites the obvious retort — *use a benchmark instead*. So: HellaSwag,
+2000 tasks, gpt-oss-20b, with and without the expert-list roll (still a mathematical no-op).
+
+| | accuracy | 95% CI |
+| --- | --- | --- |
+| base | 58.05% | [55.87%, 60.20%] |
+| roll @ L0–23 | 57.70% | [55.52%, 59.85%] |
+
+A change that moves **24.8% of top-1 predictions** moves HellaSwag by **0.35 points**, deep
+inside a ±2.2-point interval. But the headline number hides what happened. llama.cpp prints a
+running accuracy per task, so differencing the correct-count recovers each individual answer
+(2000 tasks, zero reconstruction anomalies — every difference was 0 or 1):
+
+| | tasks |
+| --- | --- |
+| individual answers changed | **139 / 2000 = 6.95%** |
+| right → wrong | 73 |
+| wrong → right | 66 |
+| net | −7 (−0.35 pp) |
+
+**The benchmark score is stable because the errors cancel, not because the model behaves the
+same.** Seven percent of its answers changed and the reported metric moved by a third of a
+point — an aggregate statistic averaging over precisely the thing that moved.
+
+Put end to end on one perturbation that is provably a no-op:
+
+| observable | change |
+| --- | --- |
+| perplexity ratio | at or below the null's own bias |
+| HellaSwag headline accuracy | −0.35 pp (inside CI) |
+| HellaSwag individual answers | 6.95% changed |
+| top-1 predictions | 24.8% changed |
+| greedy generation | diverges mid-derivation |
+
+The standard validation stack — perplexity plus a benchmark — is blind to a change that alters
+a quarter of the model's token-level decisions and 7% of its benchmark answers. Same-top-1
+against stored logits detects it in one 2-minute leg. That is the entire recommendation.
+
+A caveat worth stating in both directions: flat benchmark accuracy is *reassuring* about
+quality — the model is no worse — and *alarming* about validation, because it means the
+benchmark cannot distinguish a bit-exact kernel from an inexact one. In agentic or
+long-generation settings, where token-level divergence compounds rather than averages, the
+reassurance is weaker than the number suggests.
+
+*(DS4-Flash could not be measured here: `--hellaswag` aborts on our fork with "DSV4 coupled raw
+writes require equal sequence lengths" — the fused attention path requires equal sequence
+lengths and the multiple-choice harness batches ragged ones. That is a real limitation of our
+tree, and it means the standard llama.cpp task harnesses have never been run against it.)*
+
 ## 2. Per-layer sensitivity vs. observational predictability
 
 `P` is the precision of a held-out static token→top-6 table (`rtrc_analyze.py --marginal
