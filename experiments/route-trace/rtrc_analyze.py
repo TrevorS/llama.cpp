@@ -32,29 +32,47 @@ def read_records(path):
         assert magic == MAGIC, f"{path}: bad magic {magic:#x}"
         assert ver == 1, f"{path}: unsupported version {ver}"
 
+        # a spool from a crashed run ends mid-record; treat a short read as EOF
+        def rd(n):
+            b = f.read(n)
+            if len(b) < n:
+                raise EOFError
+            return b
+
         cur = None  # (seq, toks, poss, layers)
-        while True:
-            tb = f.read(1)
-            if not tb:
-                break
-            (rtype,) = struct.unpack("<B", tb)
-            if rtype == 0:
-                (seq, n) = struct.unpack("<II", f.read(8))
-                toks = struct.unpack(f"<{n}i", f.read(4 * n))
-                poss = struct.unpack(f"<{n}i", f.read(4 * n))
-                if cur is not None:
-                    yield cur
-                cur = (seq, toks, poss, {})
-            elif rtype == 1:
-                (seq, il, k, n) = struct.unpack("<IiII", f.read(16))
-                ids = struct.unpack(f"<{k * n}i", f.read(4 * k * n))
-                rows = [frozenset(ids[i * k:(i + 1) * k]) for i in range(n)]
-                if cur is None or cur[0] != seq:
-                    print(f"warn: layer record seq {seq} without token block", file=sys.stderr)
-                    continue
-                cur[3][il] = rows
-            else:
-                raise ValueError(f"{path}: unknown record type {rtype}")
+        try:
+            while True:
+                tb = f.read(1)
+                if not tb:
+                    break
+                (rtype,) = struct.unpack("<B", tb)
+                if rtype == 0:
+                    (seq, n) = struct.unpack("<II", rd(8))
+                    if n == 0:
+                        # a hard crash leaves the file zero-padded to a block boundary;
+                        # NUL bytes parse as empty token records - stop here
+                        print(f"note: {path} has a NUL-padded tail (power-loss write) - "
+                              f"stopping at the last complete eval", file=sys.stderr)
+                        break
+                    toks = struct.unpack(f"<{n}i", rd(4 * n))
+                    poss = struct.unpack(f"<{n}i", rd(4 * n))
+                    if cur is not None:
+                        yield cur
+                    cur = (seq, toks, poss, {})
+                elif rtype == 1:
+                    (seq, il, k, n) = struct.unpack("<IiII", rd(16))
+                    ids = struct.unpack(f"<{k * n}i", rd(4 * k * n))
+                    rows = [frozenset(ids[i * k:(i + 1) * k]) for i in range(n)]
+                    if cur is None or cur[0] != seq:
+                        print(f"warn: layer record seq {seq} without token block", file=sys.stderr)
+                        continue
+                    cur[3][il] = rows
+                else:
+                    raise ValueError(f"{path}: unknown record type {rtype}")
+        except EOFError:
+            print(f"note: {path} ends in a truncated record (crashed run) - "
+                  f"dropping the final partial eval", file=sys.stderr)
+            cur = None
         if cur is not None:
             yield cur
 
