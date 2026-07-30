@@ -238,6 +238,39 @@ that are easy to miss. Reported without them it produces a null (Confound A), a 
 (Confound B), or an unreplicable magnitude (near-tie density). The §2 table is a wiki-only
 ranking for exactly that reason: its layers span 24 depths.
 
+## 2d. The adjacent-pair design — this supersedes §2 as the primary evidence
+
+§2 ranks layers spanning 24 depths, so it is depth-confounded by construction. The clean design
+compares **adjacent** layers, where the propagation floor is matched to within a few percent,
+and asks whether the damage ratio tracks the predictability ratio. Ratios are written with the
+*less* predictable layer on top, so the prediction is always ≥ 1.
+
+| pair | `P` gap | predicted (1−`P`) ratio | observed |
+| --- | --- | --- | --- |
+| L18 / L19 | 0.231 | 1.54 | 1.68 |
+| L36 / L35 | 0.225 | 1.42 | 1.59 |
+| L34 / L35 | 0.184 | 1.34 | **2.13** |
+| L11 / L10 | 0.178 | 1.34 | 1.25 |
+| L24 / L25 | 0.001 | 1.00 | 1.05 |
+| L33 / L34 | 0.002 | 1.00 | 0.99 |
+| L07 / L08 | 0.006 | 1.01 | 0.86 |
+
+**All four large-gap pairs exceed all three zero-gap pairs** — complete separation, exact
+one-sided Mann–Whitney p = 0.029 at n = 7. Spearman between predicted and observed ratio across
+all seven pairs is 0.64, dragged down mainly by L34/L35 overshooting its prediction (2.13 vs
+1.34).
+
+The zero-gap pairs are the honest error bar on any per-layer claim, and they are **not**
+uniformly 1.0: {0.99, 1.05, 1.16}. Two are tight; L07/L08 is 16% apart at ~6σ despite a 1.6%
+predictability difference. A floor mismatch does not explain it — adjacent floors drift ~4% per
+layer in the shallow stack, under 1% of that pair's damage. So there is genuine per-layer
+structure that predictability does not capture, and it appears larger near the bottom of the
+stack, which is exactly where the shipped hash layers are.
+
+Practical reading: an effect below ~1.16 on a single adjacent pair is not evidence. Three of the
+four test pairs clear that comfortably; L11/L10 at 1.25 does not, and should be reported as
+marginal rather than as a fourth confirmation.
+
 ## 3. Cumulative curve
 
 | n | layers | Mean KLD | same top-1 | ln PPL ratio |
