@@ -17,6 +17,7 @@ Analyses:
                             confusion-mapped overlap + raw agreement
 """
 import argparse
+import random
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -220,6 +221,31 @@ def a_adjacent(evals):
         print(f"{il:>5} {w:>12.4f} {w_den:>8} {c:>11.4f} {c_den:>8}")
 
 
+def a_union(evals, n_expert=256):
+    """Measured expert-union size across the rows of one multi-token eval (the
+    speculative verify batch), against the independence prediction used by the
+    published union laws: N(t) = E * (1 - ((E-K)/E)^t)."""
+    by_t = defaultdict(lambda: defaultdict(list))  # t -> il -> [union sizes]
+    k_obs = 6
+    for _, toks, _, lys in evals:
+        for il, rows in lys.items():
+            good = [r for r in rows if r is not None]
+            t = len(good)
+            if t < 2:
+                continue
+            k_obs = len(good[0])
+            by_t[t][il].append(len(frozenset().union(*good)))
+    print(f"{'t':>3} {'layers':>7} {'measured':>9} {'independ.':>10} {'ratio':>6} {'perfect':>8} {'n':>7}")
+    for t in sorted(by_t):
+        sizes = [v for il in by_t[t] for v in by_t[t][il]]
+        if not sizes:
+            continue
+        meas = sum(sizes) / len(sizes)
+        indep = n_expert * (1.0 - ((n_expert - k_obs) / n_expert) ** t)
+        print(f"{t:>3} {len(by_t[t]):>7} {meas:>9.2f} {indep:>10.2f} "
+              f"{meas/indep:>6.3f} {k_obs*t:>8} {len(sizes):>7}")
+
+
 def a_correspond(evals_tgt, evals_dft):
     """Join target and draft traces on (pos, token); per target layer, compute
     (a) raw expert-id agreement, (b) confusion-argmax-mapped overlap between the
@@ -236,7 +262,7 @@ def a_correspond(evals_tgt, evals_dft):
 
     layers = sorted({il for e in evals_tgt for il in e[3]})
     print(f"draft rows: {len(dft_by_key)}")
-    print(f"{'layer':>5} {'joined':>8} {'raw-ovl':>8} {'mapped-ovl':>10}")
+    print(f"{'layer':>5} {'joined':>8} {'raw':>8} {'chance':>8} {'mapped':>10} {'shuffled':>10}")
     for il in layers:
         pairs = []
         for _, toks, poss, lys in evals_tgt:
@@ -252,13 +278,28 @@ def a_correspond(evals_tgt, evals_dft):
         if not pairs:
             continue
         raw = sum(len(d & s) / len(s) for d, s in pairs) / len(pairs)
-        conf = defaultdict(Counter)
-        for d, s in pairs:
-            for de in d:
-                conf[de].update(s)
-        mapping = {de: c.most_common(1)[0][0] for de, c in conf.items()}
-        mapped = sum(len({mapping[de] for de in d} & s) / len(s) for d, s in pairs) / len(pairs)
-        print(f"{il:>5} {len(pairs):>8} {raw:>8.4f} {mapped:>10.4f}")
+
+        def fit_and_score(ps):
+            conf = defaultdict(Counter)
+            for d, s in ps:
+                for de in d:
+                    conf[de].update(s)
+            m = {de: c.most_common(1)[0][0] for de, c in conf.items()}
+            return sum(len({m[de] for de in d} & s) / len(s) for d, s in ps) / len(ps)
+
+        mapped = fit_and_score(pairs)
+        # null: re-pair each draft set with a different target set and refit the mapping
+        # the same way. The confusion mapping is fitted on the data it scores, so it
+        # inflates by construction - only mapped >> shuffled means real correspondence.
+        rng = random.Random(42)
+        shuf_scores = []
+        for _ in range(3):
+            tgt = [s for _, s in pairs]
+            rng.shuffle(tgt)
+            shuf_scores.append(fit_and_score([(d, t) for (d, _), t in zip(pairs, tgt)]))
+        shuffled = sum(shuf_scores) / len(shuf_scores)
+        chance = sum(len(d) * len(s) / 256.0 / len(s) for d, s in pairs) / len(pairs)
+        print(f"{il:>5} {len(pairs):>8} {raw:>8.4f} {chance:>8.4f} {mapped:>10.4f} {shuffled:>10.4f}")
 
 
 def main():
@@ -270,6 +311,7 @@ def main():
     ap.add_argument("--split", type=float, default=0.25,
                     help="fraction of evals used to build the token table (default 0.25)")
     ap.add_argument("--adjacent", action="store_true")
+    ap.add_argument("--union", action="store_true")
     ap.add_argument("--correspond", metavar="DFT_RTRC")
     args = ap.parse_args()
 
@@ -282,6 +324,8 @@ def main():
         a_marginal(evals, args.split)
     if args.adjacent:
         a_adjacent(evals)
+    if args.union:
+        a_union(evals)
     if args.correspond:
         a_correspond(evals, load(args.correspond))
 
