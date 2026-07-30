@@ -359,9 +359,7 @@ private:
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
-    // LLAMA_ROUTE_TRACE: binary spool of per-layer selected-expert ids per decoded ubatch
-    FILE *   route_trace_f   = nullptr;
-    uint32_t route_trace_seq = 0;
+
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

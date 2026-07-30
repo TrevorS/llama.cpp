@@ -193,115 +193,6 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// "3,7-9" -> {3,7,8,9}. Shared by the routing-experiment env vars so a leg can target
-// any layer subset without rebuilding anything.
-static std::set<int32_t> llama_parse_layer_mask(const char * spec) {
-    std::set<int32_t> keep;
-    int lo = -1, cur = -1;
-    for (const char * p = spec; ; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            cur = (cur < 0 ? 0 : cur*10) + (*p - '0');
-        } else {
-            if (cur >= 0) {
-                if (lo >= 0) {
-                    for (int i = lo; i <= cur; ++i) keep.insert(i);
-                    lo = -1;
-                } else if (*p == '-') {
-                    lo = cur;
-                } else {
-                    keep.insert(cur);
-                }
-                cur = -1;
-            }
-            if (*p == '\0') break;
-        }
-    }
-    return keep;
-}
-
-// .hsfy layout (little-endian): u32 magic "HSFY", u32 version=1, u32 n_vocab,
-// u32 n_expert_used, u32 n_layers, then per layer { i32 il, i32 ids[n_expert_used*n_vocab] }
-const llama_hashify_table * llama_hashify_get() {
-    static const llama_hashify_table * cached = [] () -> const llama_hashify_table * {
-        const char * path = getenv("LLAMA_DSV4_HASHIFY");
-        if (!path) {
-            return nullptr;
-        }
-
-        FILE * f = fopen(path, "rb");
-        if (!f) {
-            LLAMA_LOG_WARN("hashify: cannot open '%s'\n", path);
-            return nullptr;
-        }
-
-        auto * tbl = new llama_hashify_table();
-
-        uint32_t magic = 0, ver = 0, n_layers = 0;
-        bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x59465348 &&
-                  fread(&ver,   4, 1, f) == 1 && ver == 1 &&
-                  fread(&tbl->n_vocab,       4, 1, f) == 1 &&
-                  fread(&tbl->n_expert_used, 4, 1, f) == 1 &&
-                  fread(&n_layers, 4, 1, f) == 1;
-
-        for (uint32_t i = 0; ok && i < n_layers; ++i) {
-            int32_t il = 0;
-            ok = fread(&il, 4, 1, f) == 1;
-            if (!ok) {
-                break;
-            }
-
-            const size_t n = (size_t) tbl->n_vocab * tbl->n_expert_used;
-            auto & row = tbl->layers[il];
-            row.resize(n);
-            ok = fread(row.data(), sizeof(int32_t), n, f) == n;
-        }
-
-        fclose(f);
-
-        if (!ok) {
-            LLAMA_LOG_WARN("hashify: '%s' is malformed - ignoring\n", path);
-            delete tbl;
-            return nullptr;
-        }
-
-        // LLAMA_DSV4_HASHIFY_LAYERS=3,7-9 keeps only those layers from the file, so one
-        // table can drive per-layer legs without rebuilding it
-        if (const char * mask = getenv("LLAMA_DSV4_HASHIFY_LAYERS")) {
-            const std::set<int32_t> keep = llama_parse_layer_mask(mask);
-            for (auto it = tbl->layers.begin(); it != tbl->layers.end(); ) {
-                it = keep.count(it->first) ? std::next(it) : tbl->layers.erase(it);
-            }
-        }
-
-        std::string ils;
-        for (const auto & [il, _] : tbl->layers) {
-            ils += (ils.empty() ? "" : ",") + std::to_string(il);
-        }
-        LLAMA_LOG_INFO("hashify: %s - n_vocab %u, n_expert_used %u, layers [%s]\n",
-                path, tbl->n_vocab, tbl->n_expert_used, ils.c_str());
-
-        return tbl;
-    } ();
-
-    return cached;
-}
-
-void llm_graph_input_hashify::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(sel && ubatch->token);
-    GGML_ASSERT(ggml_backend_buffer_is_host(sel->buffer));
-
-    const auto & row = tbl->layers.at(il);
-    const int64_t k  = tbl->n_expert_used;
-
-    int32_t * data = (int32_t *) sel->data;
-
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        const int32_t tok = ubatch->token[i];
-        GGML_ASSERT(tok >= 0 && (uint32_t) tok < tbl->n_vocab);
-        memcpy(data + i*k, row.data() + (size_t) tok*k, k*sizeof(int32_t));
-    }
-}
-
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
@@ -1377,7 +1268,6 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
-    t_route_topk.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -2112,38 +2002,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
-    // LLAMA_ROUTE_TRACE: keep the selected-expert ids alive past graph compute so the
-    // context can read them back (routing-predictability / MTP-correspondence traces)
-    static const bool route_trace = getenv("LLAMA_ROUTE_TRACE") != nullptr;
-    if (route_trace) {
-        // the top-k tensor is a strided view; the cast yields a fresh contiguous
-        // tensor on a proven CUDA path (same as the group-remap above), and expert
-        // ids are exact in f32 — converted back to i32 at spool time
-        ggml_tensor * rt = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
-        ggml_set_output(rt);
-        ggml_build_forward_expand(gf, rt);
-        res->t_route_topk.push_back({il, rt});
-    }
-
-    // LLAMA_MOE_ORDER_ROLL=<layers> rotates the selected-expert list by one slot on those
-    // layers. The expert SET is untouched and the weights are gathered by id, so this is a
-    // mathematical no-op - the only thing that changes is the order the k expert outputs are
-    // accumulated in, i.e. the floating-point rounding. Measuring it separates "the router
-    // picked differently" from "the arithmetic landed differently", which perplexity cannot
-    // do: at 3 of 43 layers this moves 5.4% of top-1 predictions and leaves PPL below the
-    // eval harness's own bias. ggml_roll is F32-only on CUDA, hence the cast round trip
-    // (expert ids are small integers, exact in F32).
-    static const char * const order_roll = getenv("LLAMA_MOE_ORDER_ROLL");
-    if (order_roll) {
-        static const std::set<int32_t> roll_layers = llama_parse_layer_mask(order_roll);
-        if (roll_layers.count(il)) {
-            ggml_tensor * f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
-            f = ggml_roll(ctx0, f, 1, 0, 0, 0);
-            selected_experts = ggml_cast(ctx0, f, GGML_TYPE_I32);
-            cb(selected_experts, "ffn_moe_topk_rolled", il);
-        }
-    }
-
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2506,24 +2364,6 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     auto & cur = inp->out_ids;
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
-    ggml_set_input(cur);
-
-    res->add_input(std::move(inp));
-
-    return cur;
-}
-
-ggml_tensor * llm_graph_context::build_inp_hashify(int il) const {
-    const auto * tbl = llama_hashify_get();
-    if (!tbl || !tbl->has(il)) {
-        return nullptr;
-    }
-
-    auto inp = std::make_unique<llm_graph_input_hashify>(tbl, il);
-
-    auto & cur = inp->sel;
-
-    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, tbl->n_expert_used, n_tokens);
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));

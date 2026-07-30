@@ -1784,13 +1784,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        // LLAMA_DSV4_HASHIFY overrides the routing decision from a token->expert table.
-        // Checked before the built-in hash path so a table covering layers 0..2 can be
-        // validated against this model's own tid2eid (it must reproduce it exactly).
-        if (ggml_tensor * sel_hashify = build_inp_hashify(il)) {
-            selected_experts = sel_hashify;
-            exp_probs_b = nullptr;
-        } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }
