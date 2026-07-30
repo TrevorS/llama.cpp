@@ -181,17 +181,39 @@ should cost *more*. The 91.6%-coverage run had it backwards:
 Fixing coverage flips the sign, and both damages drop — the fallback term was large and shared.
 
 Prediction 2 — the strongest design available. Take the *same two layers* on both corpora. On
-wiki L34/L35 sit at `P` 0.228 vs 0.462; on code they are equal (0.318 vs 0.325). So the same
+wiki L34/L35 sit at `P` 0.276 vs 0.460; on code they are equal (0.318 vs 0.325). So the same
 physical pair should differ on wiki and not on code:
 
 | corpus | L34 `P` | L35 `P` | L34 KLD | L35 KLD | ratio | floors |
 | --- | --- | --- | --- | --- | --- | --- |
-| wiki | 0.228 | 0.462 | 0.062967 | 0.029576 | **2.13×** | 0.001041 / 0.000950 |
+| wiki | 0.276 | 0.460 | 0.062967 | 0.029576 | **2.13×** | 0.001041 / 0.000950 |
 | code | 0.318 | 0.325 | 0.013091 | 0.013041 | **1.004×** | 0.000618 / 0.000505 |
 
 Identical to 0.4% on code — inside the error bars — and 2.13× apart on wiki. Same layers, same
 weights, matched floors; only the text differs, and the damage follows each corpus's own
 observational profile in both directions.
+
+### The code layer set, re-run at 99.88% coverage
+
+The original §2c numbers are superseded — they used the 91.6% table. Predictors are held-out
+`P` on the same `codefull` trace the table came from (90/10, 3163 test tokens):
+
+| layer | `P` | KLD | same top-1 | floor | excess |
+| --- | --- | --- | --- | --- | --- |
+| L42 | 0.399 | 0.008178 | 98.294% | −0.000001 | 0.00818 |
+| L27 | 0.341 | 0.010312 | 97.647% | 0.001128 | 0.00918 |
+| L19 | 0.447 | 0.013982 | 97.392% | 0.002625 | 0.01136 |
+| L34 | 0.318 | 0.013091 | 97.549% | 0.000618 | 0.01247 |
+| L35 | 0.325 | 0.013041 | 97.608% | 0.000505 | 0.01254 |
+| L25 | 0.132 | 0.015284 | 97.322% | 0.001539 | 0.01375 |
+| L20 | 0.220 | 0.017095 | 96.902% | 0.002492 | 0.01460 |
+
+Spearman ρ between floor-excess and (1 − `P`) is **0.82** across these seven layers, against
+0.81 for the wiki set on the same statistic. The relation replicates once coverage is fixed;
+the earlier null came from the diluted table.
+
+L42 is again the cheapest layer in the model — third independent confirmation, now on both
+corpora and under two different tables.
 
 ### The magnitude scale is a property of the corpus, not the intervention
 
