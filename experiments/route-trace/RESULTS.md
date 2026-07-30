@@ -164,6 +164,69 @@ stack, and rolling them returns exactly the null, confirming the hook only pertu
 Effect size does *not* transfer between models — 3% to 25% — and near-tie density explains only
 part of that (§2c). Structure transfers; magnitude does not.
 
+### What predicts the magnitude: one constant, 84 legs, three architectures
+
+Effect sizes ranged 1%–25% and looked unpredictable. They are not. Every leg reports RMS Δp —
+how far the output distribution moved — alongside the top-1 flip rate. For each leg, take the
+margin threshold `t` whose CDF in that model+corpus's *own* base logits equals the observed flip
+rate. If a perturbation simply flips whatever sits inside a margin band proportional to its
+size, `t/RMS` is one number everywhere:
+
+| group | legs | t / RMS (logit per %RMS) | spread |
+| --- | --- | --- | --- |
+| gpt-oss-20b / wiki | 3 | 0.0381 | 0.037–0.039 |
+| gpt-oss-20b / code | 6 | 0.0425 | 0.041–0.044 |
+| Nemotron-30B / wiki | 11 | 0.0329 | 0.030–0.037 |
+| DS4-Flash / wiki | 46 | 0.0313 | 0.024–0.036 |
+| DS4-Flash / code | 18 | 0.0401 | 0.034–0.051 |
+| **all** | **84** | **0.0344** | **sd 0.0052 = 15%** |
+
+**A perturbation of RMS Δp = r% flips the tokens whose top-1 margin is below ≈ 0.034·r logits.**
+One constant, 84 legs, three architectures, five model+corpus pairs, near-tie densities varying
+5.7×, and causes as different as a rounding no-op, a static routing table, uniform-random
+routing, a kernel fusion and a batch-size change.
+
+Two selection rules, both needed. A leg is kept only if its RMS Δp exceeds 3× *its own group's*
+null RMS — an earlier flat cutoff of 1.0 was tuned to DS4/wiki's stored-logit floor of 0.377 and
+wrongly discarded clean legs from groups whose floor is zero. And its flip rate must be ≥ 0.5%,
+so that at 12000 sampled margins ≥ 60 fall below the threshold and the quantile is resolvable;
+without that rule a leg flipping 0.035% of tokens contributes a threshold estimated from one or
+two samples.
+
+That is why magnitudes never transfer: the same perturbation lands on a different margin
+distribution. gpt-oss-20b is the clean demonstration — the *same model* gives flip/RMS = 4.46 on
+wikitext (PPL 195, out of distribution) and 0.92 on code (PPL 2.33, in distribution), a 4.8×
+drop from nothing but the text. Predicted from its margin distribution before the legs ran: 0.71.
+
+**Two refinements were tried and both made it worse.** The law is empirical, and the obvious
+ways to derive it from a mechanism do not improve it:
+
+| model | what it assumes | scatter |
+| --- | --- | --- |
+| match one margin quantile *(used)* | flips land inside a band ∝ perturbation size | **15%** per leg |
+| Gaussian noise on the top-2 gap, integrated over the full margin distribution | perturbation is additive-normal on the gap | 18% per leg |
+| divide by p̄(1−p̄), converting probability units to logit units | RMS Δp is a probability, margins are logits | 21% across group means (vs 11%) |
+
+The second failure is the informative one. Mean p_max varies 4.7× across these groups (0.174 for
+gpt-oss on wikitext, 0.879 for DS4 on code) while `t/RMS` varies only 1.36×, so there is nothing
+for a confidence correction to fix — quantile-matching already absorbs the distributional
+difference by construction, and correcting again double-counts. Why matching a single quantile
+beats a noise model over the whole distribution is open.
+
+**Three limits, stated rather than smoothed over.**
+
+1. The residual is not random: both code groups sit high (0.0425, 0.0401) and both well-fitted
+   wiki groups sit low (0.0313, 0.0329), so a ~±15% systematic tracks *corpus type* rather than
+   model — and neither refinement above explains it.
+2. `t/RMS` is not strictly constant within a group: across the 46 DS4/wiki legs it declines from
+   0.0348 to 0.0313 as RMS grows (Pearson r = −0.26). The margin-matched form was expected to
+   absorb that curvature and **does not** — the raw ratio gives r = −0.261, this one −0.257. A
+   ~10% sub-linearity over a 6× range is real; near-tie depletion is the natural explanation and
+   is not demonstrated here.
+3. gpt-oss/wiki still rests on 3 legs. Nemotron is the check on whether that matters: widening
+   it from 4 legs to 11 moved its mean by 0.0001, so these per-group means look converged rather
+   than under-sampled.
+
 ### Closing the loop: the benchmark cannot see it either, and the arithmetic says why
 
 Perplexity being blind invites the obvious retort — *use a benchmark instead*. HellaSwag, 2000
