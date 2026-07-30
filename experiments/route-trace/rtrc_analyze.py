@@ -40,6 +40,7 @@ def read_records(path):
             return b
 
         cur = None  # (seq, toks, poss, layers)
+        dropped = {}
         try:
             while True:
                 tb = f.read(1)
@@ -62,9 +63,26 @@ def read_records(path):
                 elif rtype == 1:
                     (seq, il, k, n) = struct.unpack("<IiII", rd(16))
                     ids = struct.unpack(f"<{k * n}i", rd(4 * k * n))
-                    rows = [frozenset(ids[i * k:(i + 1) * k]) for i in range(n)]
                     if cur is None or cur[0] != seq:
                         print(f"warn: layer record seq {seq} without token block", file=sys.stderr)
+                        continue
+                    # top-k selection always yields k DISTINCT expert ids, so a row with
+                    # fewer is a readback that missed the real write (this happened under
+                    # CUDA graph replay, before the hook forced graphs off). Keep positional
+                    # alignment with the token list and mark such rows None so the analyses
+                    # skip them instead of letting expert 0 dominate the statistics.
+                    rows = []
+                    n_bad = 0
+                    for i in range(n):
+                        chunk = ids[i * k:(i + 1) * k]
+                        if len(set(chunk)) < k:
+                            rows.append(None)
+                            n_bad += 1
+                        else:
+                            rows.append(frozenset(chunk))
+                    if n_bad:
+                        dropped[il] = dropped.get(il, 0) + n_bad
+                    if n_bad == n:
                         continue
                     cur[3][il] = rows
                 else:
@@ -75,6 +93,11 @@ def read_records(path):
             cur = None
         if cur is not None:
             yield cur
+        if dropped:
+            worst = sorted(dropped.items(), key=lambda kv: -kv[1])[:8]
+            print(f"warn: dropped degenerate rows (layer: n_rows): {worst}"
+                  f"{' ...' if len(dropped) > 8 else ''} - those layers are under-sampled",
+                  file=sys.stderr)
 
 
 def load(path):
@@ -104,7 +127,8 @@ def a_hash_check(evals, n_hash):
             if not rows:
                 continue
             for t, s in zip(toks, rows):
-                tok2sets[t].add(s)
+                if s is not None:
+                    tok2sets[t].add(s)
         bad = {t: len(ss) for t, ss in tok2sets.items() if len(ss) > 1}
         status = "EXACT" if not bad else f"VIOLATIONS: {len(bad)} tokens"
         print(f"layer {il}: {len(tok2sets)} distinct tokens -> {status}")
@@ -112,11 +136,13 @@ def a_hash_check(evals, n_hash):
 
 def a_marginal(evals, split=0.25):
     """Per-layer: build static token->top-k table on first `split` of evals,
-    measure F1 of that table against the rest (Sem-MoE protocol, per-layer)."""
+    measure F1 of that table against the rest (Sem-MoE protocol, per-layer).
+    kbar = mean size of the ACTUAL expert set (< k means duplicate ids in the
+    row, which caps precision and must be read before trusting deep layers)."""
     n_train = max(1, int(len(evals) * split))
     train, test = evals[:n_train], evals[n_train:]
-    print(f"train evals={len(train)} test evals={len(test)}")
-    print(f"{'layer':>5} {'toks':>7} {'cov':>6} {'P':>6} {'R':>6} {'F1':>6}")
+    print(f"train evals={len(train)} test evals={len(test)} split={split}")
+    print(f"{'layer':>5} {'toks':>7} {'cov':>6} {'kbar':>5} {'P':>6} {'R':>6} {'F1':>6}")
 
     layers = sorted({il for e in evals for il in e[3]})
     for il in layers:
@@ -127,18 +153,23 @@ def a_marginal(evals, split=0.25):
             if not rows:
                 continue
             for t, s in zip(toks, rows):
+                if s is None:
+                    continue
                 expert_count[t].update(s)
                 k_seen = max(k_seen, len(s))
         table = {t: frozenset(e for e, _ in c.most_common(k_seen))
                  for t, c in expert_count.items()}
 
-        tp = fp = fn = n_cov = n_tot = 0
+        tp = fp = fn = n_cov = n_tot = k_sum = 0
         for _, toks, _, lys in test:
             rows = lys.get(il)
             if not rows:
                 continue
             for t, s in zip(toks, rows):
+                if s is None:
+                    continue
                 n_tot += 1
+                k_sum += len(s)
                 pred = table.get(t)
                 if pred is None:
                     fn += len(s)
@@ -152,7 +183,8 @@ def a_marginal(evals, split=0.25):
         prec = tp / (tp + fp) if tp + fp else 0.0
         rec = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
-        print(f"{il:>5} {len(table):>7} {n_cov/n_tot:>6.3f} {prec:>6.3f} {rec:>6.3f} {f1:>6.3f}")
+        print(f"{il:>5} {len(table):>7} {n_cov/n_tot:>6.3f} {k_sum/n_tot:>5.2f} "
+              f"{prec:>6.3f} {rec:>6.3f} {f1:>6.3f}")
 
 
 def a_adjacent(evals):
@@ -169,9 +201,10 @@ def a_adjacent(evals):
             if not rows:
                 continue
             for i in range(len(poss)):
-                last_by_pos[poss[i]] = rows[i]
+                if rows[i] is not None:
+                    last_by_pos[poss[i]] = rows[i]
             for i in range(1, len(poss)):
-                if poss[i] == poss[i - 1] + 1:
+                if poss[i] == poss[i - 1] + 1 and rows[i] is not None and rows[i - 1] is not None:
                     a, b = rows[i - 1], rows[i]
                     w_num += len(a & b) / len(a | b)
                     w_den += 1
@@ -198,7 +231,8 @@ def a_correspond(evals_tgt, evals_dft):
             continue
         il0 = sorted(lys)[0]
         for t, p, s in zip(toks, poss, lys[il0]):
-            dft_by_key[(p, t)] = s
+            if s is not None:
+                dft_by_key[(p, t)] = s
 
     layers = sorted({il for e in evals_tgt for il in e[3]})
     print(f"draft rows: {len(dft_by_key)}")
@@ -210,6 +244,8 @@ def a_correspond(evals_tgt, evals_dft):
             if not rows:
                 continue
             for t, p, s in zip(toks, poss, rows):
+                if s is None:
+                    continue
                 d = dft_by_key.get((p, t))
                 if d is not None:
                     pairs.append((d, s))
@@ -231,6 +267,8 @@ def main():
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--hash-check", type=int, metavar="N")
     ap.add_argument("--marginal", action="store_true")
+    ap.add_argument("--split", type=float, default=0.25,
+                    help="fraction of evals used to build the token table (default 0.25)")
     ap.add_argument("--adjacent", action="store_true")
     ap.add_argument("--correspond", metavar="DFT_RTRC")
     args = ap.parse_args()
@@ -241,7 +279,7 @@ def main():
     if args.hash_check is not None:
         a_hash_check(evals, args.hash_check)
     if args.marginal:
-        a_marginal(evals)
+        a_marginal(evals, args.split)
     if args.adjacent:
         a_adjacent(evals)
     if args.correspond:
