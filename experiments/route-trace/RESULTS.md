@@ -108,6 +108,41 @@ Monotone across nine depths and decaying to exactly the null floor at the last l
 there is nothing downstream for the nudge to grow through. Per-layer damage is therefore **not
 comparable across depths without its matched floor**.
 
+### It is not a DeepSeek quirk: three architectures, three vendors, same structure
+
+`LLAMA_MOE_ORDER_ROLL` lives in the shared `build_moe_ffn` path, so it runs on any MoE with no
+model-specific code.
+
+| model | arch | experts | layers | wiki PPL |
+| --- | --- | --- | --- | --- |
+| DeepSeek-V4-Flash | `deepseek4` | 256, top-6, IQ3_XXS | 43, all MoE | 5.03 |
+| gpt-oss-20b | `gpt-oss` | 32, top-4, MXFP4 | 24, all MoE | 195 |
+| Nemotron-3-Nano-30B-A3B | `nemotron_h_moe` | 128, top-6, Q8_0 | 52, 23 MoE (hybrid SSM) | 8.25 |
+
+Rolling one layer's expert list, same top-1 agreement against each model's own stored logits:
+
+| model | null | first MoE layer | mid | late | last MoE layer | all layers |
+| --- | --- | --- | --- | --- | --- | --- |
+| DS4-Flash | 99.961% | 94.745% (L0) | 96.510% (L19) | 98.941% (L35) | 99.961% (L42) | — |
+| gpt-oss-20b | 99.996% | **75.208%** (L0) | 81.992% (L12) | — | 99.996% (L23) | 74.910% |
+| Nemotron-30B | 99.992% | 97.137% (L1) | 98.235% (L20) | 98.992% (L38) | 99.992% (L51) | 96.996% |
+
+Every structural feature holds on all three:
+
+- **the effect exists** — 3.0%, 5.3% and 24.8% of top-1 predictions move;
+- **it is one-shot** — rolling *every* layer equals rolling just the first (gpt-oss 74.910% vs
+  75.208%; Nemotron 96.996% vs 97.137%);
+- **it decays monotonically with depth to exactly the null at the last layer** — Nemotron runs
+  0.004184 → 0.001387 → 0.000363 → 0.000002 → 0.000000 across L1/20/38/49/51;
+- **perplexity is blind** — every ln-ratio sits at or below the model's own null bias, several
+  are negative.
+
+Nemotron also gives a free negative control: layers 4 and 26 are *not* MoE blocks in that hybrid
+stack, and rolling them returns exactly the null, confirming the hook only perturbs MoE routing.
+
+Effect size does *not* transfer between models — 3% to 25% — and near-tie density explains only
+part of that (§2c). Structure transfers; magnitude does not.
+
 ## 2. Per-layer sensitivity vs. observational predictability
 
 `P` is the precision of a held-out static token→top-6 table (`rtrc_analyze.py --marginal
