@@ -47,10 +47,14 @@ echo "ts,watts,clock,gpu_c,soc_c" > "$CSV"
 SAMPLER=$!
 
 ENVV=(GGML_CUDA_POWER="$DUTY" GGML_CUDA_POWER_GRANULARITY=layer)
-if [ "$HSFY" != "none" ]; then
-    ENVV+=(LLAMA_DSV4_HASHIFY="$HSFY")
-    [ "$LAYERS" != "-" ] && ENVV+=(LLAMA_DSV4_HASHIFY_LAYERS="$LAYERS")
-fi
+case "$HSFY" in
+    none) ;;
+    # pass "roll" instead of a table to rotate the live routing at those layers - the
+    # same-layer perturbation floor for a hashification leg, no table involved
+    roll) ENVV+=(LLAMA_MOE_ORDER_ROLL="$LAYERS") ;;
+    *)    ENVV+=(LLAMA_DSV4_HASHIFY="$HSFY")
+          [ "$LAYERS" != "-" ] && ENVV+=(LLAMA_DSV4_HASHIFY_LAYERS="$LAYERS") ;;
+esac
 
 env "${ENVV[@]}" \
     "$BIN" -m "$MODEL" --no-mmap -fa on -c 512 -ub 2048 -b 2048 -ngl 999 \
