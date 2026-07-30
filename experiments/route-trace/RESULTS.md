@@ -225,12 +225,19 @@ size, `t/RMS` is one number everywhere:
 
 | group | legs | t / RMS (logit per %RMS) | spread |
 | --- | --- | --- | --- |
-| gpt-oss-20b / wiki | 3 | 0.0384 | 0.038–0.039 |
-| gpt-oss-20b / code | 6 | 0.0443 | 0.041–0.046 |
-| Nemotron-30B / wiki | 2 | 0.0324 | 0.031–0.034 |
-| DS4-Flash / wiki | 48 | 0.0330 | 0.025–0.039 |
-| DS4-Flash / code | 16 | 0.0402 | 0.034–0.054 |
-| **all** | **75** | **0.0357** | **sd 0.0053 = 15%** |
+| gpt-oss-20b / wiki | 3 | 0.0381 | 0.037–0.039 |
+| gpt-oss-20b / code | 6 | 0.0425 | 0.041–0.044 |
+| Nemotron-30B / wiki | 4 | 0.0328 | 0.030–0.037 |
+| DS4-Flash / wiki | 46 | 0.0313 | 0.024–0.036 |
+| DS4-Flash / code | 18 | 0.0401 | 0.034–0.051 |
+| **all** | **77** | **0.0346** | **sd 0.0054 = 16%** |
+
+Two selection rules, both needed and both principled. A leg is kept only if its RMS Δp exceeds
+3× *its own group's* null RMS — an earlier flat cutoff of 1.0 was tuned to DS4/wiki's
+stored-logit floor of 0.377 and wrongly discarded clean legs from groups whose floor is zero.
+And its flip rate must be ≥ 0.5%, so that at 12000 sampled margins there are ≥ 60 samples below
+the threshold and the quantile is actually resolvable; without that rule a leg flipping 0.035%
+of tokens contributes a threshold estimated from one or two samples.
 
 **A perturbation of RMS Δp = r% flips the tokens whose top-1 margin is below ≈ 0.036·r logits.**
 One constant, 75 legs, three architectures, five model+corpus pairs, near-tie densities varying
@@ -242,8 +249,11 @@ distribution. gpt-oss-20b is the clean demonstration — the *same model* gives 
 wikitext (PPL 195, out of distribution) and 0.92 on code (PPL 2.33, in distribution), a 4.8×
 drop from nothing but the text. Predicted from its margin distribution before the legs ran: 0.71.
 
-**Two limits, stated rather than smoothed over.** First, the fit is one parameter over five
-groups whose per-group means still differ by ±25%, and two of those groups have only 2–3 legs.
+**Three limits, stated rather than smoothed over.** First, the residual is not random: both
+code groups sit high (0.0425, 0.0401) and both well-fitted wiki groups sit low (0.0313, 0.0328),
+so a ~±15% systematic tracks *corpus type* rather than model. A refinement probably needs more
+of the margin distribution's shape than a single quantile. Second, gpt-oss/wiki still has only
+3 legs.
 Second, `t/RMS` is *not* strictly constant within a group: on the 48 DS4/wiki legs it declines
 from 0.0348 to 0.0313 as RMS grows (Pearson r = −0.26 against perturbation size). This
 margin-matched formulation was expected to absorb that curvature and **does not** — the raw
