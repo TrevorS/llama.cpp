@@ -108,6 +108,27 @@ Monotone across nine depths and decaying to exactly the null floor at the last l
 there is nothing downstream for the nudge to grow through. Per-layer damage is therefore **not
 comparable across depths without its matched floor**.
 
+### Not a CUDA artifact either: the effect reproduces on CPU
+
+The obvious objection to everything above is that it measures a quirk of one GPU backend's
+kernels — tile packing, MMQ, graph capture. So the same roll was run on gpt-oss-20b with
+`-ngl 0`: no CUDA at all, 20 CPU threads, the llamafile/REPACK paths, F32 accumulation,
+`-ub 512`, 20 chunks, against a CPU-generated base.
+
+| backend | Mean KLD | RMS Δp | same top-1 |
+| --- | --- | --- | --- |
+| CUDA (`-ngl 999`, ub 2048) | 0.119476 | 5.647% | 74.910% |
+| **CPU (`-ngl 0`, ub 512)** | **0.115854** | **4.120%** | **71.784%** |
+
+28.2% of top-1 predictions move on CPU against 25.1% on GPU. Two implementations sharing no
+kernel code produce the same phenomenon at the same scale, so it is a property of the
+arithmetic rather than of any backend.
+
+What this does *not* establish: precision attenuation. The CPU path already accumulates in F32
+and there is no F64 knob to sweep, so the FP-associativity mechanism remains inferred — from
+permutation-genericity, one-shot behaviour, monotone depth decay, and now backend independence
+— rather than demonstrated by making the effect shrink.
+
 ### It is not a DeepSeek quirk: three architectures, three vendors, same structure
 
 `LLAMA_MOE_ORDER_ROLL` lives in the shared `build_moe_ffn` path, so it runs on any MoE with no
