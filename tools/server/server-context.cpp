@@ -2396,7 +2396,12 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // the slot-restore path synthesizes a checkpoint on an IDLE slot, whose task has
+        // already been released (task_prev = std::move(task)), so this cannot assume one.
+        // -1 never matches a real task id, which leaves the synthetic checkpoint eligible
+        // for min-step eviction once a real task starts using the slot - the behaviour we
+        // want, since it did not come from that task.
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
