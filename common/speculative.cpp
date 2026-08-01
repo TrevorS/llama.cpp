@@ -2969,6 +2969,26 @@ common_speculative_init_result::common_speculative_init_result(
 
     std::string model_path;
     if (has_draft) {
+        // Draft-side context overrides. Without these the draft inherits the
+        // target's n_ubatch and sizes its compute buffer as if it were the
+        // target: a 3-layer DSpark draft measured 1074 MiB against the
+        // 43-layer target's 1093 MiB. Only the feature-injection path needs a
+        // wide ubatch (it chunks the prompt by n_ubatch), so narrowing the
+        // draft frees that memory for the target -- which is where it buys
+        // prefill speed, and therefore thermal headroom on a long fill.
+        //
+        // cache_type_k/v were already parsed from -ctkd/-ctvd but never applied
+        // to the draft context, so those flags were silent no-ops.
+        if (params.speculative.draft.n_ubatch > 0) {
+            cparams.n_ubatch = params.speculative.draft.n_ubatch;
+            cparams.n_batch  = std::max<uint32_t>(cparams.n_batch, cparams.n_ubatch);
+            LOG_INF("%s: draft context n_ubatch = %u (target %u)\n",
+                    __func__, cparams.n_ubatch, (uint32_t) params.n_ubatch);
+        }
+
+        cparams.type_k = params.speculative.draft.cache_type_k;
+        cparams.type_v = params.speculative.draft.cache_type_v;
+
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
