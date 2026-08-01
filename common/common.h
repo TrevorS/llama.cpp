@@ -340,6 +340,16 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Physical batch size for the DRAFT context (0 = inherit the target's).
+    // The draft context otherwise copies the target's n_ctx/n_batch/n_ubatch
+    // verbatim, which sizes its compute buffer as if it were the target: a
+    // 3-layer DSpark draft measured 1074 MiB against the 43-layer target's
+    // 1093 MiB. The draft only needs a wide ubatch for feature injection
+    // (which chunks the prompt by n_ubatch), so narrowing it reclaims most of
+    // that while leaving the target's prefill speed -- and its thermals --
+    // untouched.
+    int32_t n_ubatch = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
