@@ -127,6 +127,9 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.mtp_draft_chain      = false;
+    // never assigned anywhere else: without this it is read as indeterminate
+    // memory in dspark.cpp's decoder, arming the in-graph draft chain at random
+    cparams.dspark_draft_chain      = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -957,6 +960,13 @@ const float * llama_context::get_mtp_draft_meta(uint32_t * count) {
     return mtp_draft_meta.empty() ? nullptr : mtp_draft_meta.data();
 }
 
+const float * llama_context::get_dspark_draft_meta(uint32_t * count) {
+    if (count) {
+        *count = (uint32_t) dspark_draft_meta.size();
+    }
+    return dspark_draft_meta.empty() ? nullptr : dspark_draft_meta.data();
+}
+
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -1211,6 +1221,16 @@ void llama_context::set_mtp_draft_chain(bool value) {
     // propagation in set_outputs. This keeps per-decode toggling free (the
     // MTP driver flips it around each draft decode).
     cparams.mtp_draft_chain = value;
+}
+
+void llama_context::set_dspark_draft_chain(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    // same rationale as set_mtp_draft_chain: the chain graph is gated out of the
+    // reserve-shape ubatches by its n_tokens window, and t_dspark_meta is kept
+    // alive by the OUTPUT-flag propagation in set_outputs, so toggling per decode
+    // costs nothing.
+    cparams.dspark_draft_chain = value;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2058,6 +2078,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract DSpark in-graph chain meta ([2K]: (id, conf_logit) per position)
+        if (cparams.dspark_draft_chain) {
+            auto * t_meta = res->get_dspark_meta();
+            if (t_meta != nullptr) {
+                ggml_backend_t backend_meta = ggml_backend_sched_get_tensor_backend(sched.get(), t_meta);
+                GGML_ASSERT(backend_meta != nullptr);
+
+                dspark_draft_meta.resize(ggml_nelements(t_meta));
+                ggml_backend_tensor_get_async(backend_meta, t_meta, dspark_draft_meta.data(), 0, ggml_nbytes(t_meta));
+            } else {
+                dspark_draft_meta.clear();
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2407,6 +2441,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_DEEPSEEK4_MTP ||
+        model.arch == LLM_ARCH_DSPARK ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
         // the 8*n_tensors default budget underestimates them badly
@@ -3872,6 +3907,16 @@ const float * llama_get_mtp_draft_meta(llama_context * ctx, uint32_t * count) {
     ctx->synchronize();
 
     return ctx->get_mtp_draft_meta(count);
+}
+
+void llama_set_dspark_draft_chain(llama_context * ctx, bool value) {
+    ctx->set_dspark_draft_chain(value);
+}
+
+const float * llama_get_dspark_draft_meta(llama_context * ctx, uint32_t * count) {
+    ctx->synchronize();
+
+    return ctx->get_dspark_draft_meta(count);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

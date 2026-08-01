@@ -810,6 +810,7 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_mtp_draft_meta() const { return t_mtp_draft_meta; }
+    ggml_tensor * get_dspark_meta()     const { return t_dspark_meta; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -842,6 +843,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    // DSpark in-graph draft chain export: [2, K] f32 = (drafted id, confidence
+    // logit) per chained proposal row (see llama_model_dspark::graph<false>)
+    ggml_tensor * t_dspark_meta = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm

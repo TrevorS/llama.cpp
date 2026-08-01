@@ -2216,3 +2216,53 @@ struct llama_model_step35 : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// DSpark speculative draft head for DeepSeek-V4-Flash.
+// Semi-autoregressive block drafter: DFlash-style feature-fusion encoder +
+// a small (3-layer) DeepSeek-V4 backbone (MLA-lite attention, sqrtsoftplus MoE
+// with shared expert, hyper-connection residuals) + a low-rank Markov head that
+// biases block logits. See src/models/dspark.cpp for the graph and the
+// integration notes on target-side layer_inp extraction.
+struct llama_model_dspark : public llama_model_base {
+    llama_model_dspark(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // Markov head + confidence head live on the model (not in the shared
+    // llama_model tensor set) so no shared header needs new fields.
+    uint32_t markov_rank = 256;
+    ggml_tensor * markov_w1      = nullptr; // [markov_rank, n_vocab] token->rank embed (GET_ROWS)
+    ggml_tensor * markov_w2      = nullptr; // [markov_rank, n_vocab] rank->vocab (MUL_MAT)
+    ggml_tensor * confidence_proj = nullptr; // [n_embd, 1] per-position survival predictor (v2, loaded but unused)
+
+    template <bool is_enc>
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_inp_embd_enc() const;
+
+        // Hyper-connection residual mixing (hc == 4), scalar port of the
+        // DeepSeek-V4 reference (see deepseek4.cpp). Kept self-contained here.
+        ggml_tensor * build_hc_weighted_sum(ggml_tensor * x, ggml_tensor * weights) const;
+        ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb) const;
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale, ggml_tensor * hc_base,
+                ggml_tensor ** post, ggml_tensor ** comb, int il) const;
+        ggml_tensor * build_hc_post(
+                ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb, int il) const;
+        ggml_tensor * build_hc_head(
+                ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale, ggml_tensor * hc_base) const;
+
+        // MLA-lite attention over the non-causal draft KV cache. DSpark declares a
+        // sliding window, so the cache is interleaved-SWA and `inp_attn_iswa` is the
+        // live input; the plain `inp_attn` path is kept for checkpoints that omit
+        // `attention.sliding_window`. Exactly one of the two is non-null.
+        ggml_tensor * build_attention(
+                const llama_model & model,
+                llm_graph_input_attn_kv      * inp_attn,
+                llm_graph_input_attn_kv_iswa * inp_attn_iswa,
+                ggml_tensor * cur, ggml_tensor * inp_pos, int il) const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
