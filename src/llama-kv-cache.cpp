@@ -1146,8 +1146,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        // SWA mask. For BLOCK_ANCHORED the reference point here is a
+                        // running max position, which sits up to a block ahead of the
+                        // anchor the NEXT block will use -- recycling on that basis
+                        // would drop history the next block still reads. Widen by the
+                        // block slack so eviction stays behind the anchored window.
+                        const uint32_t n_swa_ev = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                            ? n_swa + LLAMA_SWA_BLOCK_ANCHOR_SLACK : n_swa;
+
+                        if (llama_hparams::is_masked_swa(n_swa_ev, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -1847,7 +1854,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // apply SWA if any
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    // BLOCK_ANCHORED shares one window across the whole block, so the
+                    // test anchors on the sequence's first position in this batch
+                    // instead of the query's own position.
+                    const llama_pos p_ref = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                        ? seq_pos_min[seq_id] : p1;
+
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p_ref)) {
                         goto skip;
                     }
                 }
@@ -2184,7 +2197,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+                // same slack as the find_slot reuse test: seq_pos_max leads the
+                // next block's anchor, and dropping a cell here loses it from the
+                // serialized state permanently
+                const uint32_t n_swa_st = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                    ? n_swa + LLAMA_SWA_BLOCK_ANCHOR_SLACK : n_swa;
+
+                const bool is_masked = llama_hparams::is_masked_swa(n_swa_st, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
             }

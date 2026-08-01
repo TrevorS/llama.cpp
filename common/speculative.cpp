@@ -918,6 +918,37 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// LLAMA_DFLASH_PROBE=1: report the first non-finite value in a float span.
+// The DFlash/DSpark pipeline has three places a NaN can enter (target features
+// -> encoder output -> draft logits) and they are indistinguishable from the
+// outside: a NaN logit row still samples, it just always argmaxes to the same
+// low token id and never gets accepted. Staged so a zero-acceptance run says
+// which stage produced it.
+static bool dflash_probe_enabled() {
+    static const bool v = getenv("LLAMA_DFLASH_PROBE") && atoi(getenv("LLAMA_DFLASH_PROBE"));
+    return v;
+}
+
+static void dflash_probe(const char * stage, const float * p, size_t n) {
+    if (!dflash_probe_enabled() || p == nullptr) {
+        return;
+    }
+    size_t n_nan = 0, n_inf = 0;
+    size_t i_first = (size_t) -1;
+    float  vmin = 0.0f, vmax = 0.0f;
+    bool   have  = false;
+    for (size_t i = 0; i < n; ++i) {
+        const float v = p[i];
+        if (std::isnan(v)) { n_nan++; if (i_first == (size_t) -1) i_first = i; continue; }
+        if (std::isinf(v)) { n_inf++; if (i_first == (size_t) -1) i_first = i; continue; }
+        if (!have) { vmin = vmax = v; have = true; }
+        vmin = std::min(vmin, v);
+        vmax = std::max(vmax, v);
+    }
+    LOG_INF("%s: probe %-16s n=%zu nan=%zu inf=%zu first_bad=%zd range=[%.4g, %.4g]\n",
+            __func__, stage, n, n_nan, n_inf, (ptrdiff_t) i_first, vmin, vmax);
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -943,6 +974,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // draft-dspark: per-vocab Markov bias scratch, refilled once per block position
+    // (host chain only -- the in-graph chain never touches this)
+    std::vector<float> markov_bias;
+
+    // draft-dspark: run the block chain inside the decoder graph
+    bool use_graph_chain = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -964,15 +1002,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        // Read the trained block size from the draft's metadata. The two archs
+        // spell the key differently: dflash exports "dflash.block_size", while a
+        // DSpark draft exports it arch-prefixed as "dspark.dspark.block_size"
+        // (LLM_KV_DSPARK_BLOCK_SIZE = "%s.dspark.block_size" with arch "dspark").
+        // Probing only the dflash key silently left DSpark on the 16 default,
+        // which over-drafts: DeepSeek-V4-Flash-0731 ships block_size = 5.
         block_size = 16;
         {
             char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
-                block_size = std::atoi(buf);
+            const char * keys[] = { "dspark.dspark.block_size", "dflash.block_size" };
+            for (const char * k : keys) {
+                if (llama_model_meta_val_str(model_dft, k, buf, sizeof(buf)) >= 0) {
+                    const int v = std::atoi(buf);
+                    if (v > 0) {
+                        block_size = v;
+                        break;
+                    }
+                }
             }
         }
+        // DFlash denoises a block seeded with the vocab's <mask>; DSpark instead
+        // seeds with a dedicated noise token carried in the checkpoint
+        // (dspark_noise_token_id = 128799 for DeepSeek-V4-Flash-0731). DSpark
+        // vocabs have no <mask>, so llama_vocab_mask() returns -1 and every
+        // drafted position would be filled with an invalid id, making
+        // llama_decode fail on every round.
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        if (is_dspark) {
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "dspark.dspark.noise_token_id", buf, sizeof(buf)) >= 0) {
+                mask_token_id = std::atoi(buf);
+            }
+            GGML_ASSERT(mask_token_id >= 0 && "DSpark draft is missing dspark.noise_token_id");
+        }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
@@ -1007,6 +1070,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        // DSpark: run the semi-autoregressive block on-device. The chain does the
+        // Markov bias, the greedy argmax and the confidence head per position,
+        // chained, so the driver reads 2K floats instead of pulling block_size
+        // full logit rows (129280 each) and running a 256 x 129280 GEMV per
+        // position on the host. LLAMA_DSPARK_HOST_CHAIN=1 forces the host path
+        // as an A/B control -- both are greedy, so the ids must match exactly.
+        if (is_dspark) {
+            const char * e = getenv("LLAMA_DSPARK_HOST_CHAIN");
+            use_graph_chain = !(e && atoi(e));
+            llama_set_dspark_draft_chain(ctx_dft, use_graph_chain);
+            LOG_INF("%s: - dspark chain = %s\n", __func__, use_graph_chain ? "in-graph" : "host");
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1084,6 +1160,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
+
+                    if (dflash_probe_enabled()) {
+                        char stage[32];
+                        snprintf(stage, sizeof(stage), "tgt_layer[%d]", target_layer_ids[k]);
+                        dflash_probe(stage, layer + (size_t) i_batch_beg[seq_id] * n_embd_tgt,
+                                (size_t) n_chunk * n_embd_tgt);
+                    }
                 }
 
                 // fuse extracted features through DFlash encoder
@@ -1106,6 +1189,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+                dflash_probe("enc_out", inp_g, (size_t) n_chunk * n_embd_dec);
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
@@ -1170,6 +1255,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // In-graph chain output: [2K] floats, (token id, confidence logit) per position.
+        // Null when the graph declined to build the chain (multi-seq ubatch, a width
+        // outside the block bound, or a non-token batch) -- the host path below then
+        // runs unchanged, so this is a fast path, not a required one.
+        uint32_t      chain_n    = 0;
+        const float * chain_meta = use_graph_chain ? llama_get_dspark_draft_meta(ctx_dft, &chain_n) : nullptr;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1184,15 +1276,103 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dspark) {
-                // DSpark predicts the next token from position 0 and optionally truncates
-                // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // DSpark predicts the next token from position 0 and truncates the block
+                // at the first position whose confidence falls below p_min.
+                //
+                // The decoder graph publishes the PRE-norm hc_head rows as t_h_nextn (see
+                // dspark.cpp), so `hrows + idx*n_embd_dec` is the `x` the reference feeds
+                // to confidence_head. The second input is markov_embed(prev) with the SAME
+                // prev that biased this position -- reference forward_head collects
+                // markov_embeds inside the sampling loop and only then calls
+                // confidence_head(x, stack(markov_embeds)) -- so the test must run BEFORE
+                // sampling position i, using the id chained from position i-1.
+                const float * hrows = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+
+                const int32_t n_vocab_dft =
+                    llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+
+                // fast path: the whole block was chained on-device
+                if (chain_meta && chain_n >= 2u*(uint32_t) n_block_tokens) {
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
+                        const float clogit = chain_meta[2*i + 1];
+                        if (params.p_min > 0.0f) {
+                            const float p = 1.0f/(1.0f + expf(-clogit));
+                            if (p < params.p_min) {
+                                LOG_DBG(" - seq_id %d, dspark conf cut at pos %d: p=%.3f < %.3f\n",
+                                        seq_id, i, p, params.p_min);
+                                break;
+                            }
+                        }
+
+                        const llama_token id = (llama_token) chain_meta[2*i + 0];
+                        if (id < 0 || id >= n_vocab_dft) {
+                            LOG_WRN("%s: dspark chain produced out-of-range id %d at pos %d\n",
+                                    __func__, id, i);
+                            break;
+                        }
+
+                        // keep the sampler's history in step with the host path
+                        common_sampler_accept(smpl, id, true);
+                        result.push_back(id);
+                    }
+
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                    }
+                    continue;
+                }
+
+                dflash_probe("draft_logits", llama_get_logits_ith(ctx_dft, beg), (size_t) n_vocab_dft);
+
+                // Markov head. The reference decodes the block semi-autoregressively:
+                //     output_ids[0] = id_last
+                //     for i in range(block_size):
+                //         logits[i] += markov_head(output_ids[i])   <- bias from the PREVIOUS id
+                //         output_ids[i+1] = sample(logits[i])
+                // (inference/model.py DSparkBlock::forward_head). The block is decoded in
+                // one bidirectional pass, so positions >= 1 see only a noise embedding --
+                // the chained bias is the ONLY thing that tells position i what was chosen
+                // at position i-1. Without it the block collapses to its anchor: measured
+                // per-position acceptance was 26.0% / 1.8% / 0% / 0% / 0% at block_size 5.
+                // LLAMA_DSPARK_NO_MARKOV=1 restores the unbiased behaviour as an A/B control.
+                static const bool no_markov =
+                    getenv("LLAMA_DSPARK_NO_MARKOV") && atoi(getenv("LLAMA_DSPARK_NO_MARKOV"));
+
+                const bool use_markov = !no_markov && n_block_tokens > 0;
+                if (use_markov) {
+                    markov_bias.resize((size_t) n_vocab_dft);
+                }
+
+                llama_token prev_id = dp.id_last;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
-                        break;
+                    // confidence gate: sigmoid(W_conf . [x ; W1[prev]]) < p_min -> stop here.
+                    // Matches DeepSpec _confident_prefix_length, which cuts at the FIRST
+                    // row below threshold rather than skipping it.
+                    if (hrows) {
+                        float clogit = 0.0f;
+                        if (llama_dspark_confidence_logit(llama_get_model(ctx_dft), prev_id,
+                                    hrows + (size_t) idx * n_embd_dec, &clogit)) {
+                            const float p = 1.0f/(1.0f + expf(-clogit));
+                            if (p < params.p_min) {
+                                LOG_DBG(" - seq_id %d, dspark conf cut at pos %d: p=%.3f < %.3f\n",
+                                        seq_id, i, p, params.p_min);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (use_markov) {
+                        // bias is additive in logit space; fold it into the row in place so
+                        // the shared sampler path picks it up unchanged
+                        llama_dspark_markov_bias(llama_get_model(ctx_dft), prev_id, markov_bias.data());
+
+                        float * logits = llama_get_logits_ith(ctx_dft, idx);
+                        for (int32_t v = 0; v < n_vocab_dft; ++v) {
+                            logits[v] += markov_bias[v];
+                        }
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -1210,6 +1390,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    prev_id = id; // chain: this id biases the next block position
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1

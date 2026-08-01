@@ -377,6 +377,7 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
         case LLAMA_SWA_TYPE_STANDARD:  swa_type_str = "LLAMA_SWA_TYPE_STANDARD"; break;
         case LLAMA_SWA_TYPE_CHUNKED:   swa_type_str = "LLAMA_SWA_TYPE_CHUNKED"; break;
         case LLAMA_SWA_TYPE_SYMMETRIC: swa_type_str = "LLAMA_SWA_TYPE_SYMMETRIC"; break;
+        case LLAMA_SWA_TYPE_BLOCK_ANCHORED: swa_type_str = "LLAMA_SWA_TYPE_BLOCK_ANCHORED"; break;
     };
 
     LLAMA_LOG_DEBUG("%s: n_swa : %d, n_kv: %d, swa_type: %s\n", __func__, (int)n_swa, (int)n_kv, swa_type_str);
@@ -432,6 +433,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
                 }
 
                 // apply SWA if any
+                // note: BLOCK_ANCHORED expects the block anchor as p1 and there is no
+                // block here (this is the cacheless attention path); it is only
+                // reachable if an arch sets that type without a KV cache, which no
+                // current arch does.
+                GGML_ASSERT(swa_type != LLAMA_SWA_TYPE_BLOCK_ANCHORED &&
+                        "BLOCK_ANCHORED SWA requires the KV-cache mask builder");
+
                 if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
                     continue;
                 }
@@ -1264,6 +1272,7 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
     t_mtp_draft_meta = nullptr;
+    t_dspark_meta    = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1311,6 +1320,10 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
     }
+    if (t_dspark_meta != nullptr) {
+        ggml_set_output(t_dspark_meta);
+    }
+
     if (t_mtp_draft_meta != nullptr) {
         ggml_set_output(t_mtp_draft_meta);
     }

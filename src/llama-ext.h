@@ -22,6 +22,14 @@ LLAMA_API void          llama_set_mtp_draft_chain(struct llama_context * ctx, bo
 // (optional) receives the number of floats.
 LLAMA_API const float * llama_get_mtp_draft_meta(struct llama_context * ctx, uint32_t * count);
 
+// DSpark in-graph chained draft. When enabled, the decoder graph runs the whole
+// semi-autoregressive block on-device -- Markov bias, greedy argmax and the
+// confidence head, chained position to position -- instead of the driver pulling
+// full logit rows and running a rank x vocab GEMV per position on the host.
+// The meta is [2K] floats, interleaved (token id, confidence logit).
+LLAMA_API void          llama_set_dspark_draft_chain(struct llama_context * ctx, bool value);
+LLAMA_API const float * llama_get_dspark_draft_meta(struct llama_context * ctx, uint32_t * count);
+
 // DSV4 speculative partial-accept rewind (ds4.c compressor-frontier snapshot
 // analog). Call llama_dsv4_spec_stash BEFORE the verify decode to snapshot the
 // compressor frontier; on partial acceptance call llama_dsv4_spec_restore with
@@ -155,3 +163,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// DSpark draft heads. Implemented in src/models/dspark.cpp.
+// markov bias: per-vocab logit bias derived from the previously drafted token
+LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * out);
+// confidence: per-position survival logit from the draft hidden state + markov embed
+LLAMA_API bool llama_dspark_confidence_logit(const struct llama_model * model, llama_token prev, const float * h, float * out);

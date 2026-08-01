@@ -35,6 +35,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool mtp_draft_chain;      // MTP fused chained draft (LLAMA_MTP_FUSED_DRAFT): argmax + h-chaining in-graph
+    bool dspark_draft_chain;      // dspark: run the markov/argmax/confidence draft chain in-graph
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
