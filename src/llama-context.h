@@ -91,6 +91,7 @@ struct llama_context {
     float * get_embeddings_layer_inp(uint32_t lid);
 
     const float * get_mtp_draft_meta(uint32_t * count);
+    const float * get_dspark_draft_meta(uint32_t * count);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -119,6 +120,7 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_mtp_draft_chain(bool value);
+    void set_dspark_draft_chain(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -311,6 +313,12 @@ private:
     // populated per decode when cparams.mtp_draft_chain is enabled and the
     // graph sets llm_graph_result::t_mtp_draft_meta
     std::vector<float> mtp_draft_meta;
+
+    // DSpark in-graph chained-draft export: [2K] floats, interleaved
+    // (token id, confidence logit) per block position. Populated per decode when
+    // cparams.dspark_draft_chain is enabled and the graph sets
+    // llm_graph_result::t_dspark_meta.
+    std::vector<float> dspark_draft_meta;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

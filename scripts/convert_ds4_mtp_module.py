@@ -302,10 +302,12 @@ N_EXPERTS = 256
 # The C++ loader resolves tensor names via tn(id[, suffix, layer]); a suffix is
 # appended with a '.'. We store the registered base name (no suffix) in the maps
 # and apply the exact suffix the create_tensor call uses here:
-#   * FFN_EXP_PROBS_B is created with "bias"  (deepseek4.cpp:172 / dspark.cpp:132)
-#   * DSPARK_MARKOV_W1/W2 and CONF_PROJ use tn(id) with NO suffix (dspark.cpp:146-148)
+#   * FFN_EXP_PROBS_B is created with "bias"  (deepseek4.cpp:172)
+#   * DSPARK_MARKOV_W1/W2 and CONF_PROJ use tn(id) with NO suffix
+#     (dspark.cpp:150-154). NOTE: dflash.cpp uses tn(id, "weight") for the same
+#     enums -- the two archs genuinely differ, so do not "unify" these.
 #   * every other module tensor uses "weight"
-_NO_SUFFIX = {"dspark.markov_w1", "dspark.markov_w2", "dspark.confidence_proj"}
+_NO_SUFFIX = {"markov_w1", "markov_w2", "conf_proj"}
 
 
 def final_name(base):
@@ -322,6 +324,14 @@ def emit_scalar(writer, dst, arr, policy):
         writer.add_tensor(final_name(dst), arr.astype(np.float32))
     elif policy == "f16":
         writer.add_tensor(final_name(dst), arr.astype(np.float16))
+    elif policy == "bf16":
+        # bfloat16: same 2 bytes as f16 but with fp32 exponent range. numpy has no
+        # native bf16, so round-to-nearest-even on the top 16 bits of the f32
+        # pattern and hand gguf-py a pre-typed array.
+        f = arr.astype(np.float32, copy=False)
+        u = f.view(np.uint32)
+        rounded = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+        writer.add_tensor(final_name(dst), rounded, raw_dtype=GGMLQuantizationType.BF16)
     else:
         raise ValueError(policy)
 
@@ -408,15 +418,15 @@ def convert(mode, module_dir, main_gguf, out_path, expert_quant="q8_0"):
         emit_scalar(writer, "blk.0.nextn.hnorm",  st.decode("mtp.0.hnorm"),  "f32")
     else:  # dspark
         # only block 0 taps the target-layer features
-        emit_scalar(writer, "fc",              st.decode("mtp.0.main_proj"), "f16")
+        emit_scalar(writer, "fc",              st.decode("mtp.0.main_proj"), "f32")
         emit_scalar(writer, "enc.output_norm", st.decode("mtp.0.main_norm"), "f32")
         emit_scalar(writer, "output_norm",     st.decode("mtp.2.norm"),          "f32")
         emit_scalar(writer, "output_hc_fn",    st.decode("mtp.2.hc_head_fn"),    "f32")
         emit_scalar(writer, "output_hc_base",  st.decode("mtp.2.hc_head_base"),  "f32")
         emit_scalar(writer, "output_hc_scale", st.decode("mtp.2.hc_head_scale"), "f32")
-        emit_scalar(writer, "dspark.markov_w1",      st.decode("mtp.2.markov_head.markov_w1"), "f16")
-        emit_scalar(writer, "dspark.markov_w2",      st.decode("mtp.2.markov_head.markov_w2"), "f16")
-        emit_scalar(writer, "dspark.confidence_proj", st.decode("mtp.2.confidence_head.proj"), "f16")
+        emit_scalar(writer, "markov_w1",             st.decode("mtp.2.markov_head.markov_w1"), "f16")
+        emit_scalar(writer, "markov_w2",             st.decode("mtp.2.markov_head.markov_w2"), "f16")
+        emit_scalar(writer, "conf_proj",             st.decode("mtp.2.confidence_head.proj"), "f32")
 
     # raw quantized token_embd / output copied verbatim from the main GGUF
     add_raw_tensor(writer, raw["token_embd.weight"])
@@ -483,13 +493,13 @@ def validate(mode, out_path):
 
     # dspark heads
     if mode == "dspark":
-        for hn in ("dspark.markov_w1", "dspark.markov_w2", "dspark.confidence_proj"):
-            t = tensors[hn]   # suffix-less by contract
+        for hn in ("markov_w1", "markov_w2", "conf_proj"):
+            t = tensors[hn]
             sh = [int(x) for x in t.shape]
             print(f"  {hn:24s}: {sh} {t.tensor_type.name}")
-        m1 = [int(x) for x in tensors["dspark.markov_w1"].shape]
+        m1 = [int(x) for x in tensors["markov_w1"].shape]
         assert 129280 in m1 and 256 in m1, f"markov_w1 shape family {m1} not (129280,256)"
-        m2 = [int(x) for x in tensors["dspark.markov_w2"].shape]
+        m2 = [int(x) for x in tensors["markov_w2"].shape]
         assert 129280 in m2 and 256 in m2, f"markov_w2 shape family {m2} not (129280,256)"
         assert "fc.weight" in tensors and "enc.output_norm.weight" in tensors, "fc.weight / enc.output_norm.weight missing"
 
