@@ -329,6 +329,46 @@ KV against ~45 GiB for a dense equivalent. **The blocker is the compute buffer**
 killed ~8 measurements. Relaxed to `-m 1,1` (2026-08-01) -> ~4.3 GiB; every
 previously-failing leg then completed.
 
+## Deep fills are duty-limited: P70 goes 2.7x deeper than P85
+
+256k ctx + DSpark draft, target `-ub 2048` / `--spec-draft-ubatch 256`, q8_0 KV,
+~100k-token fill, watchdog abort at SoC 94 C:
+
+| duty | start SoC | pp | reached | note |
+| --- | --- | --- | --- | --- |
+| P85 | ~54 C | 364.40 | 28672 (29%) | ramps monotonically through 94 |
+| **P70** | 60.7 C | 263.80 | **77824 (79%)** | **2.7x deeper, ~80 s short of finishing** |
+| P65 | 63.9 C | 269.64 | 36864 (37%) | INVALID — soaked chassis |
+
+**Mechanism.** At P85 SoC climbs straight through 94 C. At P70 it *oscillates in an
+84-92 C band*, shedding heat in the duty gaps — power swinging 27 W → 83 W → 33 W.
+The wall stops being a ramp and becomes a hover. Deep fills are limited by sustained
+power, so duty cycling is the lever that moves the ceiling.
+
+**Throughput does not buy depth.** `--spec-draft-ubatch` bought +12.9% pp (322.86 →
+364.40) and the fill then hit the *same* token count at the *same* temperature, just
+11% sooner. Worth having for memory and speed; useless for depth.
+
+**Thermal soak dominates, and it invalidated the P65 leg.** P65 started 3 C warmer on
+a chassis still soaked from P70 and reached half the depth; its power trace gives it
+away (77.5 W where P70 drew 51.0 W at the same point — backwards for a lower duty).
+**Deep-fill legs need a genuinely cold chassis and cannot be run back-to-back**;
+8 minutes of cooldown is not enough. P65 remains untested.
+
+**Recipe:** `GGML_CUDA_POWER=70` + `--spec-draft-ubatch 256` + `-ctk/-ctv q8_0` at
+`-c 262144` with target `-ub 2048` handles ~78k-token fills from cold with the draft
+attached (pp ~264, tg ~24, acceptance ~0.53).
+
+## Context ladder with the draft attached
+
+| context | status |
+| --- | --- |
+| 34k | comfortable, P85/ub2048, pp 343 / tg 20.2 / acc 0.5385 |
+| 256k | ~4 GiB headroom with `--spec-draft-ubatch 256`; deep fills need P70 |
+| 512k | loads at ub1024, tg 24.0 / acc 0.5755; memory low-water 2.6 GiB (thin) |
+| 1M | target-ONLY (11 GiB headroom, tg ~16). With draft ~1 GiB over budget — only a
+smaller target quant closes it |
+
 ## Canonical references
 
 - Reference implementation: `inference/model.py` in the HF
