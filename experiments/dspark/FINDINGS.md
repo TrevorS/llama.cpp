@@ -270,6 +270,65 @@ Verification that a draft has the right module: `markov_w1` sha `a5eb4c73` and
 `5c260399`). The shipped draft reproduces 556 drafted / 324 accepted = 0.5827
 with the runtime override both ON and OFF.
 
+## KV cache dtype: `-ctk q8_0` (needs `-ctv q8_0` too)
+
+llama.cpp rejects mismatched K/V types even though MLA stores no V (every tier
+reports `V: 0.00 MiB`), so both flags are required.
+
+Memory at 1M ctx (measured):
+
+| tier | f16 | q8_0 |
+| --- | --- | --- |
+| CSA compressed | 5376 | **2856** |
+| raw SWA window | 96.75 | 51.40 |
+| HCA compressed | 160 | 85 |
+| indexer (mxfp4) | 357 | 357 (unaffected) |
+| **context total** | **6001** | **3361 MiB** |
+
+Compute is unchanged. Net **−2.6 GiB at 1M**.
+
+Quality, DSpark n=3, P85, 2 runs per arm:
+
+| depth | f16 acceptance | q8_0 acceptance | q8_0 tg | q8_0 pp |
+| --- | --- | --- | --- | --- |
+| 4k | 0.5827 | 0.5192 | −7.3% | — |
+| 34k | 0.4943 / 0.4919 | **0.5385 / 0.5385** | **+4.8%** | −4.5% |
+
+**f16 degrades with depth (0.583 -> 0.494) while q8_0 is depth-stable
+(0.519 -> 0.539)**, so the two cross over somewhere between 4k and 34k. q8_0 is
+bit-deterministic across runs (315/585 twice); f16 wobbles slightly. Unexplained,
+but reproducible — note that quantizing `type_k` flips on `attn_rot_k`, enabling
+the Hadamard rotation (confirmed `attn_rot_k = 1` under q8_0, `0` under f16), which
+exists to handle outliers in quantized caches.
+
+**Recommendation: f16 for short context, q8_0 for long** — at depth it wins on
+memory AND acceptance.
+
+## Memory budget and what actually consumes it
+
+Measured with target + draft resident at c40960 ub2048:
+
+| | model | context | compute | total |
+| --- | --- | --- | --- | --- |
+| draft | 11295 | 13 | **1074** | 12383 MiB |
+| target | 98961 | 342 | 1093 | 100396 MiB |
+
+Weights are 107.7 of the 110.1 GiB. **The draft's compute buffer (1074 MiB) is as
+large as the target's** because `common/speculative.cpp:2959` builds the draft
+context from `common_context_params_to_llama(params)` — it inherits `n_ctx`,
+`n_batch` and `n_ubatch` verbatim, and there is no draft-side `-c`/`-ub` flag. The
+draft needs the wide ubatch for feature injection (which chunks the prompt by
+`n_ubatch`), but a draft-side override would reclaim most of that.
+
+KV scaling is near-O(1) in context: `context ~= 96.75 + ctx x 0.00562 MiB`
+(raw window pinned at 2304 cells; only CSA/HCA/indexer grow). 1M costs 6001 MiB of
+KV against ~45 GiB for a dense equivalent. **The blocker is the compute buffer**,
+1059 -> 4585 MiB from 8k -> 1M at ub2048, or 1144 MiB at ub512.
+
+`earlyoom -m 3,2` left only ~1.8 GiB of working headroom with 110 GiB resident and
+killed ~8 measurements. Relaxed to `-m 1,1` (2026-08-01) -> ~4.3 GiB; every
+previously-failing leg then completed.
+
 ## Canonical references
 
 - Reference implementation: `inference/model.py` in the HF
