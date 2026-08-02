@@ -1135,6 +1135,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
+        float        * const __restrict__ lse_row, // per-row LSE tail output, pre-offset to (sequence, zt_Q); nullptr if disabled
         const float scale,
         const float slope,
         const float logit_softcap,
@@ -1473,6 +1474,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
             }
+            if (!needs_fixup && !is_fixup && lse_row != nullptr && threadIdx.x < T_B_KQ::I) {
+                // Tile is fully owned by this block: the final per-row LSE can be written directly.
+                const int j_dst = jc_cwm / ncols2;
+                const int c_dst = jc_cwm % ncols2;
+                if (!(ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) && !(ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio)) {
+                    lse_row[(jt*ncols1 + j_dst)*ne02 + c_dst] = KQ_cmr.y == 0.0f ? -INFINITY : KQ_cmr.x + logf(KQ_cmr.y);
+                }
+            }
         }
     } else {
         // jc_cwm = jc combine write meta
@@ -1511,6 +1520,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             if (is_fixup && thread_should_write) {
                 float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
+            }
+            if (!needs_fixup && !is_fixup && lse_row != nullptr && thread_should_write) {
+                // Tile is fully owned by this block: the final per-row LSE can be written directly.
+                const int j_dst = jc_cwm / ncols2;
+                const int c_dst = jc_cwm % ncols2;
+                if (!(ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) && !(ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio)) {
+                    lse_row[(jt*ncols1 + j_dst)*ne02 + c_dst] = KQ_cmr.y == 0.0f ? -INFINITY : KQ_cmr.x + logf(KQ_cmr.y);
+                }
             }
         }
     }
@@ -1580,6 +1597,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         if (is_fixup && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
             float2 * dstk_fixup_meta = dstk_fixup + (gridDim.x + blockIdx.x)*ncols;
             dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
+        }
+        if (!needs_fixup && !is_fixup && lse_row != nullptr && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
+            // Tile is fully owned by this block: the final per-row LSE can be written directly.
+            const int jc    = (threadIdx.y/np)*cols_per_warp + threadIdx.x;
+            const int j_dst = jc / ncols2;
+            const int c_dst = jc % ncols2;
+            if (!(ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) && !(ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio)) {
+                lse_row[(jt*ncols1 + j_dst)*ne02 + c_dst] = KQ_crs == 0.0f ? -INFINITY : KQ_cmn + logf(KQ_crs);
+            }
         }
     } else if (np > 1) {
         // Warps with threadIdx.y % np == 0 execute a __syncthreads() in the if branch.
@@ -1717,7 +1743,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup, lse_row,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
         jt, kb0_start, kb0_stop);
@@ -1748,7 +1774,8 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t write_lse) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -1759,6 +1786,9 @@ static __global__ void flash_attn_ext_f16(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+
+    // Per-row log-sum-exp tail output, located past the regular [DV, ne02, ne01, ne03] result.
+    float * const lse_tail = write_lse ? dst + (int64_t) DV*ne02*int64_t(ne01.z)*ne03 : nullptr;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -1842,6 +1872,7 @@ static __global__ void flash_attn_ext_f16(
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+        float        * lse_row = lse_tail ? lse_tail + (int64_t) sequence*ne01.z*ne02 + zt_Q : nullptr;
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
@@ -1855,12 +1886,12 @@ static __global__ void flash_attn_ext_f16(
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, lse_row, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, lse_row, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
@@ -1901,7 +1932,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -1912,7 +1943,7 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, write_lse);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
