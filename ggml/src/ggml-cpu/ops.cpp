@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <set>
 
 // ggml_compute_forward_dup
 
@@ -8399,6 +8400,441 @@ void ggml_compute_forward_argsort(
     }
 }
 
+// ggml_compute_forward_dsv4_lid_topk
+
+// MXFP4 packed container (P3b): 17B blocks — e8m0 scale byte + 16 nibble
+// bytes in ggml's block_mxfp4 element order (low nibble -> j, high -> j+16).
+// The packer uses the DSV4 QAT nearest-level rounding, NOT ggml's stock
+// quantizer; encode e = s + 127 with the level table at TRUE e2m1 values so
+// dequant d = 2^(e-127) == the QAT scale — the container holds the official
+// post-QAT numerics exactly.
+
+static uint8_t dsv4_e2m1_index_cpu(float x) {
+    static const float lv[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const int sgn = x < 0.0f ? 8 : 0;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int   best = 0;
+    float bd   = fabsf(ax - lv[0]);
+    for (int i = 1; i < 8; i++) {
+        const float d = fabsf(ax - lv[i]);
+        if (d < bd || (d == bd && (i & 1) == 0 && (best & 1) != 0)) { best = i; bd = d; }
+    }
+    return (uint8_t) (best | sgn);
+}
+
+// amax floor for the QAT e8m0 scale: 6.0f*FLT_MIN, so amax/6 stays normal and
+// ceilf(log2f(amax/6)) is finite (mirrors DSV4_QAT_AMAX_MIN in dsv4_lid_topk.cu)
+#define DSV4_QAT_AMAX_MIN 7.052966104933725e-38f
+
+static void dsv4_qat_pack_row_cpu(uint8_t * dst, const float * src, int64_t ne0) {
+    for (int64_t off = 0; off < ne0; off += 32) {
+        float amax = 0.0f;
+        for (int64_t i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(src[off + i]));
+        if (amax < DSV4_QAT_AMAX_MIN) amax = DSV4_QAT_AMAX_MIN;
+        const int   s     = (int) ceilf(log2f(amax / 6.0f));
+        const float scale = ldexpf(1.0f, s);
+        dst[0] = (uint8_t) (s + 127);
+        for (int i = 0; i < 16; i++) {
+            const float v0 = fminf(6.0f, fmaxf(-6.0f, src[off + i]      / scale));
+            const float v1 = fminf(6.0f, fmaxf(-6.0f, src[off + i + 16] / scale));
+            dst[1 + i] = (uint8_t) (dsv4_e2m1_index_cpu(v0) | (dsv4_e2m1_index_cpu(v1) << 4));
+        }
+        dst += 17;
+    }
+}
+
+static void dsv4_mxfp4_dequant_row_cpu(float * dst, const void * src, int64_t ne0) {
+    static const float lv[16] = {  0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+    const uint8_t * p = (const uint8_t *) src;
+    for (int64_t off = 0; off < ne0; off += 32) {
+        const float d = ldexpf(1.0f, (int) p[0] - 127);
+        for (int i = 0; i < 16; i++) {
+            dst[off + i]      = lv[p[1 + i] & 0x0F] * d;
+            dst[off + i + 16] = lv[p[1 + i] >>   4] * d;
+        }
+        p += 17;
+    }
+}
+
+void ggml_compute_forward_dsv4_lid_topk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0]; // [d_idx, n_head, nt]
+    const ggml_tensor * k       = dst->src[1]; // [d_idx, 1, n_lid, n_stream]
+    const ggml_tensor * weights = dst->src[2]; // [n_head, nt]
+    const ggml_tensor * mask    = dst->src[3]; // [n_lid, nt/n_stream, 1, n_stream]
+
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    // the packed-MXFP4 branch dequants into a fixed float kd[128] stack row
+    GGML_ASSERT(k->type != GGML_TYPE_MXFP4 || q->ne[0] <= 128);
+
+    const int64_t d_idx    = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_lid    = k->ne[2];
+    const int64_t nt_s     = mask->ne[1];
+    const int64_t n_top_k  = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nrows = n_stream * nt_s;
+
+    std::vector<float>   scores(n_lid);
+    std::vector<int32_t> order(n_lid);
+
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const int64_t s       = r / nt_s;
+        const int64_t t_local = r % nt_s;
+        const int64_t t       = s * nt_s + t_local; // global token (contiguous stream fold)
+
+        const char * q_t = (const char *) q->data       + t*q->nb[2];
+        const char * w_t = (const char *) weights->data + t*weights->nb[1];
+        const char * m_r = (const char *) mask->data     + s*mask->nb[3] + t_local*mask->nb[1];
+
+        for (int64_t j = 0; j < n_lid; j++) {
+            const char * k_j = (const char *) k->data + s*k->nb[3] + j*k->nb[2];
+            float kd[128];
+            const float * k_deq = nullptr; // set when the cache row is packed MXFP4
+            if (k->type == GGML_TYPE_MXFP4) {
+                // packed rows hold QAT values by construction (written via
+                // DSV4_QAT_SET_ROWS) -> dequant is exact, no re-simulation
+                dsv4_mxfp4_dequant_row_cpu(kd, k_j, d_idx);
+                k_deq = kd;
+            }
+            float acc = 0.0f;
+            for (int64_t h = 0; h < n_head; h++) {
+                const float * qh = (const float *)(q_t + h*q->nb[1]);
+                float dot = 0.0f;
+                if (k_deq) {
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * k_deq[d];
+                } else if (k->type == GGML_TYPE_F32) {
+                    const float * kh = (const float *) k_j;
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * kh[d];
+                } else {
+                    const ggml_fp16_t * kh = (const ggml_fp16_t *) k_j;
+                    for (int64_t d = 0; d < d_idx; d++) dot += qh[d] * GGML_FP16_TO_FP32(kh[d]);
+                }
+                const float wh = ((const float *) w_t)[h];
+                acc += (dot > 0.0f ? dot : 0.0f) * wh;
+            }
+            const float mv = ((const float *) m_r)[j];
+            scores[j] = acc + mv;
+            order[j]  = (int32_t) j;
+        }
+
+        // descending by score, lower index on ties (matches CUDA bitonic tie-break)
+        const float * sc = scores.data();
+        std::partial_sort(order.begin(), order.begin() + n_top_k, order.end(),
+            [sc](int32_t a, int32_t b) {
+                const float sa = sc[a], sb = sc[b];
+                return sa > sb || (sa == sb && a < b);
+            });
+
+        int32_t * dst_row = (int32_t *)((char *) dst->data + t_local*dst->nb[1] + s*dst->nb[3]);
+        for (int64_t kk = 0; kk < n_top_k; kk++) {
+            dst_row[kk] = order[kk];
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_lid_union
+
+void ggml_compute_forward_dsv4_lid_union(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+    const ggml_tensor * top_k = dst->src[0]; // [n_top_k, nt_s, 1, n_stream] I32
+
+    const int32_t n_csa = ggml_get_op_params_i32(dst, 0);
+    const int64_t u_max = dst->ne[0];
+    const int64_t n_tiles = dst->ne[1];
+    const int64_t n_top_k = top_k->ne[0];
+    const int64_t nt_s    = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+
+    const int32_t W_p = ggml_get_op_params_i32(dst, 2);
+    const int64_t W = (n_tiles > 1 && W_p > 0) ? W_p : nt_s;
+    GGML_ASSERT((nt_s + W - 1)/W == n_tiles || n_tiles == 1);
+
+    for (int64_t s = 0; s < n_stream; s++) {
+        for (int64_t tile = 0; tile < n_tiles; tile++) {
+            const int64_t t0 = tile*W;
+            const int64_t t1 = t0 + W < nt_s ? t0 + W : nt_s;
+            std::set<int32_t> uni;
+            for (int64_t t = t0; t < t1; t++) {
+                const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+                for (int64_t i = 0; i < n_top_k; i++) {
+                    const int32_t c = tk[i];
+                    if (c >= 0 && c < n_csa) uni.insert(c);
+                }
+            }
+            int32_t * out = (int32_t *)((char *) dst->data + tile*dst->nb[1] + s*dst->nb[3]);
+            int64_t pos = 0;
+            for (int32_t c : uni) { if (pos >= u_max) break; out[pos++] = c; }
+            for (; pos < u_max; pos++) out[pos] = n_csa - 1; // padding (gather-safe)
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_lid_memb
+
+void ggml_compute_forward_dsv4_lid_memb(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+    const ggml_tensor * top_k = dst->src[0]; // [n_top_k, nt_s, 1, n_stream] I32
+    const ggml_tensor * uni   = dst->src[1]; // [u_max, n_tiles, 1, n_stream] I32
+
+    const int32_t n_csa   = ggml_get_op_params_i32(dst, 0);
+    const int64_t u_max   = dst->ne[0];
+    const int64_t nt_s    = dst->ne[1];
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_top_k = top_k->ne[0];
+    const int64_t n_tiles = uni->ne[1];
+
+    const int32_t W_p = ggml_get_op_params_i32(uni, 2);
+    const int64_t W = (n_tiles > 1 && W_p > 0) ? W_p : nt_s;
+
+    for (int64_t s = 0; s < n_stream; s++) {
+        for (int64_t tile = 0; tile < n_tiles; tile++) {
+            const int64_t t0 = tile*W;
+            const int64_t t1 = t0 + W < nt_s ? t0 + W : nt_s;
+            // recompute the tile's union count (distinct in-range cells, capped at u_max)
+            std::set<int32_t> u;
+            for (int64_t t = t0; t < t1; t++) {
+                const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+                for (int64_t i = 0; i < n_top_k; i++) { const int32_t c = tk[i]; if (c >= 0 && c < n_csa) u.insert(c); }
+            }
+            const int64_t cnt = (int64_t) u.size() < u_max ? (int64_t) u.size() : u_max;
+            const int32_t * uidx = (const int32_t *)((const char *) uni->data + tile*uni->nb[1] + s*uni->nb[3]);
+            for (int64_t t = t0; t < t1; t++) {
+                const int32_t * tk = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1] + s*top_k->nb[3]);
+                std::set<int32_t> sel;
+                for (int64_t i = 0; i < n_top_k; i++) { const int32_t c = tk[i]; if (c >= 0 && c < n_csa) sel.insert(c); }
+                float * mrow = (float *)((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
+                for (int64_t uu = 0; uu < u_max; uu++) {
+                    mrow[uu] = (uu < cnt && sel.count(uidx[uu])) ? 0.0f : -INFINITY;
+                }
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_hc_fused
+//
+// CPU reference for the fused DeepSeek-V4 hyper-connection residual mixing.
+// Mirrors the CUDA kernel and the original scalar ggml graph accumulation order.
+// mode 0 (weighted_sum): out[e,t]     = sum_ih x[e,ih,t] * w[ih,t]
+// mode 1 (post):         out[e,dst,t] = x[e,t]*post[dst,t]
+//                                       + sum_src res[e,src,t]*comb[dst,src,t]
+
+void ggml_compute_forward_dsv4_hc_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (mode == 2) {
+        // sinkhorn: softmax along ne0, +eps, norm_cols, then
+        // (iters-1) x (norm_rows, norm_cols). Mirrors the unfused chain
+        // (build_hc_sinkhorn) with serial per-lane sums.
+        const ggml_tensor * comb = dst->src[0]; // [hc, hc, nt]
+        GGML_ASSERT(comb->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int32_t iters = ggml_get_op_params_i32(dst, 1);
+        const float   eps   = ggml_get_op_params_f32(dst, 2);
+        const int64_t hc    = comb->ne[0];
+        const int64_t nt    = comb->ne[2];
+        GGML_ASSERT(hc <= 16);
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            float m[16*16];
+            for (int64_t s = 0; s < hc; ++s) {
+                const float * src = (const float *)((const char *) comb->data + t*comb->nb[2] + s*comb->nb[1]);
+                for (int64_t d = 0; d < hc; ++d) m[d + s*hc] = src[d];
+            }
+            // softmax along d for each s, then +eps per element
+            for (int64_t s = 0; s < hc; ++s) {
+                float mx = -INFINITY;
+                for (int64_t d = 0; d < hc; ++d) mx = m[d + s*hc] > mx ? m[d + s*hc] : mx;
+                float sum = 0.0f;
+                for (int64_t d = 0; d < hc; ++d) { const float e = expf(m[d + s*hc] - mx); m[d + s*hc] = e; sum += e; }
+                for (int64_t d = 0; d < hc; ++d) m[d + s*hc] = m[d + s*hc]/sum + eps;
+            }
+            // norm_cols: m[d,s] /= (sum_s m[d,s] + eps)
+            auto norm_cols = [&]() {
+                for (int64_t d = 0; d < hc; ++d) {
+                    float cs = 0.0f;
+                    for (int64_t s = 0; s < hc; ++s) cs += m[d + s*hc];
+                    cs += eps;
+                    for (int64_t s = 0; s < hc; ++s) m[d + s*hc] /= cs;
+                }
+            };
+            // norm_rows: m[d,s] /= (sum_d m[d,s] + eps)
+            auto norm_rows = [&]() {
+                for (int64_t s = 0; s < hc; ++s) {
+                    float rs = 0.0f;
+                    for (int64_t d = 0; d < hc; ++d) rs += m[d + s*hc];
+                    rs += eps;
+                    for (int64_t d = 0; d < hc; ++d) m[d + s*hc] /= rs;
+                }
+            };
+            norm_cols();
+            for (int32_t i = 1; i < iters; ++i) { norm_rows(); norm_cols(); }
+            for (int64_t s = 0; s < hc; ++s) {
+                float * out = (float *)((char *) dst->data + t*dst->nb[2] + s*dst->nb[1]);
+                for (int64_t d = 0; d < hc; ++d) out[d] = m[d + s*hc];
+            }
+        }
+        return;
+    }
+
+    if (mode == 0) {
+        const ggml_tensor * x = dst->src[0]; // [n_embd, hc, nt]
+        const ggml_tensor * w = dst->src[1]; // [hc, nt]
+
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int64_t n_embd = x->ne[0];
+        const int64_t hc     = x->ne[1];
+        const int64_t nt     = x->ne[2];
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            const float * w_t = (const float *)((const char *) w->data + t*w->nb[1]);
+            float * o_t = (float *)((char *) dst->data + t*dst->nb[1]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float * x_e0 = (const float *)((const char *) x->data + t*x->nb[2]) + e;
+                float acc = x_e0[0] * w_t[0];
+                for (int64_t ih = 1; ih < hc; ++ih) {
+                    acc += *(const float *)((const char *) x->data + t*x->nb[2] + ih*x->nb[1] + e*x->nb[0]) * w_t[ih];
+                }
+                o_t[e] = acc;
+            }
+        }
+    } else {
+        const ggml_tensor * x    = dst->src[0]; // [n_embd, nt]
+        const ggml_tensor * res  = dst->src[1]; // [n_embd, hc, nt]
+        const ggml_tensor * post = dst->src[2]; // [hc, nt]
+        const ggml_tensor * comb = dst->src[3]; // [dst, src, nt]
+
+        GGML_ASSERT(x->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32);
+        GGML_ASSERT(post->type == GGML_TYPE_F32 && comb->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+        const int64_t n_embd = x->ne[0];
+        const int64_t nt     = x->ne[1];
+        const int64_t hc     = res->ne[1];
+
+        for (int64_t t = ith; t < nt; t += nth) {
+            const float * post_t = (const float *)((const char *) post->data + t*post->nb[1]);
+            const float * comb_t = (const float *)((const char *) comb->data + t*comb->nb[2]);
+            const float * x_t    = (const float *)((const char *) x->data    + t*x->nb[1]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const float xv = x_t[e];
+                for (int64_t d = 0; d < hc; ++d) {
+                    float acc = xv * post_t[d];
+                    for (int64_t s = 0; s < hc; ++s) {
+                        const float rv = *(const float *)((const char *) res->data + t*res->nb[2] + s*res->nb[1] + e*res->nb[0]);
+                        acc += rv * comb_t[s*hc + d];
+                    }
+                    *(float *)((char *) dst->data + t*dst->nb[2] + d*dst->nb[1] + e*dst->nb[0]) = acc;
+                }
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_dsv4_qat_set_rows
+//
+// set_rows into an MXFP4 container with the DSV4 QAT rounding (P3b packed
+// lid cache). dst is a view of the container; src0 = f32 rows, src1 = idxs.
+
+void ggml_compute_forward_dsv4_qat_set_rows(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * b = dst->src[0]; // [ne0, n_rows] F32
+    const ggml_tensor * c = dst->src[1]; // [n_rows] I64/I32
+
+    GGML_ASSERT(dst->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->ne[0] % 32 == 0);
+
+    const int64_t ne0    = b->ne[0];
+    const int64_t n_rows = b->ne[1];
+
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t idx = c->type == GGML_TYPE_I64 ?
+                ((const int64_t *) c->data)[r] : (int64_t) ((const int32_t *) c->data)[r];
+        GGML_ASSERT(idx >= 0 && idx < dst->ne[1]);
+        dsv4_qat_pack_row_cpu(
+                (uint8_t *) dst->data + idx*dst->nb[1],
+                (const float *)((const char *) b->data + r*b->nb[1]),
+                ne0);
+    }
+}
+
+// ggml_compute_forward_dsv4_fa_merge
+//
+// merge two flash_attn_ext_with_lse results computed over disjoint KV subsets:
+// out = (ea*a + eb*b) / (ea + eb) per row, ea = exp(lse_a - max(lse_a, lse_b)).
+// srcs are [DV, H, Q, S+1] with the LSE tail at element offset DV*H*Q*S,
+// tail idx = (s*Q + iq)*H + h == the row index; dst is [DV, H, Q, S].
+
+void ggml_compute_forward_dsv4_fa_merge(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(dst));
+
+    const int64_t DV     = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3]; // H*Q*S
+
+    const float * a_data = (const float *) a->data;
+    const float * b_data = (const float *) b->data;
+    const float * lse_a  = a_data + DV*n_rows;
+    const float * lse_b  = b_data + DV*n_rows;
+    float       * d_data = (float *) dst->data;
+
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const float la = lse_a[r];
+        const float lb = lse_b[r];
+        const float m  = MAX(la, lb);
+
+        const float * ar = a_data + r*DV;
+        const float * br = b_data + r*DV;
+        float       * dr = d_data + r*DV;
+
+        if (m == -INFINITY) { // both parts fully masked
+            memset(dr, 0, DV*sizeof(float));
+            continue;
+        }
+
+        const float ea  = expf(la - m);
+        const float eb  = expf(lb - m);
+        const float es  = ea + eb;
+        const float wa  = ea / es;
+        const float wb  = eb / es;
+
+        // a part with lse == -inf (fully masked, weight exactly 0) may carry
+        // NaN/uninitialized values — skip it entirely, never multiply by 0
+        for (int64_t d = 0; d < DV; ++d) {
+            float v = 0.0f;
+            if (wa != 0.0f) { v += wa*ar[d]; }
+            if (wb != 0.0f) { v += wb*br[d]; }
+            dr[d] = v;
+        }
+    }
+}
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {
@@ -8699,6 +9135,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             // permute(0, 2, 1, 3)
             memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+
+            // LSE tail (ggml_flash_attn_ext_with_lse): dst carries one extra
+            // ne3 slice; lse[h, iq, s] = M + log(S) at (s*n_q + iq)*n_head + h
+            if (ggml_flash_attn_ext_has_lse(dst)) {
+                float * lse = (float *) dst->data + (int64_t) ne0*ne1*ne2*neq3;
+                lse[((int64_t) i3*ne2 + i1)*ne1 + i2] = S == 0.0f ? -INFINITY : M + logf(S);
+            }
         }
     }
 }
@@ -9111,8 +9554,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
+    // LSE tail (ggml_flash_attn_ext_with_lse): only the one-chunk full-row
+    // path writes it — force that path so the tail is never silently skipped
+    const bool has_lse = ggml_flash_attn_ext_has_lse(dst);
+
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !has_lse && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9169,7 +9616,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !has_lse && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
