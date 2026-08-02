@@ -7,6 +7,11 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -630,13 +635,91 @@ struct server_prompt_cache_state {
     }
 };
 
+// L2 (on-disk) tier for the prompt cache. Entries evicted from the RAM cache — or too large
+// to ever fit in it (e.g. a 256k-ctx slot state) — are spilled here as files instead of being
+// dropped, so a client that later replays the same token prefix (pi /tree, /fork, a fresh
+// session, or a server restart) resumes from a cached KV state rather than re-prefilling.
+//
+// Design notes:
+//   - A server_prompt reaching the cache already has its state serialized into RAM byte buffers
+//     (prompt_save filled data.main/data.drft via llama_state_seq_get_data_ext). Spilling is
+//     therefore pure file I/O of existing bytes — no llama_context / GPU access — so it runs on a
+//     background writer thread without touching the decode path.
+//   - The in-RAM index keeps only each entry's token vector (~1 MiB at 256k) for prefix matching;
+//     the heavy state blobs live on disk and are streamed in only on a hit.
+//   - Eviction uses a decaying-hit score (ds4_kvstore semantics): (hits+1) * n_tokens / file_size
+//     with a 6h hit half-life, so hot, large, token-dense entries are kept. The hit counters are
+//     persisted in each file's header (rewritten in place on hit) so the decay survives restarts.
+struct server_prompt_disk_cache {
+    // desc: model/ctx compatibility key (mismatched files are ignored). limit_bytes: on-disk budget.
+    server_prompt_disk_cache(std::string dir, std::string compat_desc,
+                             size_t limit_bytes, size_t min_tokens, size_t max_entry_bytes);
+    ~server_prompt_disk_cache();
+
+    // queue an evicted/oversize prompt for asynchronous write to disk (takes ownership).
+    // returns false if the state was not queued (ineligible or an equal/longer prefix is already persisted).
+    bool spill(server_prompt_cache_state && state);
+
+    // try to restore the best on-disk prefix for tokens_new into `prompt`/the contexts.
+    // returns true and moves the loaded state into `prompt` on a hit; false on miss/error.
+    bool load(server_prompt & prompt, const server_tokens & tokens_new,
+              llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+
+    size_t disk_size() const;
+
+    // largest state (bytes) worth diverting straight to disk when it can't fit the RAM cache.
+    size_t entry_cap() const { return max_entry_bytes; }
+
+    // smallest prompt (tokens) worth persisting.
+    size_t min_tokens_to_store() const { return min_tokens; }
+
+private:
+    struct entry {
+        std::string  path;
+        llama_tokens tokens;     // for prefix matching (kept in RAM)
+        size_t       file_size = 0;
+        uint32_t     hits      = 0;
+        int64_t      last_hit_unix = 0;
+    };
+
+    std::string dir;
+    std::string compat_desc;
+    uint64_t    compat_hash = 0;
+    size_t      limit_bytes = 0;
+    size_t      min_tokens  = 0;
+    size_t      max_entry_bytes = 0;
+
+    mutable std::mutex        mtx;      // guards index + writer queue
+    std::vector<entry>        index;
+
+    std::deque<server_prompt_cache_state> write_q;
+    std::condition_variable   cv;
+    std::thread               writer;
+    std::atomic<bool>         stop { false };
+
+    void        scan_existing();       // startup: rebuild index from files on disk
+    void        writer_loop();         // background: drain write_q to disk
+    bool        write_entry(const server_prompt_cache_state & p); // serialize one prompt -> file (writer thread)
+    // drop lowest-score files until bytes_incoming more fit under limit_bytes (mtx held).
+    // called with the exact entry size BEFORE a write lands, so the budget is never overshot.
+    void        evict_locked(size_t bytes_incoming = 0);
+    double      score(const entry & e, int64_t now_unix) const;
+    std::string path_for(const llama_tokens & toks) const;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
 
+    // spills the surviving RAM tier to the disk tier (if enabled) so it outlives the process.
+    ~server_prompt_cache();
+
     std::list<server_prompt_cache_state> states;
+
+    // optional L2 on-disk tier (nullptr = disabled)
+    std::unique_ptr<server_prompt_disk_cache> disk;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -653,6 +736,10 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    // demote an entry leaving the RAM cache to the disk tier (if enabled), else drop it.
+    void evict_front();
 };
 
 // used exclusively by router mode
