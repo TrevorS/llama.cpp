@@ -323,6 +323,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_CLASSIFIER_OUTPUT_LABELS, "%s.classifier.output_labels" },
 
     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
+    { LLM_KV_DSPARK_BLOCK_SIZE,     "%s.dspark.block_size"     },
+    { LLM_KV_DSPARK_NOISE_TOKEN_ID, "%s.dspark.noise_token_id" },
+    { LLM_KV_DSPARK_MARKOV_RANK,    "%s.dspark.markov_rank"    },
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
