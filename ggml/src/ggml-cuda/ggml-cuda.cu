@@ -10,6 +10,8 @@
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
+#include "ggml-cuda/dsv4_lid_topk.cuh"
+#include "ggml-cuda/dsv4_hc_fused.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
@@ -88,7 +90,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
+
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -365,9 +373,31 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
+        //
+        // GGML_CUDA_SCHED=spin|yield|blocking overrides it. cc121 is GB10 (DGX Spark),
+        // where the CPU and GPU share one package and one thermal budget: a host thread
+        // busy-waiting in cudaStreamSynchronize pegs a core at up to 3.9 GHz producing
+        // pure heat, and that heat comes out of the GPU's headroom. On a discrete GPU
+        // the spare core is free; here it is not. Default is unchanged (spin) so this is
+        // opt-in until the latency/thermal trade is measured on real workloads.
         if (prop.major == 12 && prop.minor == 1) {
+            unsigned int sched_flag = cudaDeviceScheduleSpin;
+            const char * sched_env  = getenv("GGML_CUDA_SCHED");
+            if (sched_env != nullptr) {
+                if (strcmp(sched_env, "blocking") == 0) {
+                    sched_flag = cudaDeviceScheduleBlockingSync;
+                } else if (strcmp(sched_env, "yield") == 0) {
+                    sched_flag = cudaDeviceScheduleYield;
+                } else if (strcmp(sched_env, "spin") != 0) {
+                    GGML_LOG_WARN("%s: unknown GGML_CUDA_SCHED='%s', using spin\n", __func__, sched_env);
+                    sched_env = nullptr;
+                }
+                if (sched_env != nullptr) {
+                    GGML_LOG_INFO("%s: GGML_CUDA_SCHED=%s\n", __func__, sched_env);
+                }
+            }
             CUDA_CHECK(cudaSetDevice(physical_id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            CUDA_CHECK(cudaSetDeviceFlags(sched_flag));
         }
 
 #endif  // defined(GGML_USE_HIP)
@@ -703,6 +733,13 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#ifdef USE_CUDA_GRAPH
+    if (cuda_graphs_hwm > 0) {
+        GGML_LOG_INFO("%s: cuda graph cache high-water %zu entries (at exit: %zu)\n",
+                __func__, cuda_graphs_hwm, cuda_graphs.size());
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2358,6 +2395,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
+        case GGML_OP_DSV4_LID_TOPK:
+            ggml_cuda_op_dsv4_lid_topk(ctx, dst);
+            break;
+        case GGML_OP_DSV4_LID_UNION:
+            ggml_cuda_op_dsv4_lid_union(ctx, dst);
+            break;
+        case GGML_OP_DSV4_LID_MEMB:
+            ggml_cuda_op_dsv4_lid_memb(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_FUSED:
+            ggml_cuda_op_dsv4_hc_fused(ctx, dst);
+            break;
+        case GGML_OP_DSV4_QAT_SET_ROWS:
+            ggml_cuda_op_dsv4_qat_set_rows(ctx, dst);
+            break;
+        case GGML_OP_DSV4_FA_MERGE:
+            ggml_cuda_op_dsv4_fa_merge(ctx, dst);
+            break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
@@ -2583,7 +2638,27 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Fold a shape signature into the cache key so graphs that alternate shapes on the same
+    // first-node address (MTP draft: ingest batch=accepted+1 vs generate batch=1) land on
+    // distinct cache slots instead of re-capturing every alternation. GGML_CUDA_GRAPH_SHAPE_KEY=0
+    // reverts to the raw nodes[0] key. The key is only ever used as a map key, never dereferenced.
+    // Stale-replay safety is unchanged: the per-slot property scan still guards capture.
+    // Default ON since 2026-07-27 (all gates passed). See experiments/ds4-tile/FLAGS.md.
+    static const bool shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") == nullptr ||
+                                  atoi(getenv("GGML_CUDA_GRAPH_SHAPE_KEY")) != 0;
+    if (!shape_key) {
+        return cgraph->nodes[0];
+    }
+    uint64_t h = (uint64_t)(uintptr_t)cgraph->nodes[0];
+    h ^= (uint64_t)cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        h = (h ^ (uint64_t)node->op) * 0x100000001B3ull;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = (h ^ (uint64_t)node->ne[d]) * 0x100000001B3ull;
+        }
+    }
+    return (const void *)(uintptr_t)h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2592,6 +2667,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // GGML_CUDA_GRAPH_DEBUG=1: per-slot churn diagnostics (which slot resets, which node property moved)
+    static const bool graph_debug = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -2599,14 +2677,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         return false;
     }
 
+    const uint64_t uid_prev = graph->uid;
     graph->uid = cgraph->uid;
 
     // Check if the graph size has changed
+    bool size_changed = false;
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (graph_debug) {
+            GGML_LOG_INFO("GRAPH_DEBUG ctx=%p key=%p uid %zu->%zu n_nodes %zu->%d SIZE_CHANGED\n",
+                (void *)cuda_ctx, graph_key, uid_prev, cgraph->uid, graph->node_props.size(), cgraph->n_nodes);
+        }
         res = true;
+        size_changed = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    int n_diff_logged = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -2619,10 +2705,45 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        const bool node_diff = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
+
+        if (graph_debug && !size_changed && node_diff && n_diff_logged < 6) {
+            const ggml_cuda_graph::node_properties & old_p = graph->node_props[i];
+            const char * kind = "other";
+            if (old_p.node.op != prop.node.op) {
+                kind = "op";
+            } else if (memcmp(old_p.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0) {
+                kind = "ne";
+            } else if (memcmp(old_p.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0) {
+                kind = "nb";
+            } else if (old_p.node.data != prop.node.data) {
+                kind = "data_ptr";
+            } else if (memcmp(old_p.node.src, prop.node.src, sizeof(prop.node.src)) != 0) {
+                kind = "src_tensor_ptrs";
+            } else if (memcmp(old_p.node.op_params, prop.node.op_params, sizeof(prop.node.op_params)) != 0) {
+                kind = "op_params";
+            } else if (memcmp(old_p.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0) {
+                kind = "src_data_ptrs";
+            } else if (memcmp(old_p.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0) {
+                kind = "src_ne";
+            } else if (memcmp(old_p.node_src_nb, prop.node_src_nb, sizeof(prop.node_src_nb)) != 0) {
+                kind = "src_nb";
+            }
+            GGML_LOG_INFO("GRAPH_DEBUG ctx=%p key=%p uid %zu->%zu node[%d] %s (%s) DIFF %s\n",
+                (void *)cuda_ctx, graph_key, uid_prev, cgraph->uid,
+                i, ggml_op_desc(cgraph->nodes[i]), cgraph->nodes[i]->name, kind);
+            n_diff_logged++;
+        }
+
+        if (res || node_diff) {
             graph->node_props[i] = prop;
             res = true;
         }
+    }
+
+    if (graph_debug && !res) {
+        GGML_LOG_INFO("GRAPH_DEBUG ctx=%p key=%p uid %zu->%zu n_nodes %d PROPS_EQUAL (silent reuse path)\n",
+            (void *)cuda_ctx, graph_key, uid_prev, cgraph->uid, cgraph->n_nodes);
     }
 
     return res;
@@ -2829,6 +2950,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         } else if (unary_op == GGML_UNARY_OP_SOFTPLUS && node_idx + 1 < n_nodes &&
                    nodes[node_idx + 1]->op == GGML_OP_SQRT && nodes[node_idx + 1]->src[0] == nodes[node_idx]) {
             // sqrt(softplus(x)) scoring (DeepSeek-V4)
+            // LLAMA_DSV4_MOE_GATE_FUSE=0 keeps the unfused gate chain (bisect lever, see experiments/ds4-tile/FLAGS.md)
+            static const bool dsv4_gate_fuse = getenv("LLAMA_DSV4_MOE_GATE_FUSE") == nullptr ||
+                                               std::atoi(getenv("LLAMA_DSV4_MOE_GATE_FUSE")) != 0;
+            if (!dsv4_gate_fuse) {
+                return false;
+            }
             args.sqrt_softplus = true;
             node_idx++;
         } else {
@@ -4020,6 +4147,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static void ggml_cuda_power_chunk_node(ggml_backend_cuda_context * cuda_ctx);
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4170,6 +4299,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     i += nodes_to_skip;
+                    if (!use_cuda_graph && !is_concurrent_event_active) {
+                        ggml_cuda_power_chunk_node(cuda_ctx);
+                    }
                     continue;
                 }
 #ifndef NDEBUG
@@ -4194,6 +4326,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (!use_cuda_graph && !is_concurrent_event_active) {
+                    ggml_cuda_power_chunk_node(cuda_ctx);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4255,10 +4391,354 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// ==================== duty-cycle power throttle (GGML_CUDA_POWER) ====================
+// Idles the GPU between graph computes so sustained board power stays below the
+// platform firmware's power cap. On GB10 (DGX Spark) sustained deep-context prefill
+// engages the firmware "SW Power Cap" state, which can fail to clear and hard-wedge
+// the box; a duty cycle below 100% keeps it from engaging at all (same idea as
+// antirez/ds4 --power N, where 85% measured faster than 100% under sustained load).
+//
+//   GGML_CUDA_POWER=N        fixed duty cycle, N in [1,99] = percent GPU-busy
+//   GGML_CUDA_POWER_ADAPT=1  closed loop: full speed until NVML reports a
+//                            power/thermal throttle reason, then drop to
+//                            GGML_CUDA_POWER_MIN (default 60) until the reason
+//                            has stayed clear for 10s (Linux only, dlopen NVML)
+//
+// Work intervals are measured with a cudaEvent pair around each graph compute; the
+// compensating sleep happens before the NEXT submit, when the previous compute has
+// already been drained by the caller's own output sync — no synchronization is added.
+
+// ring of in-flight event pairs + a sleep-debt accumulator: measurement never
+// stalls on one unresolved pair (deep pipelining just delays payment by a
+// compute or two, irrelevant at thermal time constants), and the duty tax is
+// exact in aggregate: every measured span eventually gets paid.
+struct ggml_cuda_power_dev {
+    static constexpr int RING = 8;
+    cudaEvent_t ev_start[RING] = {};
+    cudaEvent_t ev_stop [RING] = {};
+    int  head    = 0;     // next slot to record
+    int  tail    = 0;     // oldest in-flight slot
+    int  count   = 0;     // in-flight pairs
+    bool started = false; // start recorded at head, stop not yet
+    double debt_ms = 0.0; // measured-but-unpaid sleep
+    // GGML_CUDA_POWER_DEBUG=1 telemetry
+    uint64_t n_pre     = 0; // pre-hook calls (graph computes)
+    uint64_t n_meas    = 0; // event pairs consumed
+    uint64_t n_full    = 0; // pre-hooks where the ring was full (span unmeasured)
+    double   meas_ms   = 0.0;
+    double   sleep_ms  = 0.0;
+    // GGML_CUDA_POWER_GRANULARITY=layer[N]: chunked pacing state (direct-exec path only)
+    cudaEvent_t chunk_start = nullptr;
+    cudaEvent_t chunk_stop  = nullptr;
+    bool     chunk_started = false;
+    bool     chunk_paced   = false; // this compute was chunk-paced -> skip the whole-graph pair
+    int      chunk_n_nodes = 0;
+    uint64_t n_chunks      = 0;
+    double   chunk_meas_ms  = 0.0;
+    double   chunk_sleep_ms = 0.0;
+};
+
+struct ggml_cuda_power_state {
+    bool enabled  = false;
+    bool adapt    = false;
+    int  base_pct = 100;
+    int  min_pct  = 60;
+    int  chunk_nodes = 0; // 0 = per-graph pacing (default); >0 = pace every N launched nodes in direct-exec
+    std::atomic<int>  cur_pct{100};
+    std::atomic<bool> stop_poller{false};
+    std::thread poller;
+    ggml_cuda_power_dev dev[GGML_CUDA_MAX_DEVICES];
+
+    ~ggml_cuda_power_state() {
+        if (poller.joinable()) {
+            stop_poller.store(true, std::memory_order_relaxed);
+            poller.join();
+        }
+        static const bool dbg = []() {
+            const char * e = getenv("GGML_CUDA_POWER_DEBUG");
+            return e && e[0] == '1';
+        }();
+        // deliberately raw fprintf (not GGML_LOG_*): the [cuda-power] telemetry
+        // is gated by GGML_CUDA_POWER_DEBUG alone and must print regardless of
+        // the ggml log level, and stderr is unbuffered so the in-run trail
+        // (dbg2 path below) survives a hard box power-cap wedge.
+        if (dbg) {
+            for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
+                if (dev[i].n_pre == 0) {
+                    continue;
+                }
+                const double duty = dev[i].meas_ms + dev[i].sleep_ms > 0.0
+                    ? dev[i].meas_ms / (dev[i].meas_ms + dev[i].sleep_ms) : 1.0;
+                fprintf(stderr, "[cuda-power] dev%d: computes=%llu measured=%llu ring-full=%llu "
+                        "meas=%.0fms slept=%.0fms residual-debt=%.0fms effective-duty=%.1f%%\n",
+                        i, (unsigned long long) dev[i].n_pre, (unsigned long long) dev[i].n_meas,
+                        (unsigned long long) dev[i].n_full, dev[i].meas_ms, dev[i].sleep_ms,
+                        dev[i].debt_ms, 100.0*duty);
+                if (dev[i].n_chunks > 0) {
+                    const double cduty = dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms > 0.0
+                        ? dev[i].chunk_meas_ms / (dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms) : 1.0;
+                    fprintf(stderr, "[cuda-power] dev%d: chunks=%llu chunk-meas=%.0fms chunk-slept=%.0fms "
+                            "chunk-duty=%.1f%%\n",
+                            i, (unsigned long long) dev[i].n_chunks, dev[i].chunk_meas_ms,
+                            dev[i].chunk_sleep_ms, 100.0*cduty);
+                }
+            }
+        }
+    }
+};
+
+#ifdef __linux__
+static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
+    typedef int (*nvml_init_t)(void);
+    typedef int (*nvml_handle_t)(unsigned int, void **);
+    typedef int (*nvml_reasons_t)(void *, unsigned long long *);
+    struct nvml_utilization { unsigned int gpu; unsigned int memory; };
+    typedef int (*nvml_util_t)(void *, nvml_utilization *);
+
+    void * lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) {
+        lib = dlopen("libnvidia-ml.so", RTLD_NOW);
+    }
+    if (lib == nullptr) {
+        GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT: libnvidia-ml not found, adaptive governor disabled\n");
+        return;
+    }
+    nvml_init_t    p_init    = (nvml_init_t)    dlsym(lib, "nvmlInit_v2");
+    nvml_handle_t  p_handle  = (nvml_handle_t)  dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
+    nvml_reasons_t p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksEventReasons");
+    if (p_reasons == nullptr) {
+        p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksThrottleReasons");
+    }
+    nvml_util_t p_util = (nvml_util_t) dlsym(lib, "nvmlDeviceGetUtilizationRates");
+    void * handle = nullptr;
+    if (p_init == nullptr || p_handle == nullptr || p_reasons == nullptr ||
+        p_init() != 0 || p_handle(0, &handle) != 0) {
+        GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT: NVML init failed, adaptive governor disabled\n");
+        return;
+    }
+
+    // Hard distress bits count unconditionally: SwThermalSlowdown (0x20) |
+    // HwThermalSlowdown (0x40) | HwPowerBrakeSlowdown (0x80).
+    // SwPowerCap (0x4) is benign at idle on GB10 (normal power management parks clocks at
+    // 208 MHz with the bit set; it clears under healthy load — measured 2026-07-15), so it
+    // only counts as distress while GPU utilization is simultaneously high.
+    const unsigned long long distress_hard = 0xE0ull;
+    const unsigned long long sw_power_cap  = 0x04ull;
+    const auto poll_period  = std::chrono::milliseconds(500);
+    const auto clear_period = std::chrono::seconds(10);
+
+    bool engaged = false;
+    auto last_set = std::chrono::steady_clock::now();
+
+    while (!ps->stop_poller.load(std::memory_order_relaxed)) {
+        unsigned long long reasons = 0;
+        if (p_reasons(handle, &reasons) == 0) {
+            bool distress = (reasons & distress_hard) != 0;
+            if (!distress && (reasons & sw_power_cap) != 0 && p_util != nullptr) {
+                nvml_utilization util = {0, 0};
+                if (p_util(handle, &util) == 0 && util.gpu >= 50) {
+                    distress = true; // capped while working, not capped while idle
+                }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (distress) {
+                last_set = now;
+                if (!engaged) {
+                    engaged = true;
+                    ps->cur_pct.store(ps->min_pct, std::memory_order_relaxed);
+                    GGML_LOG_WARN("ggml_cuda: power throttle reason engaged (0x%llx) -> duty %d%%\n",
+                                  reasons, ps->min_pct);
+                }
+            } else if (engaged && now - last_set > clear_period) {
+                engaged = false;
+                ps->cur_pct.store(ps->base_pct, std::memory_order_relaxed);
+                GGML_LOG_WARN("ggml_cuda: power throttle reason cleared -> duty %d%%\n", ps->base_pct);
+            }
+        }
+        std::this_thread::sleep_for(poll_period);
+    }
+}
+#endif // __linux__
+
+static ggml_cuda_power_state & ggml_cuda_power(void) {
+    static ggml_cuda_power_state ps;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const char * env = getenv("GGML_CUDA_POWER");
+        if (env != nullptr) {
+            const int v = atoi(env);
+            if (v >= 1 && v <= 100) {
+                ps.base_pct = v;
+            }
+        }
+        const char * env_min = getenv("GGML_CUDA_POWER_MIN");
+        if (env_min != nullptr) {
+            const int v = atoi(env_min);
+            if (v >= 1 && v <= 99) {
+                ps.min_pct = v;
+            }
+        }
+        const char * env_adapt = getenv("GGML_CUDA_POWER_ADAPT");
+        ps.adapt   = env_adapt != nullptr && env_adapt[0] == '1';
+        ps.enabled = ps.base_pct < 100 || ps.adapt;
+        if (!ps.enabled) {
+            return;
+        }
+        // GGML_CUDA_POWER_GRANULARITY: "graph" (default) pays the duty tax between graph
+        // submits; "layer" (=96 nodes) or "layerN" paces every N launched nodes on the
+        // direct-exec path, shortening the sustained-draw window the firmware latch sees.
+        // Replayed CUDA graphs (decode) are unaffected - they cannot be paced mid-graph.
+        const char * env_gran = getenv("GGML_CUDA_POWER_GRANULARITY");
+        if (env_gran != nullptr && strncmp(env_gran, "layer", 5) == 0) {
+            const int n = atoi(env_gran + 5);
+            ps.chunk_nodes = n >= 8 && n <= 4096 ? n : 96;
+        }
+        ps.cur_pct.store(ps.base_pct, std::memory_order_relaxed);
+        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s\n",
+                      ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct,
+                      ps.chunk_nodes > 0 ? "layer" : "graph");
+#ifdef __linux__
+        if (ps.adapt) {
+            ps.poller = std::thread(ggml_cuda_power_poller, &ps);
+        }
+#else
+        if (ps.adapt) {
+            GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_ADAPT is Linux-only, ignored\n");
+        }
+#endif
+    });
+    return ps;
+}
+
+// GGML_CUDA_POWER_GRANULARITY=layer[N]: called after each launched node on the direct-exec
+// path. Every chunk_nodes launches: sync the chunk span, sleep the duty complement, restart.
+// The sync is deliberate - it is what turns submission-side pacing into a real GPU idle gap.
+// Never called while capturing (sync illegal) or inside a concurrent multi-stream region.
+static void ggml_cuda_power_chunk_node(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled || ps.chunk_nodes <= 0) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    if (d.chunk_start == nullptr) {
+        CUDA_CHECK(cudaEventCreate(&d.chunk_start));
+        CUDA_CHECK(cudaEventCreate(&d.chunk_stop));
+    }
+    if (!d.chunk_started) {
+        CUDA_CHECK(cudaEventRecord(d.chunk_start, cuda_ctx->stream()));
+        d.chunk_started = true;
+        d.chunk_n_nodes = 0;
+        return;
+    }
+    if (++d.chunk_n_nodes < ps.chunk_nodes) {
+        return;
+    }
+    const int pct = ps.cur_pct.load(std::memory_order_relaxed);
+    if (pct >= 1 && pct <= 99) {
+        CUDA_CHECK(cudaEventRecord(d.chunk_stop, cuda_ctx->stream()));
+        CUDA_CHECK(cudaEventSynchronize(d.chunk_stop));
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, d.chunk_start, d.chunk_stop) == cudaSuccess && ms > 0.05f) {
+            const double pay = std::min((double) ms * (100 - pct) / pct, 5000.0);
+            std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(pay * 1000.0)));
+            d.n_chunks++;
+            d.chunk_meas_ms  += ms;
+            d.chunk_sleep_ms += pay;
+            d.chunk_paced     = true;
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(d.chunk_start, cuda_ctx->stream()));
+    d.chunk_n_nodes = 0;
+}
+
+static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    d.n_pre++;
+    d.chunk_started = false;
+    d.chunk_paced   = false;
+    if (d.ev_start[0] == nullptr) {
+        for (int i = 0; i < ggml_cuda_power_dev::RING; i++) {
+            CUDA_CHECK(cudaEventCreate(&d.ev_start[i]));
+            CUDA_CHECK(cudaEventCreate(&d.ev_stop[i]));
+        }
+    }
+    // drain every resolved pair from the tail into the debt accumulator
+    while (d.count > 0 && cudaEventQuery(d.ev_stop[d.tail]) == cudaSuccess) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, d.ev_start[d.tail], d.ev_stop[d.tail]) == cudaSuccess && ms > 0.05f) {
+            const int pct = ps.cur_pct.load(std::memory_order_relaxed);
+            if (pct >= 1 && pct <= 99) {
+                d.debt_ms += (double) ms * (100 - pct) / pct;
+            }
+            d.n_meas++;
+            d.meas_ms += ms;
+        }
+        d.tail = (d.tail + 1) % ggml_cuda_power_dev::RING;
+        d.count--;
+    }
+    (void) cudaGetLastError(); // clear cudaErrorNotReady from the probe
+    // pay accumulated debt before submitting new work (capped per stop so a
+    // huge span cannot stall the loop; the residue carries to the next call)
+    if (d.debt_ms > 0.05) {
+        const double pay = std::min(d.debt_ms, 5000.0);
+        std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(pay * 1000.0)));
+        d.sleep_ms += pay;
+        d.debt_ms  -= pay;
+    }
+    // GGML_CUDA_POWER_DEBUG=2: periodic in-run telemetry, flushed per line so
+    // a hard box wedge still leaves the trail in the log
+    static const bool dbg2 = []() {
+        const char * e = getenv("GGML_CUDA_POWER_DEBUG");
+        return e && e[0] == '2';
+    }();
+    if (dbg2 && d.n_pre % 16 == 0) {
+        fprintf(stderr, "[cuda-power] t=%llu computes=%llu measured=%llu ring-full=%llu "
+                "meas=%.0fms slept=%.0fms debt=%.0fms\n",
+                (unsigned long long) (std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count() % 100000),
+                (unsigned long long) d.n_pre, (unsigned long long) d.n_meas,
+                (unsigned long long) d.n_full, d.meas_ms, d.sleep_ms, d.debt_ms);
+        fflush(stderr);
+    }
+    if (d.count < ggml_cuda_power_dev::RING && !d.started) {
+        CUDA_CHECK(cudaEventRecord(d.ev_start[d.head], cuda_ctx->stream()));
+        d.started = true;
+    } else if (d.count >= ggml_cuda_power_dev::RING) {
+        d.n_full++;
+    }
+}
+
+static void ggml_cuda_power_post_compute(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_power_state & ps = ggml_cuda_power();
+    if (!ps.enabled) {
+        return;
+    }
+    ggml_cuda_power_dev & d = ps.dev[cuda_ctx->device];
+    if (d.started) {
+        if (d.chunk_paced) {
+            // chunk pacing already settled this compute inline, and the whole-graph span
+            // now contains the chunk sleeps - recording it would double-tax the duty.
+            // Drop the pending pair; the start slot is simply re-recorded next compute.
+            d.started = false;
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(d.ev_stop[d.head], cuda_ctx->stream()));
+        d.head = (d.head + 1) % ggml_cuda_power_dev::RING;
+        d.count++;
+        d.started = false;
+    }
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_power_pre_compute(cuda_ctx);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4279,7 +4759,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete (ctx=%p key=%p uid=%zu n_nodes=%d)\n",
+                        __func__, (void *)cuda_ctx, graph_key, cgraph->uid, cgraph->n_nodes);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
@@ -4289,7 +4770,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset (ctx=%p key=%p uid=%zu n_nodes=%d)\n",
+                        __func__, (void *)cuda_ctx, graph_key, cgraph->uid, cgraph->n_nodes);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
@@ -4310,6 +4792,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_power_post_compute(cuda_ctx);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5284,6 +5768,48 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif
+        case GGML_OP_DSV4_LID_TOPK: {
+            const int64_t top_k = op->ne[0];
+            const int64_t n_lid = op->src[1]->ne[2];
+            // The multi-chunk merge path (n_lid > SORT_N) needs merge_group =
+            // SORT_N/top_k >= 2; the single-chunk path has no such constraint.
+            const bool merge_ok = n_lid <= (int64_t) DSV4_TOPK_SORT_N ||
+                                  top_k <= (int64_t) DSV4_TOPK_SORT_N / 2;
+            return (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 ||
+                    (op->src[1]->type == GGML_TYPE_MXFP4 && op->src[0]->ne[0] % 32 == 0)) &&
+                   top_k <= (int64_t) DSV4_TOPK_SORT_N && merge_ok;
+        }
+        case GGML_OP_DSV4_LID_UNION:
+            return op->type == GGML_TYPE_I32 && op->src[0]->type == GGML_TYPE_I32;
+        case GGML_OP_DSV4_LID_MEMB:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_I32 &&
+                   op->src[1]->type == GGML_TYPE_I32;
+        case GGML_OP_DSV4_QAT_SET_ROWS:
+            return op->type == GGML_TYPE_MXFP4 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
+                   op->src[0]->ne[0] % 32 == 0 && op->src[0]->ne[0] <= 1024;
+        case GGML_OP_DSV4_FA_MERGE:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32;
+            return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_I32;
+        case GGML_OP_DSV4_HC_FUSED: {
+            // the CUDA kernels bound hc <= GGML_DSV4_HC_MAX; hc lives in a
+            // different dim per mode. Reject over-cap hc so the scheduler can
+            // fall back to the CPU reference (which handles hc up to 16).
+            const int mode = ggml_get_op_params_i32(op, 0);
+            const int64_t hc = mode == GGML_DSV4_HC_MODE_SINKHORN     ? op->src[0]->ne[0] :
+                               mode == GGML_DSV4_HC_MODE_WEIGHTED_SUM ? op->src[0]->ne[1] :
+                                                                        op->src[1]->ne[1]; // POST
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1] == nullptr /* mode 2 = sinkhorn */ || op->src[1]->type == GGML_TYPE_F32) &&
+                   hc <= GGML_DSV4_HC_MAX;
+        }
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
