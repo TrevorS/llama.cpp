@@ -19,11 +19,25 @@ static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;   // v2: partial save now includes base + block caches
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
+// v2 carries a used-row count instead of always spanning the whole cache, and
+// the lid cache may be a packed MXFP4 container (LLAMA_DSV4_LID_CACHE_MXFP4).
+// The container change alters row byte counts versus f16/f32 snapshots and the
+// reader can't tell the two apart, so v1 states are rejected outright rather
+// than reinterpreted.
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+
+bool llama_dsv4_lid_cache_mxfp4() {
+    static const bool on = []() {
+        const char * e = getenv("LLAMA_DSV4_LID_CACHE_MXFP4");
+        const char * f = getenv("LLAMA_DSV4_FUSED_LID");
+        return (!e || e[0] != '0') && !(f && f[0] == '0');
+    }();
+    return on;
+}
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
@@ -378,15 +392,13 @@ static void dsv4_state_read_k_cache(
     io.read(&ns,          sizeof(ns));
     io.read(&n_layer_ref, sizeof(n_layer_ref));
 
-    if (version != 1 && version != DSV4_K_CACHE_STATE_VER) {
+    // no v1 compat: a v1 lid snapshot is f16/f32 rows, which the MXFP4 container
+    // would silently reinterpret byte-for-byte (see DSV4_K_CACHE_STATE_VER)
+    if (version != DSV4_K_CACHE_STATE_VER) {
         throw std::runtime_error("DSV4 K-cache state version mismatch");
     }
 
     const uint32_t kv_size = kv->get_size();
-    if (version == 1 && n_rows_ref != kv_size) {
-        LLAMA_LOG_INFO("kv size ref %d kv %d\n", n_rows_ref, kv_size);
-        throw std::runtime_error("DSV4 K-cache state size mismatch");
-    }
     if (n_rows_ref > kv_size) {
         LLAMA_LOG_INFO("kv rows ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
@@ -920,7 +932,8 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                // kv + score + per-stream views (2u*(1+n_stream))
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream))*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -968,6 +981,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         ggml_format_name(kv,    "dsv4_%s_state_kv_l%d",    name, il);
         ggml_format_name(score, "dsv4_%s_state_score_l%d", name, il);
 
+        // upstream: per-stream views of the live state cache (reduced graph splits)
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
 
@@ -1302,11 +1316,17 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
-    LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
+    // Packed MXFP4 lid container (P3b, default ON since 2026-07-17; =0 disables):
+    // rows hold official QAT values in 68 B (d=128) instead of 256 B f16 —
+    // written via GGML_OP_DSV4_QAT_SET_ROWS, staged-dequant on read. Only the lid
+    // sub-cache decouples from type_k; raw/csa/hca keep the shared type.
+    const ggml_type type_lid = llama_dsv4_lid_cache_mxfp4() ? GGML_TYPE_MXFP4 : type_k;
+
+    LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells, type = %s\n",
+            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO), ggml_type_name(type_lid));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            model, hparams_lid, type_lid, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1479,11 +1499,17 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         }
 
         if (n_rs_seq == 0) {
+            LLAMA_LOG_DEBUG("%s: seq %d p0=%d rejected: rollback ring disabled (n_rs_seq=0)\n",
+                    __func__, seq_id, p0);
             return false;
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+            // caller must fall back to a checkpoint restore: the ring only holds
+            // n_rs_seq snapshot planes of the compressor state
+            LLAMA_LOG_DEBUG("%s: seq %d p0=%d rejected: rollback %d out of ring depth %u (pos_max=%d)\n",
+                    __func__, seq_id, p0, rollback, n_rs_seq, pos_max);
             return false;
         }
 
@@ -1602,23 +1628,26 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    // DSV4 base + block caches aren't recomputable from a partial re-decode, so save them even in partial mode.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
-        const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
+    kv_raw->state_write(io, seq_id, raw_flags);
 
-        //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
-        const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
-        const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
-        const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+    // The block caches are written in partial mode too (see raw_flags above),
+    // but only over their used rows — upstream's snapshot-size optimization.
+    const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
-    }
+    //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
+    const uint32_t n_rows_csa = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+    const uint32_t n_rows_hca = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+    const uint32_t n_rows_lid = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+
+    dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
+    dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
+    dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
     hca_state->state_write(io, seq_id, flags, rs_idx);
@@ -1650,20 +1679,38 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    // Mirror state_write. A failure mid-way (e.g. comp state_size mismatch when
+    // the source context had a different n_ctx) must not leave the cache
+    // half-restored: kv_raw succeeds first and would keep the restored cells,
+    // making every subsequent decode fail to find a KV slot. Roll back the
+    // sequence before rethrowing so callers can fall back to a re-decode.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
-        clear_compressed(seq_id, true);
+    try {
+        kv_raw->state_read(io, seq_id, raw_flags);
+
+        // drop stale rows first so a shorter snapshot can't inherit leftovers
+        kv_csa->clear(true);
+        kv_hca->clear(true);
+        kv_lid->clear(true);
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (seq_id < 0 || !seq_rm(seq_id, -1, -1)) {
+            clear(true);
+        }
+        throw;
     }
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
-
+    // the restored state is a plane-0 snapshot, so any pending rollback index
+    // no longer refers to anything - reset it or the next compressor read would
+    // gather from a stale ring plane
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         rs_idx[seq_id] = 0;
@@ -1981,6 +2028,10 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_qat(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

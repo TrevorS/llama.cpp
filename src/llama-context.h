@@ -90,6 +90,7 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -304,6 +305,11 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    // MTP fused chained-draft export: [K] token ids as floats,
+
+    // DSpark in-graph chained-draft export: [2K] floats, interleaved
+    // (token id, confidence logit) per block position. Populated per decode when
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -350,6 +356,8 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+
+
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
