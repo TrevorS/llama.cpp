@@ -234,6 +234,42 @@ def test_apply_chat_template():
     assert res.body["prompt"] == "<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>You are a test.<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi there<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
 
 
+# A template that simply echoes whatever reasoning_effort it was handed, so the test
+# asserts on the plumbing rather than on any particular model's prompt wording.
+EFFORT_ECHO_TEMPLATE = (
+    "{%- if reasoning_effort is defined and reasoning_effort -%}"
+    "EFFORT={{ reasoning_effort }};"
+    "{%- else -%}"
+    "EFFORT=unset;"
+    "{%- endif -%}"
+    "{%- for m in messages -%}{{ m['role'] }}:{{ m['content'] }};{%- endfor -%}"
+)
+
+
+@pytest.mark.parametrize("effort,kwargs,expect", [
+    ("high",   None,                          "EFFORT=high;"),   # OAI field reaches the template
+    ("max",    None,                          "EFFORT=max;"),
+    (None,     None,                          "EFFORT=unset;"),  # absent stays absent
+    ("none",   None,                          "EFFORT=unset;"),  # "none" means no-thinking, not a level
+    ("high",   {"reasoning_effort": "low"},   "EFFORT=low;"),    # explicit kwarg wins
+])
+def test_reasoning_effort_reaches_chat_template(tmp_path, effort, kwargs, expect):
+    global server
+    tmpl = tmp_path / "effort_echo.jinja"
+    tmpl.write_text(EFFORT_ECHO_TEMPLATE)
+    server.jinja = True
+    server.chat_template_file = str(tmpl)
+    server.start()
+    data = {"messages": [{"role": "user", "content": "Hi"}]}
+    if effort is not None:
+        data["reasoning_effort"] = effort
+    if kwargs is not None:
+        data["chat_template_kwargs"] = kwargs
+    res = server.make_request("POST", "/apply-template", data=data)
+    assert res.status_code == 200
+    assert expect in res.body["prompt"]
+
+
 @pytest.mark.parametrize("response_format,n_predicted,re_content", [
     ({"type": "json_object", "schema": {"const": "42"}}, 6, "\"42\""),
     ({"type": "json_object", "schema": {"items": [{"type": "integer"}]}}, 10, "[ -3000 ]"),
