@@ -340,6 +340,16 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Physical batch size for the DRAFT context (0 = inherit the target's).
+    // The draft context otherwise copies the target's n_ctx/n_batch/n_ubatch
+    // verbatim, which sizes its compute buffer as if it were the target: a
+    // 3-layer DSpark draft measured 1074 MiB against the 43-layer target's
+    // 1093 MiB. The draft only needs a wide ubatch for feature injection
+    // (which chunks the prompt by n_ubatch), so narrowing it reclaims most of
+    // that while leaving the target's prefill speed -- and its thermals --
+    // untouched.
+    int32_t n_ubatch = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -621,6 +631,15 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    // L2 on-disk prompt cache (empty dir = disabled). Persists evicted / oversize slot states so a
+    // replayed token prefix (session resume, tree/fork jump, server restart) skips re-prefilling.
+    std::string cache_disk_dir;                 // enables the disk tier when non-empty
+    int32_t cache_disk_mib        = 65536;      // on-disk budget in MiB (0 = no limit)
+    int32_t cache_disk_min_tokens = 2048;       // smallest prompt worth persisting
+    int32_t cache_disk_max_entry_mib = 4096;    // largest single state to divert to disk
+    int32_t cache_disk_interval_tokens = 8192;  // eager store: persist a live slot once it has grown
+                                                // this many tokens past its last store (0 = disable)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
