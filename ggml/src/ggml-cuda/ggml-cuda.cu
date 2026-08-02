@@ -372,9 +372,31 @@ static ggml_cuda_device_info ggml_cuda_init() {
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
         // remove this call again when cudaDeviceScheduleSpin is default.
+        //
+        // GGML_CUDA_SCHED=spin|yield|blocking overrides it. cc121 is GB10 (DGX Spark),
+        // where the CPU and GPU share one package and one thermal budget: a host thread
+        // busy-waiting in cudaStreamSynchronize pegs a core at up to 3.9 GHz producing
+        // pure heat, and that heat comes out of the GPU's headroom. On a discrete GPU
+        // the spare core is free; here it is not. Default is unchanged (spin) so this is
+        // opt-in until the latency/thermal trade is measured on real workloads.
         if (prop.major == 12 && prop.minor == 1) {
+            unsigned int sched_flag = cudaDeviceScheduleSpin;
+            const char * sched_env  = getenv("GGML_CUDA_SCHED");
+            if (sched_env != nullptr) {
+                if (strcmp(sched_env, "blocking") == 0) {
+                    sched_flag = cudaDeviceScheduleBlockingSync;
+                } else if (strcmp(sched_env, "yield") == 0) {
+                    sched_flag = cudaDeviceScheduleYield;
+                } else if (strcmp(sched_env, "spin") != 0) {
+                    GGML_LOG_WARN("%s: unknown GGML_CUDA_SCHED='%s', using spin\n", __func__, sched_env);
+                    sched_env = nullptr;
+                }
+                if (sched_env != nullptr) {
+                    GGML_LOG_INFO("%s: GGML_CUDA_SCHED=%s\n", __func__, sched_env);
+                }
+            }
             CUDA_CHECK(cudaSetDevice(physical_id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            CUDA_CHECK(cudaSetDeviceFlags(sched_flag));
         }
 
 #endif  // defined(GGML_USE_HIP)
