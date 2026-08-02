@@ -120,7 +120,6 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     // never assigned anywhere else: without this it is read as indeterminate
     // memory in dspark.cpp's decoder, arming the in-graph draft chain at random
-    cparams.dspark_draft_chain      = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -943,13 +942,6 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
-const float * llama_context::get_dspark_draft_meta(uint32_t * count) {
-    if (count) {
-        *count = (uint32_t) dspark_draft_meta.size();
-    }
-    return dspark_draft_meta.empty() ? nullptr : dspark_draft_meta.data();
-}
-
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     output_reorder();
 
@@ -1194,16 +1186,6 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
-}
-
-void llama_context::set_dspark_draft_chain(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
-
-    // the chain graph is gated out of the reserve-shape ubatches by its
-    // n_tokens window, and t_dspark_meta is kept
-    // alive by the OUTPUT-flag propagation in set_outputs, so toggling per decode
-    // costs nothing.
-    cparams.dspark_draft_chain = value;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2035,20 +2017,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
-            }
-        }
-
-        // extract DSpark in-graph chain meta ([2K]: (id, conf_logit) per position)
-        if (cparams.dspark_draft_chain) {
-            auto * t_meta = res->get_dspark_meta();
-            if (t_meta != nullptr) {
-                ggml_backend_t backend_meta = ggml_backend_sched_get_tensor_backend(sched.get(), t_meta);
-                GGML_ASSERT(backend_meta != nullptr);
-
-                dspark_draft_meta.resize(ggml_nelements(t_meta));
-                ggml_backend_tensor_get_async(backend_meta, t_meta, dspark_draft_meta.data(), 0, ggml_nbytes(t_meta));
-            } else {
-                dspark_draft_meta.clear();
             }
         }
 
@@ -3832,16 +3800,6 @@ bool llama_is_swa_only(const llama_context * ctx, int32_t * n_swa) {
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
-}
-
-void llama_set_dspark_draft_chain(llama_context * ctx, bool value) {
-    ctx->set_dspark_draft_chain(value);
-}
-
-const float * llama_get_dspark_draft_meta(llama_context * ctx, uint32_t * count) {
-    ctx->synchronize();
-
-    return ctx->get_dspark_draft_meta(count);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

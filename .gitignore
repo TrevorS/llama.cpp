@@ -157,3 +157,6 @@ AGENTS.local.md
 
 # secrets — never commit
 .env
+
+# local research artifacts (measured findings, harnesses) — kept out of the branch
+experiments/

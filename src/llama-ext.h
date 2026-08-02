@@ -9,14 +9,6 @@
 #include <cstdint>
 #include <map>
 
-// DSpark in-graph chained draft. When enabled, the decoder graph runs the whole
-// semi-autoregressive block on-device -- Markov bias, greedy argmax and the
-// confidence head, chained position to position -- instead of the driver pulling
-// full logit rows and running a rank x vocab GEMV per position on the host.
-// The meta is [2K] floats, interleaved (token id, confidence logit).
-LLAMA_API void          llama_set_dspark_draft_chain(struct llama_context * ctx, bool value);
-LLAMA_API const float * llama_get_dspark_draft_meta(struct llama_context * ctx, uint32_t * count);
-
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

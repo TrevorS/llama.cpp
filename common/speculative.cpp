@@ -978,7 +978,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // (host chain only -- the in-graph chain never touches this)
 
     // draft-dspark: run the block chain inside the decoder graph
-    bool use_graph_chain = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1069,19 +1068,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
-
-        // DSpark: run the semi-autoregressive block on-device. The chain does the
-        // Markov bias, the greedy argmax and the confidence head per position,
-        // chained, so the driver reads 2K floats instead of pulling block_size
-        // full logit rows (129280 each) and running a 256 x 129280 GEMV per
-        // position on the host. LLAMA_DSPARK_HOST_CHAIN=1 forces the host path
-        // as an A/B control -- both are greedy, so the ids must match exactly.
-        if (is_dspark) {
-            const char * e = getenv("LLAMA_DSPARK_HOST_CHAIN");
-            use_graph_chain = !(e && atoi(e));
-            llama_set_dspark_draft_chain(ctx_dft, use_graph_chain);
-            LOG_INF("%s: - dspark chain = %s\n", __func__, use_graph_chain ? "in-graph" : "host");
-        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1254,13 +1240,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
-        // In-graph chain output: [2K] floats, (token id, confidence logit) per position.
-        // Null when the graph declined to build the chain (multi-seq ubatch, a width
-        // outside the block bound, or a non-token batch) -- the host path below then
-        // runs unchanged, so this is a fast path, not a required one.
-        uint32_t      chain_n    = 0;
-        const float * chain_meta = use_graph_chain ? llama_get_dspark_draft_meta(ctx_dft, &chain_n) : nullptr;
-
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1289,37 +1268,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 const int32_t n_vocab_dft =
                     llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-
-                // fast path: the whole block was chained on-device
-                if (chain_meta && chain_n >= 2u*(uint32_t) n_block_tokens) {
-                    for (int32_t i = 0; i < n_block_tokens; ++i) {
-                        const float clogit = chain_meta[2*i + 1];
-                        if (params.p_min > 0.0f) {
-                            const float p = 1.0f/(1.0f + expf(-clogit));
-                            if (p < params.p_min) {
-                                LOG_DBG(" - seq_id %d, dspark conf cut at pos %d: p=%.3f < %.3f\n",
-                                        seq_id, i, p, params.p_min);
-                                break;
-                            }
-                        }
-
-                        const llama_token id = (llama_token) chain_meta[2*i + 0];
-                        if (id < 0 || id >= n_vocab_dft) {
-                            LOG_WRN("%s: dspark chain produced out-of-range id %d at pos %d\n",
-                                    __func__, id, i);
-                            break;
-                        }
-
-                        // keep the sampler's history in step with the host path
-                        common_sampler_accept(smpl, id, true);
-                        result.push_back(id);
-                    }
-
-                    if (result.size() < (size_t) params.n_min) {
-                        result.clear();
-                    }
-                    continue;
-                }
 
                 dflash_probe("draft_logits", llama_get_logits_ith(ctx_dft, beg), (size_t) n_vocab_dft);
 
