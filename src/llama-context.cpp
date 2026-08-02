@@ -2434,7 +2434,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_DEEPSEEK4_MTP ||
         model.arch == LLM_ARCH_DSPARK ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
@@ -3685,10 +3684,7 @@ llama_context * llama_init_from_model(
     }
 
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.n_layer_nextn == 0 &&
-        model->arch != LLM_ARCH_DEEPSEEK4_MTP) {
-        // standalone draft-head arches are ALL MTP with zero trunk layers, so
-        // they keep n_layer_nextn == 0 to preserve n_layer() accounting
+        model->hparams.n_layer_nextn == 0) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }

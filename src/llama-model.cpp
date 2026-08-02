@@ -186,7 +186,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_DEEPSEEK4_MTP:
             return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
@@ -2325,10 +2324,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_MTP) {
-                        // DEEPSEEK4_MTP: all layers have compress_ratio 0, so the
-                        // composite cache degenerates to kv_raw only (the draft
-                        // block is plain sliding-window MLA — ds4.c raw_window).
+                    if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                         res = new llama_kv_cache_dsv4(
@@ -2604,7 +2600,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_DEEPSEEK4_MTP:
         // DSPARK's draft backbone is a 3-layer DeepSeek-V4 stack, so it pairs
         // rotary dimensions interleaved like its parent -- not NeoX half-split.
         // With NEOX nothing crashes: block position 0 stays correct (it is
