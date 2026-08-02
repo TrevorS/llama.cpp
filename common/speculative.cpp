@@ -179,8 +179,6 @@ struct common_speculative_impl {
     // (optional) pos of a draft-context KV cell that must survive the post-draft cleanup (-1 = none)
     virtual llama_pos dft_keep_pos(llama_seq_id /*seq_id*/) const { return -1; }
 
-    // true if this implementation requires the target context to extract pre-norm embeddings
-    virtual bool need_embd_nextn() const { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2245,9 +2243,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return keep_pos[seq_id];
     }
 
-    bool need_embd_nextn() const override {
-        return true;
-    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -3416,20 +3411,6 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
-}
-
-bool common_speculative_need_embd_nextn(common_speculative * spec) {
-    if (spec == nullptr) {
-        return false;
-    }
-
-    for (auto & impl : spec->impls) {
-        if (impl->need_embd_nextn()) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 llama_pos common_speculative_dft_keep_pos(common_speculative * spec, llama_seq_id seq_id) {
