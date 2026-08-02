@@ -1580,7 +1580,7 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             rs_idx[seq_id] = (uint32_t) rollback;
         }
 
-        return false;
+        return res;
     }
 
     const bool res = kv_raw->seq_rm(seq_id, p0, p1);
@@ -1765,10 +1765,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw;
     }
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
-
+    // the restored state is a plane-0 snapshot, so any pending rollback index
+    // no longer refers to anything - reset it or the next compressor read would
+    // gather from a stale ring plane
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         rs_idx[seq_id] = 0;
