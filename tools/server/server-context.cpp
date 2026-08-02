@@ -18,8 +18,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
+#include <ctime>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -230,6 +232,9 @@ struct server_slot {
     int32_t i_batch     = -1;
 
     int32_t n_prompt_tokens_cache     = 0;
+
+    // prompt length at the last eager disk store; gates the next one (see callback_on_release)
+    int32_t n_disk_stored             = 0;
     int32_t n_prompt_tokens_processed = 0;
 
     size_t last_nl_pos = 0;
@@ -279,6 +284,54 @@ struct server_slot {
         return true;
     }
 
+    // Eager L2 store, mirroring ds4_kvstore_maybe_store_continued: persist the LIVE slot
+    // prefix straight to the disk tier, bypassing the RAM tier.
+    //
+    // The RAM tier only reaches disk via eviction or the shutdown spill, and neither fires
+    // for a single long-lived agent slot: --cache-ram (8 GiB default) is never filled by one
+    // slot, and the shutdown spill walks `states` only -- never the slot that is still live,
+    // which is precisely the conversation worth keeping. Measured before this: 0 disk entries
+    // after a full agent session. A SIGKILL or a box wedge then costs the whole prefill.
+    //
+    // Straight to disk rather than through alloc(): the slot still owns this state, so routing
+    // it through the RAM tier would hold two copies of a multi-hundred-MiB blob and could evict
+    // useful entries to make room for a duplicate.
+    bool prompt_save_disk(server_prompt_cache & prompt_cache) const {
+        if (!prompt_cache.disk || prompt.tokens.size() == 0 || prompt.tokens.has_mtmd) {
+            return false;
+        }
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        if (size_tgt + size_dft > prompt_cache.disk->entry_cap()) {
+            SLT_TRC(*this, "eager disk store: state %.3f MiB exceeds the per-entry cap, skipping\n",
+                    (size_tgt + size_dft) / (1024.0 * 1024.0));
+            return false;
+        }
+
+        server_prompt_cache_state state;
+        state.prompt.tokens      = prompt.tokens.clone();
+        state.prompt.checkpoints = prompt.checkpoints;
+
+        try {
+            state.data.main.resize(size_tgt);
+            state.data.drft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_WRN(*this, "eager disk store: allocation failed (%s), skipping\n", e.what());
+            return false;
+        }
+
+        llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        // spill() takes ownership and hands the blob to the writer thread; the file I/O
+        // itself is off this thread. Only the serialization above is synchronous.
+        return prompt_cache.disk->spill(std::move(state));
+    }
+
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
@@ -294,6 +347,10 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        // the prefix this counter referred to is gone; a new conversation must be
+        // allowed to store from scratch rather than inherit the old threshold
+        n_disk_stored = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -958,6 +1015,13 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
+    // prefill guard: refuse after N consecutive large prompt re-computations with no
+    // meaningful cache reuse (runaway client prefix instability; sustained bulk prefill
+    // has hard-locked this host twice). 0 disables.
+    int prefill_guard_n       = 3;
+    int prefill_guard_min     = 8192;
+    int prefill_guard_strikes = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1355,6 +1419,36 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // A turn just finished and the slot still holds its KV. This is the only
+                // moment the full conversation prefix exists and nothing else is queued
+                // against it, so it is where the eager disk store belongs.
+                const int interval = params_base.cache_disk_interval_tokens;
+                if (interval <= 0 || !prompt_cache || !prompt_cache->disk) {
+                    return;
+                }
+
+                for (auto & s : slots) {
+                    if (s.id != id_slot) {
+                        continue;
+                    }
+
+                    const int n_cur = s.prompt.n_tokens();
+
+                    // grow-only: re-storing the same or a shorter prefix would just churn the
+                    // disk budget (spill() would dedup it away anyway, after paying the copy)
+                    if (n_cur < s.n_disk_stored + interval) {
+                        break;
+                    }
+
+                    const int64_t t0 = ggml_time_us();
+                    if (s.prompt_save_disk(*prompt_cache)) {
+                        s.n_disk_stored = n_cur;
+                        SLT_INF(s, "eager disk store: queued %d-token prefix (serialize %.0f ms)\n",
+                                n_cur, (ggml_time_us() - t0) / 1000.0);
+                    }
+                    break;
+                }
             };
 
             slot.reset();
@@ -1378,6 +1472,18 @@ private:
             }
         }
 
+        {
+            const char * s = getenv("LLAMA_SERVER_PREFILL_GUARD");
+            if (s) {
+                prefill_guard_n = atoi(s);
+            }
+            if ((s = getenv("LLAMA_SERVER_PREFILL_GUARD_MIN")) != nullptr) {
+                prefill_guard_min = atoi(s);
+            }
+            SRV_INF("prefill guard: %s (n = %d, min tokens = %d)\n",
+                    prefill_guard_n > 0 ? "enabled" : "disabled", prefill_guard_n, prefill_guard_min);
+        }
+
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
@@ -1397,6 +1503,26 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        // optional L2 on-disk tier for the prompt cache
+        if (!params_base.cache_disk_dir.empty()) {
+            if (prompt_cache) {
+                char model_desc[256] = {0};
+                llama_model_desc(llama_get_model(ctx_tgt), model_desc, sizeof(model_desc));
+                // any change here (model, ctx size, draft presence) must invalidate old files,
+                // since a serialized sequence state is only restorable into a matching setup.
+                const std::string compat_desc = string_format("%s|n_ctx=%d|n_embd=%d|draft=%d",
+                        model_desc, n_ctx, llama_model_n_embd(llama_get_model(ctx_tgt)), ctx_dft ? 1 : 0);
+                prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
+                        params_base.cache_disk_dir,
+                        compat_desc,
+                        (size_t) std::max(0, params_base.cache_disk_mib)        * 1024ull * 1024ull,
+                        (size_t) std::max(0, params_base.cache_disk_min_tokens),
+                        (size_t) std::max(0, params_base.cache_disk_max_entry_mib) * 1024ull * 1024ull);
+            } else {
+                SRV_WRN("%s", "--cache-disk requires the RAM prompt cache; enable it with `--cache-ram N`\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -2341,7 +2467,12 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // the slot-restore path synthesizes a checkpoint on an IDLE slot, whose task has
+        // already been released (task_prev = std::move(task)), so this cannot assume one.
+        // -1 never matches a real task id, which leaves the synthetic checkpoint eligible
+        // for min-step eviction once a real task starts using the slot - the behaviour we
+        // want, since it did not come from that task.
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2629,6 +2760,23 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // Synthesize a context checkpoint at the restored boundary.
+                    // The SWA/hybrid prompt-reuse gate requires checkpoint
+                    // coverage to resume near the frontier; a freshly restored
+                    // slot has none (checkpoints are not part of the save
+                    // file), so without this the next request silently forces a
+                    // full prompt re-process. pos_min is recorded as 0: the
+                    // restored state resumes at its tail (the pos_max guard in
+                    // the gate rejects deeper rewinds), and the actual
+                    // seq_pos_min sits exactly at the SWA window edge, one
+                    // position too new for the gate's coverage predicate.
+                    {
+                        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (pos_max >= 0) {
+                            create_checkpoint(*slot, 0, /*pos_min=*/ 0, pos_max);
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3005,6 +3153,11 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        // stash the speculative impl state (e.g. draft-mtp's pending_h) so a
+                        // rollback restores it together with the KV it was produced with
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -3042,7 +3195,10 @@ private:
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                // keep the fused boundary cell (if any) - wipe only above it
+                const llama_pos keep_pos = common_speculative_dft_keep_pos(spec.get(), slot.id);
+
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, std::max(ckpt.pos_max + 1, keep_pos + 1), -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
             }
@@ -3056,12 +3212,7 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
-
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3385,6 +3536,40 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                        }
+
+                        // prefill guard: a run of large prompt re-computations with no meaningful
+                        // reuse means the client's prompt prefix is unstable; sustained bulk
+                        // re-prefill has hard-locked this host. Refuse before decoding, not after.
+                        if (prefill_guard_n > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            const int n_to_process = slot.task->n_tokens() - n_past;
+
+                            if (!slot.prompt.tokens.empty() && n_to_process >= prefill_guard_min && n_past <= n_to_process / 4) {
+                                if (prefill_guard_strikes < prefill_guard_n) {
+                                    prefill_guard_strikes++;
+                                }
+
+                                SRV_WRN("prefill guard: strike %d/%d — re-computing %d of %d prompt tokens (n_past = %d), client prompt prefix is not stable\n",
+                                        prefill_guard_strikes, prefill_guard_n, n_to_process, slot.task->n_tokens(), n_past);
+
+                                if (prefill_guard_strikes >= prefill_guard_n) {
+                                    send_error(slot, string_format(
+                                                "prefill guard tripped: %d consecutive requests re-computed >= %d prompt tokens with no cache reuse. "
+                                                "This host cannot sustain bulk re-prefill; fix client prompt-prefix stability "
+                                                "or set LLAMA_SERVER_PREFILL_GUARD=0.",
+                                                prefill_guard_strikes, prefill_guard_min),
+                                            ERROR_TYPE_UNAVAILABLE);
+
+                                    // drop the stale slot state so a fresh conversation can cold-start
+                                    // (cold prefills on an empty slot never strike)
+                                    slot.prompt.tokens.keep_first(0);
+
+                                    slot.release();
+                                    return;
+                                }
+                            } else {
+                                prefill_guard_strikes = 0;
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
@@ -3893,6 +4078,10 @@ private:
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
+                        if (!ckpt.data_spec.empty()) {
+                            common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+                        }
+
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
 
@@ -3924,6 +4113,14 @@ private:
             // update how many tokens out of those tested were accepted
             slot.n_draft_accepted += n_accepted;
             slot.n_draft_verif_steps += 1;
+
+            // per-round spec trace for the offline depth-0/1/2 oracle (LLAMA_SPEC_TRACE=1).
+            // acceptance is prefix-monotone, so the accepted length at the run's draft
+            // depth determines what a shallower depth would have yielded that round.
+            static const bool spec_trace = getenv("LLAMA_SPEC_TRACE") != nullptr;
+            if (spec_trace) {
+                SLT_INF(slot, "SPECTRACE acc=%zu draft=%zu\n", ids.size() - 1, n_draft);
+            }
 
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
@@ -4529,6 +4726,82 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->slots_data);
+        return res;
+    };
+
+    this->get_slots_saves = [this](const server_http_req &) {
+        // filesystem only - no task queue, so it responds while slots are busy and
+        // must not wake a sleeping server (bypass_sleep)
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const int64_t t_now_unix = (int64_t) time(nullptr);
+        const auto    ft_now     = std::filesystem::file_time_type::clock::now();
+
+        json saves = json::array();
+        for (const auto & file : fs_list(params.slot_save_path, false)) {
+            // only expose names that a later ?action=restore would accept
+            if (!fs_validate_filename(file.name)) {
+                continue;
+            }
+            std::error_code ec;
+            const auto ftime = std::filesystem::last_write_time(file.path, ec);
+            if (ec) {
+                continue; // deleted mid-listing
+            }
+            // C++17-portable file_time -> unix seconds via delta from now
+            const int64_t delta = std::chrono::duration_cast<std::chrono::seconds>(ft_now - ftime).count();
+            saves.push_back(json {
+                { "filename",   file.name },
+                { "size_bytes", file.size },
+                { "mtime",      t_now_unix - delta },
+            });
+        }
+
+        // newest first; tie-break on filename so same-second saves order deterministically
+        std::sort(saves.begin(), saves.end(), [](const json & a, const json & b) {
+            const int64_t am = a.at("mtime").get<int64_t>();
+            const int64_t bm = b.at("mtime").get<int64_t>();
+            if (am != bm) {
+                return am > bm;
+            }
+            return a.at("filename").get<std::string>() < b.at("filename").get<std::string>();
+        });
+
+        res->ok(json { { "saves", saves } });
+        return res;
+    };
+
+    this->del_slots_saves = [this](const server_http_req & req) {
+        // filesystem only - see get_slots_saves
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const std::string filename = req.get_param("filename");
+        if (filename.empty() || !fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // same path construction as handle_slots_save/restore (slot_save_path ends with a separator)
+        const std::string filepath = params.slot_save_path + filename;
+        std::error_code ec;
+        if (!std::filesystem::remove(filepath, ec)) {
+            if (ec) {
+                res->error(format_error_response("Failed to delete slot save file: " + ec.message(), ERROR_TYPE_SERVER));
+            } else {
+                res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+            }
+            return res;
+        }
+
+        res->ok(json { { "success", true }, { "filename", filename } });
         return res;
     };
 
@@ -5186,6 +5459,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+
+    // distinguish a missing file from a real restore failure up front - the task-level
+    // error lumps both into "no available space in KV cache or invalid slot save file"
+    if (!std::filesystem::is_regular_file(filepath)) {
+        res->error(format_error_response("No such slot save file: " + filename, ERROR_TYPE_NOT_FOUND));
+        return res;
+    }
 
     auto & rd = res->rd;
     {
