@@ -237,6 +237,9 @@ struct server_slot {
     int32_t i_batch     = -1;
 
     int32_t n_prompt_tokens_cache     = 0;
+
+    // prompt length at the last eager disk store; gates the next one (see callback_on_release)
+    int32_t n_disk_stored             = 0;
     int32_t n_prompt_tokens_processed = 0;
 
     size_t last_nl_pos = 0;
@@ -286,6 +289,54 @@ struct server_slot {
         return true;
     }
 
+    // Eager L2 store, mirroring ds4_kvstore_maybe_store_continued: persist the LIVE slot
+    // prefix straight to the disk tier, bypassing the RAM tier.
+    //
+    // The RAM tier only reaches disk via eviction or the shutdown spill, and neither fires
+    // for a single long-lived agent slot: --cache-ram (8 GiB default) is never filled by one
+    // slot, and the shutdown spill walks `states` only -- never the slot that is still live,
+    // which is precisely the conversation worth keeping. Measured before this: 0 disk entries
+    // after a full agent session. A SIGKILL or a box wedge then costs the whole prefill.
+    //
+    // Straight to disk rather than through alloc(): the slot still owns this state, so routing
+    // it through the RAM tier would hold two copies of a multi-hundred-MiB blob and could evict
+    // useful entries to make room for a duplicate.
+    bool prompt_save_disk(server_prompt_cache & prompt_cache) const {
+        if (!prompt_cache.disk || prompt.tokens.size() == 0 || prompt.tokens.has_mtmd) {
+            return false;
+        }
+
+        const size_t size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        if (size_tgt + size_dft > prompt_cache.disk->entry_cap()) {
+            SLT_TRC(*this, "eager disk store: state %.3f MiB exceeds the per-entry cap, skipping\n",
+                    (size_tgt + size_dft) / (1024.0 * 1024.0));
+            return false;
+        }
+
+        server_prompt_cache_state state;
+        state.prompt.tokens      = prompt.tokens.clone();
+        state.prompt.checkpoints = prompt.checkpoints;
+
+        try {
+            state.data.main.resize(size_tgt);
+            state.data.drft.resize(size_dft);
+        } catch (const std::bad_alloc & e) {
+            SLT_WRN(*this, "eager disk store: allocation failed (%s), skipping\n", e.what());
+            return false;
+        }
+
+        llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (ctx_dft) {
+            llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        // spill() takes ownership and hands the blob to the writer thread; the file I/O
+        // itself is off this thread. Only the serialization above is synchronous.
+        return prompt_cache.disk->spill(std::move(state));
+    }
+
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
@@ -301,6 +352,10 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+
+        // the prefix this counter referred to is gone; a new conversation must be
+        // allowed to store from scratch rather than inherit the old threshold
+        n_disk_stored = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1378,6 +1433,36 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // A turn just finished and the slot still holds its KV. This is the only
+                // moment the full conversation prefix exists and nothing else is queued
+                // against it, so it is where the eager disk store belongs.
+                const int interval = params_base.cache_disk_interval_tokens;
+                if (interval <= 0 || !prompt_cache || !prompt_cache->disk) {
+                    return;
+                }
+
+                for (auto & s : slots) {
+                    if (s.id != id_slot) {
+                        continue;
+                    }
+
+                    const int n_cur = s.prompt.n_tokens();
+
+                    // grow-only: re-storing the same or a shorter prefix would just churn the
+                    // disk budget (spill() would dedup it away anyway, after paying the copy)
+                    if (n_cur < s.n_disk_stored + interval) {
+                        break;
+                    }
+
+                    const int64_t t0 = ggml_time_us();
+                    if (s.prompt_save_disk(*prompt_cache)) {
+                        s.n_disk_stored = n_cur;
+                        SLT_INF(s, "eager disk store: queued %d-token prefix (serialize %.0f ms)\n",
+                                n_cur, (ggml_time_us() - t0) / 1000.0);
+                    }
+                    break;
+                }
             };
 
             slot.reset();

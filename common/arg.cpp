@@ -1663,6 +1663,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MAX_ENTRY_MB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-interval-tokens"}, "N",
+        string_format("eagerly persist a live slot to the disk cache once it has grown this many tokens "
+                      "past its last store, instead of only on eviction/shutdown (default: %d, 0 - disable); "
+                      "requires --cache-disk", params.cache_disk_interval_tokens),
+        [](common_params & params, int value) {
+            params.cache_disk_interval_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_INTERVAL_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

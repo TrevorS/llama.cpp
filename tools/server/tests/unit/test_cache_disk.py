@@ -102,3 +102,61 @@ def test_cache_disk_persists_across_restart(tmp_path):
     _, _, hits, last_hit = hit_entries[0]
     assert hits == 1
     assert last_hit >= min(h[3] for h in headers)  # touched at hit time
+
+
+def test_cache_disk_eager_store_survives_hard_kill(tmp_path):
+    """The eager store must persist a live slot WITHOUT a graceful shutdown.
+
+    The shutdown spill only walks the RAM tier, never the slot that is still live, and the
+    RAM tier is only reached via eviction -- which a single long-lived slot never triggers.
+    So before the eager store a crash lost the whole conversation. SIGKILL here on purpose:
+    SIGTERM would run the dtor and prove nothing.
+    """
+    global server
+    cache_dir = server.cache_disk
+    log1 = tmp_path / "eager1.log"
+    log2 = tmp_path / "eager2.log"
+
+    server.cache_disk_interval_tokens = 8  # tiny prompts; the 8192 default would never fire here
+    server.log_path = str(log1)
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "cache_prompt": True,
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    n_prompt = res.body["timings"]["prompt_n"]
+
+    # the store is queued on slot release and written by the disk-cache writer thread
+    deadline = time.time() + 20
+    while time.time() < deadline and not list(Path(cache_dir).glob("*.dkv")):
+        time.sleep(0.5)
+
+    # persisted with the server still running and nothing evicted
+    assert list(Path(cache_dir).glob("*.dkv")), "eager store did not persist a live slot"
+    assert "eager disk store" in log1.read_text()
+
+    # hard kill: no dtor, so no shutdown spill can rescue this
+    server.process.kill()
+    server.process.wait(timeout=10)
+    server.process = None
+
+    headers = read_dkv_headers(cache_dir)
+    assert len(headers) >= 1
+    assert headers[0][0] == DKV2_MAGIC
+
+    # restart and replay: the prefix must come back off disk
+    server.log_path = str(log2)
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "cache_prompt": True,
+        "n_predict": 4,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] < n_prompt, "prefill was not skipped after the hard kill"
+
+    server.stop()
+    assert "disk prompt cache: restored" in log2.read_text()

@@ -638,6 +638,8 @@ struct common_params {
     int32_t cache_disk_mib        = 65536;      // on-disk budget in MiB (0 = no limit)
     int32_t cache_disk_min_tokens = 2048;       // smallest prompt worth persisting
     int32_t cache_disk_max_entry_mib = 4096;    // largest single state to divert to disk
+    int32_t cache_disk_interval_tokens = 8192;  // eager store: persist a live slot once it has grown
+                                                // this many tokens past its last store (0 = disable)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
