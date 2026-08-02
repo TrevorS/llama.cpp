@@ -1190,6 +1190,28 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * inp_pos,
         int il,
         int row) const {
+    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, row);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_attention(
+        const llama_model & model,
+        llm_graph_input_attn_k_iswa * inp_mtp,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il) const {
+    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il, -1);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+        const llama_model & model,
+        llm_graph_input_dsv4 * inp_dsv4,
+        llm_graph_input_attn_k_iswa * inp_mtp,
+        ggml_tensor * cur,
+        ggml_tensor * inp_pos,
+        int il,
+        int row) const {
+    GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
+
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4 ? inp_dsv4->get_raw() : nullptr;
 
