@@ -355,6 +355,25 @@ away (77.5 W where P70 drew 51.0 W at the same point — backwards for a lower d
 **Deep-fill legs need a genuinely cold chassis and cannot be run back-to-back**;
 8 minutes of cooldown is not enough. P65 remains untested.
 
+**Cold-start rule: idle time predicts deep-fill capacity; SoC die temp does not.**
+Four P70 fills, same config:
+
+| idle before | start SoC | prompt | reached | power @t+152s |
+| --- | --- | --- | --- | --- |
+| ~25 min | 43.7 C | 98k | **96700 (98%)** | 38.5 W |
+| ~10 min | 60.7 C | 98k | 77824 (79%) | 51.0 W |
+| 9 min | 49.8 C | 85k (shorter) | 43008 (51%) | 69.5 W |
+| 8 min | 63.9 C | 98k | 36864 (37%) | 77.5 W |
+
+The 49.8 C / 9-min run reached half the depth of the 60.7 C / 10-min run *with a
+shorter prompt*, drawing ~2x the power at the same elapsed time. The die cools in
+minutes; the heatsink does not. A `wait until SoC <= 50 C` gate passed in 540 s and
+produced the second-worst result — **gate on ~25 min of idle instead**.
+
+Best result: **96700 of ~98500 tokens (98%) at P70 from a genuinely cold box**,
+pp 257.61, only ~8 s spent >= 93 C, SoC max 94.4 — and the oscillation stayed healthy
+(dipping to 79.9 C at t+482), so the run was not diverging.
+
 **Recipe:** `GGML_CUDA_POWER=70` + `--spec-draft-ubatch 256` + `-ctk/-ctv q8_0` at
 `-c 262144` with target `-ub 2048` handles ~78k-token fills from cold with the draft
 attached (pp ~264, tg ~24, acceptance ~0.53).
