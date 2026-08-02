@@ -1427,6 +1427,10 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // occupancy high-water mark for the shape-keyed cache (bounded by the 10s
+    // eviction, but unmeasured under agentic churn — logged at shutdown)
+    size_t cuda_graphs_hwm = 0;
+
     int64_t last_graph_eviction_sweep = 0;
 
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
@@ -1447,6 +1451,7 @@ struct ggml_backend_cuda_context {
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            cuda_graphs_hwm = std::max(cuda_graphs_hwm, cuda_graphs.size());
         }
         it->second->last_used_time = time_now;
         return it->second.get();
