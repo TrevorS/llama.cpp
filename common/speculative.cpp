@@ -976,7 +976,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // draft-dspark: per-vocab Markov bias scratch, refilled once per block position
     // (host chain only -- the in-graph chain never touches this)
-    std::vector<float> markov_bias;
 
     // draft-dspark: run the block chain inside the decoder graph
     bool use_graph_chain = false;
@@ -1334,46 +1333,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // the chained bias is the ONLY thing that tells position i what was chosen
                 // at position i-1. Without it the block collapses to its anchor: measured
                 // per-position acceptance was 26.0% / 1.8% / 0% / 0% / 0% at block_size 5.
-                // LLAMA_DSPARK_NO_MARKOV=1 restores the unbiased behaviour as an A/B control.
-                static const bool no_markov =
-                    getenv("LLAMA_DSPARK_NO_MARKOV") && atoi(getenv("LLAMA_DSPARK_NO_MARKOV"));
-
-                const bool use_markov = !no_markov && n_block_tokens > 0;
-                if (use_markov) {
-                    markov_bias.resize((size_t) n_vocab_dft);
-                }
-
-                llama_token prev_id = dp.id_last;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    // confidence gate: sigmoid(W_conf . [x ; W1[prev]]) < p_min -> stop here.
-                    // Matches DeepSpec _confident_prefix_length, which cuts at the FIRST
-                    // row below threshold rather than skipping it.
-                    if (hrows) {
-                        float clogit = 0.0f;
-                        if (llama_dspark_confidence_logit(llama_get_model(ctx_dft), prev_id,
-                                    hrows + (size_t) idx * n_embd_dec, &clogit)) {
-                            const float p = 1.0f/(1.0f + expf(-clogit));
-                            if (p < params.p_min) {
-                                LOG_DBG(" - seq_id %d, dspark conf cut at pos %d: p=%.3f < %.3f\n",
-                                        seq_id, i, p, params.p_min);
-                                break;
-                            }
-                        }
+                    // confidence gate: the graph's confidence head already emits
+                    // sigmoid(W_conf . [x ; W1[prev]]) broadcast across the nextn row, so
+                    // element 0 is the probability. Cut at the FIRST row below threshold,
+                    // matching DeepSpec _confident_prefix_length.
+                    if (hrows && hrows[(size_t) idx * n_embd_dec] < params.p_min) {
+                        LOG_DBG(" - seq_id %d, dspark conf cut at pos %d: p=%.3f < %.3f\n",
+                                seq_id, i, hrows[(size_t) idx * n_embd_dec], params.p_min);
+                        break;
                     }
 
-                    if (use_markov) {
-                        // bias is additive in logit space; fold it into the row in place so
-                        // the shared sampler path picks it up unchanged
-                        llama_dspark_markov_bias(llama_get_model(ctx_dft), prev_id, markov_bias.data());
-
-                        float * logits = llama_get_logits_ith(ctx_dft, idx);
-                        for (int32_t v = 0; v < n_vocab_dft; ++v) {
-                            logits[v] += markov_bias[v];
-                        }
-                    }
+                    // NOTE: the Markov bias is applied in-graph by
+                    // build_dspark_markov_head(), chained on the previous position's
+                    // argmax, so the logits read here are already biased.
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
 
@@ -1391,7 +1367,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     result.push_back(id);
 
-                    prev_id = id; // chain: this id biases the next block position
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1

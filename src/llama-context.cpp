@@ -2402,7 +2402,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
-        model.arch == LLM_ARCH_DSPARK ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
         // the 8*n_tensors default budget underestimates them badly

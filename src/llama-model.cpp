@@ -305,8 +305,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
-        case LLM_ARCH_DSPARK:
-            return new llama_model_dspark(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -2600,15 +2598,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
-        // DSPARK's draft backbone is a 3-layer DeepSeek-V4 stack, so it pairs
-        // rotary dimensions interleaved like its parent -- not NeoX half-split.
-        // With NEOX nothing crashes: block position 0 stays correct (it is
-        // carried by the injected target hidden state and the shared lm_head)
-        // while deeper positions silently lose their positional signal. The
-        // failure signature is a healthy position 0 with positions 1..n
-        // collapsing, i.e. acceptance stalling near 2 tokens.
-        // DFLASH stays NEOX -- that arch's backbone is genuinely NeoX-rotated.
-        case LLM_ARCH_DSPARK:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:
@@ -2832,8 +2821,7 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
-        case LLM_ARCH_DFLASH:
-        case LLM_ARCH_DSPARK:    return true;
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }

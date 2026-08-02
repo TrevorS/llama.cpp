@@ -141,8 +141,3 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
-// DSpark draft heads. Implemented in src/models/dspark.cpp.
-// markov bias: per-vocab logit bias derived from the previously drafted token
-LLAMA_API void llama_dspark_markov_bias(const struct llama_model * model, llama_token prev, float * out);
-// confidence: per-position survival logit from the draft hidden state + markov embed
-LLAMA_API bool llama_dspark_confidence_logit(const struct llama_model * model, llama_token prev, const float * h, float * out);
