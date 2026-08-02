@@ -1326,7 +1326,8 @@ json oaicompat_chat_params_parse(
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
             inputs.chat_template_kwargs.erase("reasoning_effort");
-        } else if (!reasoning_effort.empty()) {
+        } else if (!reasoning_effort.empty() && !inputs.chat_template_kwargs.count("reasoning_effort")) {
+            // An explicit chat_template_kwargs entry always wins over the OAI field.
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
