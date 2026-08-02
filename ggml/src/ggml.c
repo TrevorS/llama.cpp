@@ -1098,9 +1098,16 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "DSV4_LID_TOPK",
+    "DSV4_LID_UNION",
+    "DSV4_LID_MEMB",
+    "DSV4_HC_FUSED",
+    "DSV4_QAT_SET_ROWS",
+    "DSV4_FA_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1220,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dsv4_lid_topk(q,k,w,mask)",
+    "dsv4_lid_union(top_k)",
+    "dsv4_lid_memb(top_k,uni)",
+    "dsv4_hc_fused(x,a,b,c)",
+    "dsv4_qat_set_rows(a,b,c)",
+    "dsv4_fa_merge(a,b)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5418,6 +5432,260 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+// ggml_dsv4_lid_topk
+
+struct ggml_tensor * ggml_dsv4_lid_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        int                   n_top_k) {
+    GGML_ASSERT(q);
+    GGML_ASSERT(k);
+    GGML_ASSERT(weights);
+    GGML_ASSERT(mask);
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type    == GGML_TYPE_F32);
+
+    const int64_t d_idx    = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_lid    = k->ne[2];
+    const int64_t nt_s     = mask->ne[1];
+
+    GGML_ASSERT(k->ne[0]       == d_idx);
+    GGML_ASSERT(k->ne[1]       == 1);
+    GGML_ASSERT(weights->ne[0] == n_head);
+    GGML_ASSERT(mask->ne[0]    == n_lid);
+    GGML_ASSERT(n_top_k > 0 && n_top_k <= n_lid);
+    GGML_ASSERT(q->ne[2]       == nt_s * n_stream);
+
+    // output mirrors the ggml_top_k(indexer_score) shape: [n_top_k, nt/n_stream, 1, n_stream]
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nt_s, 1, n_stream);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_top_k);
+
+    result->op     = GGML_OP_DSV4_LID_TOPK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+    result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsv4_lid_union
+
+struct ggml_tensor * ggml_dsv4_lid_union(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        int                   n_csa,
+        int                   u_max,
+        int                   W) {
+    GGML_ASSERT(top_k);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_max > 0 && n_csa > 0);
+    GGML_ASSERT(W >= 0);
+
+    const int64_t nt_s     = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+
+    const int64_t n_tiles = (W <= 0 || W >= nt_s) ? 1 : (nt_s + W - 1)/W;
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u_max, n_tiles, 1, n_stream);
+    ggml_set_op_params_i32(result, 0, (int32_t) n_csa);
+    ggml_set_op_params_i32(result, 1, (int32_t) u_max);
+    ggml_set_op_params_i32(result, 2, (int32_t) W);
+
+    result->op     = GGML_OP_DSV4_LID_UNION;
+    result->src[0] = top_k;
+
+    return result;
+}
+
+// ggml_dsv4_lid_memb
+
+struct ggml_tensor * ggml_dsv4_lid_memb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * uni,
+        int                   n_csa) {
+    GGML_ASSERT(top_k && uni);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(uni->type   == GGML_TYPE_I32);
+
+    const int64_t nt_s     = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+    const int64_t u_max    = uni->ne[0];
+
+    GGML_ASSERT(uni->ne[3] == n_stream);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, u_max, nt_s, 1, n_stream);
+    ggml_set_op_params_i32(result, 0, (int32_t) n_csa);
+
+    result->op     = GGML_OP_DSV4_LID_MEMB;
+    result->src[0] = top_k;
+    result->src[1] = uni;
+
+    return result;
+}
+
+// ggml_dsv4_hc_weighted_sum
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(weights);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+
+    GGML_ASSERT(weights->ne[0] == hc);
+    GGML_ASSERT(weights->ne[1] == nt);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+
+    ggml_set_op_params_i32(result, 0, 0); // mode 0 = weighted_sum
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_hc_fused_post (our HC_FUSED-mode post; upstream also defines a
+// distinct ggml_dsv4_hc_post for its HC_POST op — renamed to avoid collision)
+
+struct ggml_tensor * ggml_dsv4_hc_fused_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(residual);
+    GGML_ASSERT(post);
+    GGML_ASSERT(comb);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(post->type     == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type     == GGML_TYPE_F32);
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t nt     = x->ne[1];
+    const int64_t hc     = residual->ne[1];
+
+    GGML_ASSERT(residual->ne[0] == n_embd);
+    GGML_ASSERT(residual->ne[2] == nt);
+    GGML_ASSERT(post->ne[0] == hc && post->ne[1] == nt);
+    GGML_ASSERT(comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == nt);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+
+    ggml_set_op_params_i32(result, 0, 1); // mode 1 = post
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = x;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_hc_sinkhorn
+
+struct ggml_tensor * ggml_dsv4_hc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * comb,
+        int                   n_iters,
+        float                 eps) {
+    GGML_ASSERT(comb);
+    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb->ne[0] == comb->ne[1]); // square combine matrix
+    GGML_ASSERT(n_iters >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, comb->ne[0], comb->ne[1], comb->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, 2); // mode 2 = sinkhorn
+    ggml_set_op_params_i32(result, 1, n_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_FUSED;
+    result->src[0] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_qat_set_rows
+
+struct ggml_tensor * ggml_dsv4_qat_set_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(a->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[0] % 32 == 0);
+    GGML_ASSERT(b->ne[1] == c->ne[0]);
+    // 2D only (the lid cpy path merges dims 0/1 before scattering)
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(b));
+
+    // same src layout as GGML_OP_SET_ROWS: result views the container
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op     = GGML_OP_DSV4_QAT_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    result->src[2] = a;
+
+    return result;
+}
+
+// ggml_dsv4_fa_merge
+
+struct ggml_tensor * ggml_dsv4_fa_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    // inputs carry the FA LSE tail: [DV, H, Q, S+1] with DV >= S. The halves may
+    // slice the same rows differently (e.g. [DV,H,nt,1+1] vs [DV,H,W,T+1] when
+    // one FA ran the tokens flat and the other tiled them over ne3) — the main
+    // data and the tail then still share one memory layout; only the row count
+    // (and order) must match.
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[3] >= 2 && b->ne[3] >= 2);
+    GGML_ASSERT(a->ne[0] >= a->ne[3] - 1);
+    GGML_ASSERT(b->ne[0] >= b->ne[3] - 1);
+    GGML_ASSERT(a->ne[1]*a->ne[2]*(a->ne[3] - 1) == b->ne[1]*b->ne[2]*(b->ne[3] - 1));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3] - 1);
+
+    result->op     = GGML_OP_DSV4_FA_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -5486,6 +5754,39 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+// FA with per-row log-sum-exp output (DSV4 split-attention merge): result
+// gains one tail ne3-slice holding lse[h, iq, s] contiguous at element
+// offset DV*n_head*n_q*ne3 — idx = (s*n_q + iq)*n_head + h. The attention
+// output itself is the plain [DV, n_head, n_q, ne3] prefix. Flag lives in
+// op_params i32[4]. Tail must fit: requires DV >= ne3.
+struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(v->ne[0] >= q->ne[3]); // tail slice must hold n_head*n_q*ne3 lse floats
+    struct ggml_tensor * result = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, max_bias, logit_softcap);
+
+    // re-shape in place: one extra ne3 slice for the lse tail
+    result->ne[3] += 1;
+    result->nb[0] = ggml_type_size(result->type);
+    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(result->type));
+    result->nb[2] = result->nb[1]*result->ne[1];
+    result->nb[3] = result->nb[2]*result->ne[2];
+
+    ggml_set_op_params_i32(result, 4, 1); // LSE flag
+
+    return result;
+}
+
+bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
