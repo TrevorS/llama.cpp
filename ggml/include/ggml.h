@@ -590,6 +590,13 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_DSV4_LID_TOPK,
+        GGML_OP_DSV4_LID_UNION,
+        GGML_OP_DSV4_LID_MEMB,
+        GGML_OP_DSV4_HC_FUSED,
+        GGML_OP_DSV4_QAT_SET_ROWS,
+        GGML_OP_DSV4_FA_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -2419,6 +2426,92 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // DeepSeek-V4 lightning-indexer fused score + top-k.
+    // Replaces the 8-op chain (k*q matmul -> relu -> weight -> sum over heads -> mask -> top_k)
+    // with a single op whose working set is O(chunk x n_tokens) instead of O(n_ctx x n_tokens x n_head).
+    //   q       : [d_idx, n_head, n_tokens]              F32 (after hadamard/rope)
+    //   k       : [d_idx, 1, n_lid, n_stream]            F16/F32 (indexer K cache view)
+    //   weights : [n_head, n_tokens]                     F32 (per-head weights, scale already applied)
+    //   mask    : [n_lid, n_tokens/n_stream, 1, n_stream] F32 (additive, carries causality)
+    // score(t,j) = sum_h( relu(q_th . k_j) * weights[h,t] ) + mask[j, t_local, stream(t)]
+    // output  : [n_top_k, n_tokens/n_stream, 1, n_stream] I32, per-token indices into the context,
+    //           descending by score with lower-index tie-break (matches ggml_top_k selection set).
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask,
+            int                   n_top_k);
+
+    // DeepSeek-V4 B2 sparse-CSA: per-tile (W consecutive tokens) union of the
+    // tokens' top-k CSA selections, so main attention runs over the compact
+    // per-tile union instead of the full n_csa.
+    //   top_k : [n_top_k, nt_s, 1, n_stream] I32 (from ggml_dsv4_lid_topk)
+    //   W     : tokens per union tile; 0 (or >= nt_s) = one tile for the whole
+    //           batch. T = ceil(nt_s/W) tiles; the last tile may be partial.
+    // union : [u_max, T, 1, n_stream] I32 — sorted unique union per tile,
+    //         padded with (n_csa-1). u_max caps the union (overflow drops the
+    //         highest-index cells; size it >= expected union).
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_union(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            int                   n_csa,
+            int                   u_max,
+            int                   W);
+
+    // Membership mask for the union: memb[u, t] = 0 if token t selected
+    // union[u] of ITS tile (tile = t/W from uni), -INFINITY otherwise (and
+    // -INFINITY for padded union slots).
+    //   top_k : [n_top_k, nt_s, 1, n_stream] I32
+    //   uni   : [u_max, T, 1, n_stream]      I32 (from ggml_dsv4_lid_union)
+    // out : [u_max, nt_s, 1, n_stream] F32 — reshapeable to [u_max, W, 1, T]
+    //       when n_stream == 1 and nt_s == W*T.
+    GGML_API struct ggml_tensor * ggml_dsv4_lid_memb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * uni,
+            int                   n_csa);
+
+    // DeepSeek-V4 hyper-connection residual mixing, fused (see dsv4_hc_fused.cuh).
+    // weighted_sum: out[e,t] = sum_ih x[e,ih,t]*weights[ih,t]
+    //   x [n_embd,hc,nt], weights [hc,nt] -> [n_embd,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // post: out[e,dst,t] = x[e,t]*post[dst,t] + sum_src residual[e,src,t]*comb[dst,src,t]
+    //   x [n_embd,nt], residual [n_embd,hc,nt], post [hc,nt], comb [dst,src,nt] -> [n_embd,hc,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_fused_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
+
+    // set_rows variant that scatters f32 rows b into MXFP4 container a at row
+    // indices c, quantizing with the DSV4 QAT rounding (scale
+    // exp2(ceil(log2(amax/6))), even-index tie-break) — NOT ggml's stock
+    // mxfp4 quantizer (the official e2m1 indexer numeric, folded into the scatter).
+    // a: [ne0, kv_size] MXFP4 (ne0 % 32 == 0); b: [ne0, n_rows] F32;
+    // c: [n_rows] I64/I32. 2D only.
+    GGML_API struct ggml_tensor * ggml_dsv4_qat_set_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
+    // sinkhorn: softmax along ne0, +eps per element, then column normalization
+    // followed by (n_iters-1) x (row, column) normalizations — the whole
+    // unrolled ~85-node ggml chain in one op.
+    //   comb [dst,src,nt] -> [dst,src,nt]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * comb,
+            int                   n_iters,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2445,6 +2538,33 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // like ggml_flash_attn_ext, but the result carries a per-row log-sum-exp
+    // tail: res ne3 = q ne3 + 1; the extra slice holds lse[h, iq, s] at
+    // element offset n_embd_v*n_head*n_batch*ne3, idx = (s*n_batch + iq)*n_head + h.
+    // View the [.., ne3] prefix as the attention output. Requires
+    // n_embd_v >= ne3. Used by the DSV4 split-attention LSE merge.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_with_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    GGML_API bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a);
+
+    // merge two ggml_flash_attn_ext_with_lse results computed over disjoint KV
+    // subsets of the same queries: out = (ea*a + eb*b) / (ea + eb) per row,
+    // ea = exp(lse_a - max(lse_a, lse_b)), eb likewise. a, b:
+    // [n_embd_v, n_head, n_batch, ne3+1] with the LSE tail; res:
+    // [n_embd_v, n_head, n_batch, ne3] normalized, no tail.
+    GGML_API struct ggml_tensor * ggml_dsv4_fa_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
