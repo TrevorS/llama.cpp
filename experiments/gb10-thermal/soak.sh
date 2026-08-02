@@ -22,7 +22,8 @@ cd /home/trevor/Projects/llama.cpp
 MINUTES=${1:-45}
 OUT=${OUT:-$HOME/thermal/soak-$(date +%Y%m%d-%H%M)}
 PORT=8232
-SOC_ABORT=90
+SOC_ABORT=${SOC_ABORT:-93}   # 93, not 90: both wedges lived at 94-98 C (README 3.0),
+                             # and aborting at 90 killed two soaks before they could plateau
 MEM_FLOOR=3000
 
 M=~/models/ds4/0731/unsloth-iq3xxs-v2/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf
@@ -36,6 +37,7 @@ avail(){ echo $(( $(grep MemAvailable /proc/meminfo | tr -dc '0-9') / 1024 )); }
 echo "════ GB10 soak: ${MINUTES} min, clock-capped, NO duty cycling ════"
 echo "  out: $OUT"
 echo "  clock cap: $(systemctl is-active gb10-clock-cap.service 2>/dev/null)  governor: $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor)"
+echo "  POWER=${POWER:-none}  GRAN=${GRAN:-none}  PIN=${PIN:-none}  abort=${SOC_ABORT}C"
 echo "  SoC start $(soc) C   avail $(avail) MiB"
 
 # ---- telemetry ----
@@ -43,6 +45,7 @@ spark-monitor --log "$OUT/spark.csv" --interval 1 > /dev/null 2>&1 &
 SPARK=$!
 
 # ---- server: production config, minus GGML_CUDA_POWER ----
+${PIN:+taskset -c $PIN} \
 env LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1 \
     ${POWER:+GGML_CUDA_POWER=$POWER} ${GRAN:+GGML_CUDA_GRANULARITY=$GRAN} \
 build/bin/llama-server -m "$M" --alias soak -lm none \
