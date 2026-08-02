@@ -118,7 +118,6 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
-    cparams.mtp_draft_chain      = false;
     // never assigned anywhere else: without this it is read as indeterminate
     // memory in dspark.cpp's decoder, arming the in-graph draft chain at random
     cparams.dspark_draft_chain      = false;
@@ -944,13 +943,6 @@ float * llama_context::get_embeddings_nextn() {
     return embd_nextn.data;
 }
 
-const float * llama_context::get_mtp_draft_meta(uint32_t * count) {
-    if (count) {
-        *count = (uint32_t) mtp_draft_meta.size();
-    }
-    return mtp_draft_meta.empty() ? nullptr : mtp_draft_meta.data();
-}
-
 const float * llama_context::get_dspark_draft_meta(uint32_t * count) {
     if (count) {
         *count = (uint32_t) dspark_draft_meta.size();
@@ -1204,21 +1196,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
-void llama_context::set_mtp_draft_chain(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
-
-    // no sched reserve: chain graphs are excluded from reserve-shape ubatches
-    // anyway (nt gate) and the meta tensor is protected by the OUTPUT-flag
-    // propagation in set_outputs. This keeps per-decode toggling free (the
-    // MTP driver flips it around each draft decode).
-    cparams.mtp_draft_chain = value;
-}
-
 void llama_context::set_dspark_draft_chain(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // same rationale as set_mtp_draft_chain: the chain graph is gated out of the
-    // reserve-shape ubatches by its n_tokens window, and t_dspark_meta is kept
+    // the chain graph is gated out of the reserve-shape ubatches by its
+    // n_tokens window, and t_dspark_meta is kept
     // alive by the OUTPUT-flag propagation in set_outputs, so toggling per decode
     // costs nothing.
     cparams.dspark_draft_chain = value;
@@ -2053,20 +2035,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
-            }
-        }
-
-        // extract MTP fused chained-draft meta (small: [K] token ids per chained ubatch)
-        if (cparams.mtp_draft_chain) {
-            auto * t_meta = res->get_mtp_draft_meta();
-            if (t_meta != nullptr) {
-                ggml_backend_t backend_meta = ggml_backend_sched_get_tensor_backend(sched.get(), t_meta);
-                GGML_ASSERT(backend_meta != nullptr);
-
-                mtp_draft_meta.resize(ggml_nelements(t_meta));
-                ggml_backend_tensor_get_async(backend_meta, t_meta, mtp_draft_meta.data(), 0, ggml_nbytes(t_meta));
-            } else {
-                mtp_draft_meta.clear();
             }
         }
 
@@ -3865,16 +3833,6 @@ bool llama_is_swa_only(const llama_context * ctx, int32_t * n_swa) {
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
-}
-
-void llama_set_mtp_draft_chain(llama_context * ctx, bool value) {
-    ctx->set_mtp_draft_chain(value);
-}
-
-const float * llama_get_mtp_draft_meta(llama_context * ctx, uint32_t * count) {
-    ctx->synchronize();
-
-    return ctx->get_mtp_draft_meta(count);
 }
 
 void llama_set_dspark_draft_chain(llama_context * ctx, bool value) {

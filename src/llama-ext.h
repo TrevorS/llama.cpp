@@ -9,15 +9,6 @@
 #include <cstdint>
 #include <map>
 
-// MTP fused chained draft (LLAMA_MTP_FUSED_DRAFT): run the chained draft
-// (greedy argmax + in-graph h-chaining) inside the block-decode graph instead
-// of on the host. Draft token ids are exported as one f32 per chained row.
-LLAMA_API void          llama_set_mtp_draft_chain(struct llama_context * ctx, bool value);
-// Returns the meta from the most recent decode ([K] floats: one token id per
-// chained row) or nullptr if the last decode built no chain. `count`
-// (optional) receives the number of floats.
-LLAMA_API const float * llama_get_mtp_draft_meta(struct llama_context * ctx, uint32_t * count);
-
 // DSpark in-graph chained draft. When enabled, the decoder graph runs the whole
 // semi-autoregressive block on-device -- Markov bias, greedy argmax and the
 // confidence head, chained position to position -- instead of the driver pulling

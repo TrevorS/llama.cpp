@@ -1271,7 +1271,6 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
-    t_mtp_draft_meta = nullptr;
     t_dspark_meta    = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
@@ -1322,10 +1321,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_dspark_meta != nullptr) {
         ggml_set_output(t_dspark_meta);
-    }
-
-    if (t_mtp_draft_meta != nullptr) {
-        ggml_set_output(t_mtp_draft_meta);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;

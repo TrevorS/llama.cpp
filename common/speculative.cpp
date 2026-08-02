@@ -1487,10 +1487,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t batch_cap = 0;
 
-    // fused chained draft: all K draft steps run in ONE decode with in-graph
-    // greedy argmax feedback (ds4.c combined-forward analog); greedy-only
-    bool fused_chain = false;
-
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1539,15 +1535,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        // fused chained draft (single-head growing-KV drafts only). Backend
-        // samplers are incompatible with it (the chain decode has K output
-        // rows per seq; the drafted ids come back via the draft-meta tensor).
-        // Measured: ids identical to the sequential path, throughput a wash
-        // (21.0 vs 21.1 t/s - the sequential decodes were already GPU-bound
-        // with backend sampling), so this stays opt-in.
-        fused_chain = !chain_heads && !is_mem_shared &&
-                      std::getenv("LLAMA_MTP_FUSED_DRAFT") != nullptr;
-
         // ingest fusion: defer the verify-batch catch-up decode into the next
         // draft()'s seed decode (eagle3's deferred-boundary pattern). Default ON,
         // LLAMA_MTP_FUSE_INGEST=0 reverts to the standalone catch-up decode.
@@ -1557,11 +1544,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }();
 
         fuse_ingest = fuse_env && !chain_heads && !is_mem_shared;
-        if (fuse_ingest && fused_chain) {
-            // the chain graph assumes batch row 0 is the real seed
-            SPC_WRN("%s", "LLAMA_MTP_FUSED_DRAFT is set - disabling ingest fusion\n");
-            fuse_ingest = false;
-        }
 
         // suffix-truncated ingest: a pure-SWA draft over raw KV rows only ever
         // reads the last n_swa rows, so ingesting a long span can skip
@@ -1580,7 +1562,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !fused_chain) {
+        if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -2059,59 +2041,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
-            }
-        }
-
-        // fused chained draft: append K-1 placeholder rows to the seed batch and
-        // decode once; the graph chains argmax feedback and exports the drafted
-        // ids via the draft-meta tensor. Greedy-only (p_min == 0), single seq.
-        if (fused_chain && n_drafting == 1 && params.p_min <= 0.0f && params.n_max >= 2) {
-            llama_seq_id seq_id = 0;
-            while (seq_id < (llama_seq_id) n_seq && !drafting[seq_id]) {
-                seq_id++;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t K = params.n_max;
-            for (int32_t k = 1; k < K; ++k) {
-                // placeholder rows: the graph replaces token/h with the chain.
-                // logits=false - the drafted ids come back via the meta tensor,
-                // and the draft ctx caps outputs per decode (n_outputs_max)
-                common_batch_add(batch, dp.id_last, dp.n_past + k, { seq_id }, false);
-                std::memset(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, 0, row_bytes);
-            }
-
-            llama_set_mtp_draft_chain(ctx_dft, true);
-            const int ret = llama_decode(ctx_dft, batch);
-            llama_set_mtp_draft_chain(ctx_dft, false);
-
-            if (ret == 0) {
-                uint32_t n_meta = 0;
-                const float * meta = llama_get_mtp_draft_meta(ctx_dft, &n_meta);
-
-                if (meta != nullptr && n_meta >= (uint32_t) K) {
-                    auto & result = *dp.result;
-                    for (int32_t k = 0; k < K; ++k) {
-                        result.push_back((llama_token) meta[k]);
-                    }
-                    if (result.size() < (size_t) params.n_min) {
-                        result.clear();
-                    }
-                    return;
-                }
-                SPC_DBG("mtp fused meta unavailable (n_meta=%u, expect %u) - sequential fallback\n",
-                        n_meta, (uint32_t) K);
-                // the chain decode already wrote KV cells for all K rows and the
-                // graph didn't run the chain - reset the draft region and fall
-                // back to the sequential path from scratch
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
-                common_batch_clear(batch);
-                common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-                std::memcpy(batch.embd, pending_h[seq_id].data(), row_bytes);
-                i_last[seq_id] = 0;
-            } else {
-                SPC_ERR("fused chain llama_decode returned %d\n", ret);
-                return;
             }
         }
 
