@@ -55,20 +55,6 @@ public:
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
-    // Speculative-rollback frontier stash. spec_stash() snapshots the whole
-    // kv/score ring per layer (device-to-device). spec_restore_rows() copies
-    // back only the ring rows of the REJECTED positions [p0, p1] — within one
-    // verify ubatch every position occupies a distinct ring slot (nt <
-    // state_size), so the live ring already holds the accepted rows' values
-    // and only the rejected slots need rewinding.
-    //
-    // The stash buffers (~2x the live compressor state) are allocated lazily on
-    // the first spec_stash() — a load that never speculatively rewinds (bench,
-    // non-spec serving) pays no stash VRAM. Returns false if that allocation
-    // fails, so the caller falls back to full checkpoint restore.
-    bool spec_stash();
-    void spec_restore_rows(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-
 private:
     struct layer {
         uint32_t il;
@@ -76,18 +62,9 @@ private:
         ggml_tensor * kv;
         ggml_tensor * score;
 
-        std::vector<ggml_tensor *> kv_stream;    // upstream: per-stream views
+        std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
-
-        ggml_tensor * kv_stash;                  // ours: MTP frontier-rewind snapshot (lazy)
-        ggml_tensor * score_stash;
-
-        ggml_backend_buffer_type_t buft;         // where to lazily allocate the stash
     };
-
-    // allocate the per-layer stash buffers on first use; true once ready,
-    // false if the backend allocation failed (leaves the stash unallocated).
-    bool ensure_stash_allocated();
 
     const uint32_t ratio;
     const uint32_t state_size;
@@ -96,8 +73,6 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> stash_ctxs_bufs; // lazy
-    bool stash_allocated = false;
 
     std::vector<layer> layers;
 
@@ -183,24 +158,7 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
-    // Speculative partial-accept rewind (ds4.c frontier-snapshot analog).
-    // spec_frontier_stash() snapshots the compressor frontier before a verify
-    // decode; spec_frontier_restore() rewinds only the rejected positions'
-    // ring rows afterwards, leaving the accepted rows' contributions (already
-    // in the live ring) and the raw cells (trimmed separately via seq_rm)
-    // intact. The compressed-cache body needs no rewind: visibility is
-    // position-derived and stale block rows are overwritten on re-decode.
-    // returns false if the (lazily-allocated) stash could not be created, so the
-    // caller falls back to full checkpoint restore instead of frontier rewind
-    bool spec_frontier_stash(llama_seq_id seq_id, llama_pos pos_max);
-    bool spec_frontier_restore(llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject);
-
 private:
-    // frontier stash bookkeeping: per-seq frontier position at stash time.
-    // The stash tensors cover all streams; per-seq streams isolate slots, so
-    // stashes of the same pre-verify moment coexist across slots.
-    std::map<llama_seq_id, llama_pos> spec_stash_pos;
-
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;

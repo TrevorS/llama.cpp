@@ -966,7 +966,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             throw std::runtime_error("no nextn embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd_nextn();
+        const uint32_t n_embd = model.hparams.n_embd_out();
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1589,7 +1589,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_nextn();
+        const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -2048,7 +2048,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_nextn();
+                const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -2186,7 +2186,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    const uint32_t n_embd_nextn = model.hparams.n_embd_nextn();
+    const uint32_t n_embd_nextn = model.hparams.n_embd_out();
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max        : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max     : 0;
@@ -2375,7 +2375,7 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
-            const uint64_t n_embd_nextn = model.hparams.n_embd_nextn();
+            const uint64_t n_embd_nextn = model.hparams.n_embd_out();
             for (uint64_t k = 0; k < n_embd_nextn; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
             }
@@ -3873,28 +3873,6 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
 
 void llama_set_mtp_draft_chain(llama_context * ctx, bool value) {
     ctx->set_mtp_draft_chain(value);
-}
-
-bool llama_dsv4_spec_stash(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
-
-    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
-    if (kv == nullptr) {
-        return false;
-    }
-
-    return kv->spec_frontier_stash(seq_id, kv->seq_pos_max(seq_id));
-}
-
-bool llama_dsv4_spec_restore(llama_context * ctx, llama_seq_id seq_id, llama_pos p0_reject, llama_pos p1_reject) {
-    ctx->synchronize();
-
-    auto * kv = dynamic_cast<llama_kv_cache_dsv4 *>(ctx->get_memory());
-    if (kv == nullptr) {
-        return false;
-    }
-
-    return kv->spec_frontier_restore(seq_id, p0_reject, p1_reject);
 }
 
 const float * llama_get_mtp_draft_meta(llama_context * ctx, uint32_t * count) {

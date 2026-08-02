@@ -11,7 +11,6 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
-#include "../../src/llama-ext.h" // staging API: llama_dsv4_spec_stash/restore (frontier rewind)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -216,10 +215,6 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
-
-    // this round's rollback protection is a DSV4 frontier stash (KiB-scale)
-    // instead of a full spec_ckpt target dump; see llama_dsv4_spec_stash
-    bool spec_frontier = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -1003,10 +998,6 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
-    // DSV4 frontier-stash rollback for speculative rounds (kill switch:
-    // LLAMA_DSV4_SPEC_FRONTIER=0). Ignored when the memory is not DSV4.
-    bool spec_frontier_enabled = true;
-
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -1376,11 +1367,6 @@ private:
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
-
-        if (const char * s = std::getenv("LLAMA_DSV4_SPEC_FRONTIER")) {
-            spec_frontier_enabled = atoi(s) != 0;
-        }
-        SRV_INF("dsv4 spec frontier rollback: %s\n", spec_frontier_enabled ? "enabled" : "disabled");
 
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
@@ -3226,26 +3212,12 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    // DSV4 frontier stash: a KiB-scale device snapshot of the
-                    // compressor frontier replaces the MiB-scale full state
-                    // dump when the memory supports it. Streams isolate slots,
-                    // so per-slot stashes of the same pre-verify moment coexist.
-                    slot.spec_frontier = spec_frontier_enabled &&
-                                         llama_dsv4_spec_stash(ctx_tgt, slot.id);
+                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    if (!slot.spec_frontier) {
-                        //const int64_t t_start = ggml_time_us();
-
-                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                        //const int64_t t_total = ggml_time_us() - t_start;
-                        //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-
-                        SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
-                                ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
-                                (float) ckpt.size() / 1024 / 1024,
-                                (float) ckpt.data_dft.size() / 1024 / 1024);
-                    }
+                    SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                            ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+                            (float) ckpt.size() / 1024 / 1024,
+                            (float) ckpt.data_dft.size() / 1024 / 1024);
                 }
 
                 if (use_ckpt_dft) {
@@ -4085,27 +4057,7 @@ private:
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
-                    if (use_ckpt_tgt && slot.spec_frontier) {
-                        // DSV4 frontier rewind: restore only the rejected
-                        // positions' compressor-frontier ring rows, keep the
-                        // accepted rows' raw cells and ring contributions, and
-                        // fall through to the normal accept path below - no
-                        // full state reload, no re-verify round.
-                        const auto & ckpt = slot.spec_ckpt;
-
-                        const llama_pos p0_reject = ckpt.pos_max + (llama_pos) accepted.size() + 1;
-                        const llama_pos p1_reject = ckpt.pos_max + (llama_pos) n_draft + 1;
-
-                        const bool ok = llama_dsv4_spec_restore(slot.ctx_tgt, slot.id, p0_reject, p1_reject);
-                        GGML_ASSERT(ok && "dsv4 frontier restore failed - stash out of sync with verify round");
-
-                        if (trace > 0) {
-                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (frontier rewind)\n", accepted.size() - 1, slot.spec_draft.size());
-                        }
-                        // the deep raw-tail trim happens on the normal path via
-                        // common_context_seq_rm at pos_next(), which the dsv4
-                        // cache accepts now that the frontier is consistent
-                    } else if (use_ckpt_tgt) {
+                    if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
