@@ -1091,7 +1091,14 @@ json oaicompat_chat_params_parse(
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
+        } else if (!reasoning_effort.empty() && !inputs.chat_template_kwargs.count("reasoning_effort")) {
+            // The remaining OAI levels ("low"/"medium"/"high"/"max"/...) are
+            // model-specific, so forward them verbatim and let the template decide
+            // what they mean — templates that ignore the variable are unaffected.
+            // Stored JSON-encoded to match how chat_template_kwargs is populated
+            // above. An explicit chat_template_kwargs entry always wins.
+            inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        }
     }
 
     inputs.force_pure_content = opt.force_pure_content;
