@@ -160,3 +160,51 @@ def test_cache_disk_eager_store_survives_hard_kill(tmp_path):
 
     server.stop()
     assert "disk prompt cache: restored" in log2.read_text()
+
+
+def test_cache_disk_restore_is_faithful(tmp_path):
+    """A restored prefix must generate exactly what the live slot would have generated.
+
+    Skipping prefill is only useful if the skipped work is reconstructed faithfully; a
+    subtly-wrong restore looks like a win and silently degrades output. The control is a
+    HOT slot continuing in-process, not a cold monolithic prefill of the whole history --
+    those two differ numerically anyway (incremental vs single-pass), with or without any
+    cache, so comparing against cold would conflate restore fidelity with that.
+    """
+    global server
+    cache_dir = server.cache_disk
+    server.cache_disk_interval_tokens = 8
+    server.log_path = str(tmp_path / "fid1.log")
+    server.start()
+
+    turn1 = {"prompt": "The capital of France is Paris. The capital of Japan is Tokyo.",
+             "cache_prompt": True, "n_predict": 4, "temperature": 0.0}
+    turn2 = {"prompt": "The capital of France is Paris. The capital of Japan is Tokyo."
+                       " Therefore the two cities named are",
+             "cache_prompt": True, "n_predict": 8, "temperature": 0.0}
+
+    assert server.make_request("POST", "/completion", data=turn1).status_code == 200
+
+    # continuation on the still-live slot: the reference behaviour
+    res_hot = server.make_request("POST", "/completion", data=turn2)
+    assert res_hot.status_code == 200
+    hot_text = res_hot.body["content"]
+
+    deadline = time.time() + 20
+    while time.time() < deadline and not list(Path(cache_dir).glob("*.dkv")):
+        time.sleep(0.5)
+    assert list(Path(cache_dir).glob("*.dkv"))
+
+    server.process.kill()
+    server.process.wait(timeout=10)
+    server.process = None
+
+    server.log_path = str(tmp_path / "fid2.log")
+    server.start()
+    res_restored = server.make_request("POST", "/completion", data=turn2)
+    assert res_restored.status_code == 200
+
+    assert res_restored.body["content"] == hot_text, (
+        f"restored prefix changed the output: hot={hot_text!r} restored={res_restored.body['content']!r}"
+    )
+    server.stop()
