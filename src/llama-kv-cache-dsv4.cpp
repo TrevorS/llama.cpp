@@ -1567,11 +1567,17 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         }
 
         if (n_rs_seq == 0) {
+            LLAMA_LOG_DEBUG("%s: seq %d p0=%d rejected: rollback ring disabled (n_rs_seq=0)\n",
+                    __func__, seq_id, p0);
             return false;
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+            // caller must fall back to a checkpoint restore: the ring only holds
+            // n_rs_seq snapshot planes of the compressor state
+            LLAMA_LOG_DEBUG("%s: seq %d p0=%d rejected: rollback %d out of ring depth %u (pos_max=%d)\n",
+                    __func__, seq_id, p0, rollback, n_rs_seq, pos_max);
             return false;
         }
 
@@ -1830,6 +1836,16 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
 }
 
 bool llama_kv_cache_dsv4::spec_frontier_stash(llama_seq_id seq_id, llama_pos pos_max) {
+    // the n_rs_seq rollback ring supersedes this stash: it snapshots the same
+    // compressor rows in-graph, to depth n_rs_seq, and seq_rm rewinds to them
+    // directly. With the ring active the server only reaches here for
+    // over-depth rollbacks, which the ring cannot serve either - so fall back
+    // to the full checkpoint. (The stash is sized n_stream, not the ring's
+    // n_stream*(1 + n_rs_seq) planes, so copying into it would assert.)
+    if (n_rs_seq > 0) {
+        return false;
+    }
+
     // all three states share the lazy-stash lifecycle; if any fails to allocate,
     // don't record the frontier so the caller falls back to checkpoint restore
     if (!csa_state->spec_stash() || !hca_state->spec_stash() || !lid_state->spec_stash()) {
