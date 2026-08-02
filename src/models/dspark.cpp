@@ -730,7 +730,7 @@ llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_gra
     // -- the ids do not exist yet here. Exporting x lets the driver call
     // llama_dspark_confidence_logit() with the prev id it just sampled.
     //
-    // n_embd_nextn() falls back to n_embd_out(), so these rows are [n_embd, n_tok]
+    // n_embd_out() is the hc-expanded width, so these rows are [n_embd, n_tok]
     // and the driver's `h + idx*n_embd_dec` indexing lands on row idx.
     // Without this the decoder left t_h_nextn unset and llama_get_embeddings_nextn()
     // still returned the previous ENCODE's fused features -- p_min then truncated

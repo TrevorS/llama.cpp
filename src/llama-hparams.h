@@ -216,7 +216,6 @@ struct llama_hparams {
 
     // nextn/MTP hidden-state row width (0 = use n_embd)
     // e.g. deepseek4 exports the flattened hc-stream state: n_embd * hc_mult
-    uint32_t n_embd_nextn_impl = 0;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
@@ -359,7 +358,6 @@ struct llama_hparams {
     uint32_t n_embd_out() const;
 
     // row width of the nextn/MTP hidden-state export (h_nextn)
-    uint32_t n_embd_nextn() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;

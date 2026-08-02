@@ -2508,10 +2508,6 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
-int32_t llama_model_n_embd_nextn(const llama_model * model) {
-    return model->hparams.n_embd_nextn();
-}
-
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }

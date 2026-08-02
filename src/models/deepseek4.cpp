@@ -68,7 +68,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
 
         // draft input rows = the target's flattened hc-stream state
         hparams.n_embd_inp_impl   = hparams.n_embd * hparams.dsv4_hc_mult;
-        hparams.n_embd_nextn_impl = hparams.n_embd * hparams.dsv4_hc_mult;
+        hparams.n_embd_out_impl   = hparams.n_embd * hparams.dsv4_hc_mult;
 
         type = LLM_TYPE_UNKNOWN;
         return;
@@ -108,7 +108,6 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // nextn/MTP export width: the DS4 MTP head consumes the flattened
     // hc-stream state, not the collapsed hidden state (see graph tail).
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
-    hparams.n_embd_nextn_impl = hparams.n_embd * hparams.dsv4_hc_mult;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -1591,7 +1590,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer0 = model.layers[0];
         GGML_ASSERT(layer0.nextn.e_proj && layer0.nextn.h_proj && layer0.nextn.enorm && layer0.nextn.hnorm);
 
-        const int64_t n_embd_h = hparams.n_embd_nextn();
+        const int64_t n_embd_h = hparams.n_embd_out();
 
         auto inp_eh = std::make_unique<llm_graph_input_embd_h>(n_embd_h);
 
