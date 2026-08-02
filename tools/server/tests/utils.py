@@ -111,6 +111,7 @@ class ServerProcess:
     cache_ram: int | None = None
     cache_disk: str | None = None
     cache_disk_min_tokens: int | None = None
+    cache_disk_interval_tokens: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -267,6 +268,8 @@ class ServerProcess:
             server_args.extend(["--cache-disk", self.cache_disk])
         if self.cache_disk_min_tokens is not None:
             server_args.extend(["--cache-disk-min-tokens", self.cache_disk_min_tokens])
+        if self.cache_disk_interval_tokens is not None:
+            server_args.extend(["--cache-disk-interval-tokens", self.cache_disk_interval_tokens])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
