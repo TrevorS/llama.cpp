@@ -757,7 +757,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
-    udata->embd      .resize(n_embd_all);
+    // reserve + append instead of resize: every row is copied in below, so the
+    // value-initializing resize would be a wasted zero-fill of the whole block
+    // (n_tokens*n_embd floats - hundreds of MB for a wide-embd draft ubatch)
+    udata->embd      .reserve(n_embd_all);
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
     udata->seq_id    .resize(n_tokens);
@@ -775,7 +778,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         if (batch.embd) {
-            memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
+            const float * src = batch.embd + (int64_t) idxs[i]*n_embd;
+            udata->embd.insert(udata->embd.end(), src, src + n_embd);
         }
 
         for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
