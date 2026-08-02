@@ -6174,59 +6174,6 @@ struct test_dsv4_fa_merge : public test_case {
     }
 };
 
-// GGML_OP_DSV4_UNION_GATHER (fused tile-union row gather + type convert)
-struct test_dsv4_union_gather : public test_case {
-    const int64_t hd, n_src, u_cap, T;
-    const ggml_type dst_type;
-
-    std::string vars() override {
-        return "hd=" + std::to_string(hd) + ",n_src=" + std::to_string(n_src) +
-               ",u_cap=" + std::to_string(u_cap) + ",T=" + std::to_string(T) +
-               ",dst_type=" + std::string(ggml_type_name(dst_type));
-    }
-
-    // pure gather + one F32->F16 rounding; CPU and CUDA both round to
-    // nearest-even, so this should be near-exact
-    double max_nmse_err() override { return 1e-6; }
-
-    test_dsv4_union_gather(int64_t hd, int64_t n_src, int64_t u_cap, int64_t T, ggml_type dst_type)
-        : hd(hd), n_src(n_src), u_cap(u_cap), T(T), dst_type(dst_type) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, n_src);
-        ggml_set_name(src, "src");
-        ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, u_cap, T, 1, 1);
-        ggml_set_name(idx, "idx");
-        ggml_tensor * out = ggml_dsv4_union_gather(ctx, src, idx, dst_type);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32) {
-                // mirror dsv4_union_kernel's output contract: per tile, sorted
-                // unique in-range indices, tail-padded with n_src-1 (repeated —
-                // duplicates must just produce duplicate rows)
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t tt = 0; tt < T; tt++) {
-                    const int64_t n_real = 1 + rand() % std::min(u_cap, n_src);
-                    std::vector<int32_t> rows(n_real);
-                    for (auto & v : rows) v = rand() % n_src;
-                    std::sort(rows.begin(), rows.end());
-                    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-                    int64_t p = 0;
-                    for (int32_t c : rows) data[tt*u_cap + p++] = c;
-                    for (; p < u_cap; p++) data[tt*u_cap + p] = (int32_t) (n_src - 1);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
 // GGML_OP_TOP_K
 struct test_top_k : public test_case {
     const ggml_type type;
@@ -9979,10 +9926,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_fa_merge(128, 4, 35, 3, 0, 0, 3));
 
     // fused tile-union gather + convert (get_rows F32 round-trip replacement)
-    test_cases.emplace_back(new test_dsv4_union_gather(512, 16384, 4096, 8, GGML_TYPE_F16)); // production tile geometry
-    test_cases.emplace_back(new test_dsv4_union_gather(512, 16384, 4096, 8, GGML_TYPE_F32)); // no-convert arm
-    test_cases.emplace_back(new test_dsv4_union_gather(128,  1000,   64, 3, GGML_TYPE_F16)); // odd sizes
-    test_cases.emplace_back(new test_dsv4_union_gather(512, 12288, 4096, 1, GGML_TYPE_F16)); // single tile
 
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 256, 7));   // lid shape
     test_cases.emplace_back(new test_dsv4_qat_set_rows(128, 64, 64));   // every row

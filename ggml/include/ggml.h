@@ -596,7 +596,6 @@ extern "C" {
         GGML_OP_DSV4_HC_FUSED,
         GGML_OP_DSV4_QAT_SET_ROWS,
         GGML_OP_DSV4_FA_MERGE,
-        GGML_OP_DSV4_UNION_GATHER,
 
         GGML_OP_COUNT,
     };
@@ -2453,20 +2452,6 @@ extern "C" {
             struct ggml_tensor  * top_k,
             struct ggml_tensor  * uni,
             int                   n_csa);
-
-    // Fused row gather + type convert for the B2 tile-union path: replaces the
-    // get_rows (always F32) -> cast -> reshape chain, skipping the full-F32
-    // intermediate round-trip.
-    //   src : [hd, n_rows_src, 1, 1] F32 — rows may be strided (cache view; nb[1] honored)
-    //   idx : [u_cap, T, 1, 1]       I32 (from ggml_dsv4_lid_union; entries in
-    //         [0, n_rows_src), ascending per tile, tail-padded with n_rows_src-1;
-    //         duplicates legal — they produce duplicate rows)
-    // out : [hd, 1, u_cap, T] dst_type (F16 or F32) — the shape the tiled FA consumes.
-    GGML_API struct ggml_tensor * ggml_dsv4_union_gather(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * src,
-            struct ggml_tensor  * idx,
-            enum ggml_type        dst_type);
 
     // DeepSeek-V4 hyper-connection residual mixing, fused (see dsv4_hc_fused.cuh).
     // weighted_sum: out[e,t] = sum_ih x[e,ih,t]*weights[ih,t]

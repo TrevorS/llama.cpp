@@ -8835,48 +8835,6 @@ void ggml_compute_forward_dsv4_fa_merge(
         }
     }
 }
-
-// ggml_compute_forward_dsv4_union_gather
-//
-// fused row gather + type convert for the B2 tile-union path:
-// dst[:, 0, u, t] = (dst_type) src[:, idx[u, t]]. src rows may be strided
-// (CSA cache view) — nb[1] honored; idx entries are in [0, n_rows_src).
-
-void ggml_compute_forward_dsv4_union_gather(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * src = dst->src[0]; // [hd, n_rows_src, 1, 1] F32
-    const ggml_tensor * idx = dst->src[1]; // [u_cap, T, 1, 1] I32
-
-    GGML_ASSERT(src->type == GGML_TYPE_F32);
-    GGML_ASSERT(idx->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(src->nb[0] == sizeof(float));
-
-    const int64_t hd    = dst->ne[0];
-    const int64_t u_cap = dst->ne[2];
-    const int64_t n_t   = dst->ne[3];
-    const int64_t n_src = src->ne[1];
-
-    const int64_t n_out = u_cap*n_t;
-    for (int64_t ro = params->ith; ro < n_out; ro += params->nth) {
-        const int64_t u = ro % u_cap;
-        const int64_t t = ro / u_cap;
-        const int64_t r = *(const int32_t *)((const char *) idx->data + u*idx->nb[0] + t*idx->nb[1]);
-        GGML_ASSERT(r >= 0 && r < n_src);
-        const float * s = (const float *)((const char *) src->data + r*src->nb[1]);
-        char * d = (char *) dst->data + u*dst->nb[2] + t*dst->nb[3];
-        if (dst->type == GGML_TYPE_F32) {
-            memcpy(d, s, hd*sizeof(float));
-        } else {
-            ggml_fp16_t * dh = (ggml_fp16_t *) d;
-            for (int64_t i = 0; i < hd; i++) {
-                dh[i] = GGML_CPU_FP32_TO_FP16(s[i]);
-            }
-        }
-    }
-}
-
 // ggml_compute_forward_top_k
 
 struct cmp_top_k {
