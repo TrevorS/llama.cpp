@@ -877,9 +877,14 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    // DSpark in-graph draft chain export: [2, K] f32 = (drafted id, confidence
+    // logit) per chained proposal row (see llama_model_dspark::graph<false>)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // MTP fused chained-draft export: [K] f32 = drafted token id per chained
+    // proposal row (see deepseek4.cpp MTP chain graph)
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1096,6 +1101,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

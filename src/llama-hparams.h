@@ -22,7 +22,23 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_STANDARD  = 1,
     LLAMA_SWA_TYPE_CHUNKED   = 2,
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
+    // Window anchored at the start of the ubatch's block rather than sliding per
+    // query: every query in the block sees the same `n_swa` history keys plus the
+    // whole block. Used by semi-autoregressive block drafters (DSpark), whose
+    // reference keeps one ring cache per block -- sglang derives prefix_lens from
+    // the block's first token and broadcasts the same page indices to all block
+    // rows, and SpecForge's mask spec derives anchor_pos from q_idx / block_size
+    // only. STANDARD instead drops j+1 of the oldest history keys at block offset
+    // j, which no choice of n_swa can correct.
+    // The mask builder passes the per-sequence min batch position as `p1`.
+    LLAMA_SWA_TYPE_BLOCK_ANCHORED = 4,
 };
+
+// Extra history the *cache* keeps for BLOCK_ANCHORED beyond n_swa. Cell reuse in
+// find_slot() tests against a running max position, not the next block's anchor,
+// so without slack it would recycle cells the next block still needs. Bounded by
+// the widest draft block we build.
+#define LLAMA_SWA_BLOCK_ANCHOR_SLACK 32
 
 // forward declaration; full definition in llama-graph.h
 enum llm_ffn_op_type : int;
@@ -198,6 +214,9 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    // nextn/MTP hidden-state row width (0 = use n_embd)
+    // e.g. deepseek4 exports the flattened hc-stream state: n_embd * hc_mult
+
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
     uint32_t n_no_rope_layer_step    = 4;
@@ -338,6 +357,8 @@ struct llama_hparams {
     // dimension of output embeddings
     uint32_t n_embd_out() const;
 
+    // row width of the nextn/MTP hidden-state export (h_nextn)
+
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;
     uint32_t n_embd_head_v(uint32_t il = 0) const;
@@ -401,6 +422,16 @@ struct llama_hparams {
                     const llama_pos pos_chunk_start = (p1 / n_swa) * n_swa;
 
                     if (p0 < pos_chunk_start) {
+                        return true;
+                    }
+                } break;
+            case LLAMA_SWA_TYPE_BLOCK_ANCHORED:
+                {
+                    // p1 is the block anchor, not the query position. Keys at or
+                    // past the anchor are the block itself and are never masked
+                    // (p1 - p0 <= 0); history is clipped to the n_swa keys ending
+                    // at the anchor, identically for every query in the block.
+                    if (p1 - p0 > (int32_t) n_swa) {
                         return true;
                     }
                 } break;

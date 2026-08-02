@@ -7,6 +7,10 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 
+// DSV4 compressor state (defined in llama-kv-cache-dsv4.h, included by
+// deepseek4.cpp); only used here by pointer in the deepseek4 graph helpers.
+class llama_dsv4_comp_state;
+
 //
 // base classes
 //
@@ -1132,11 +1136,37 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
 
+        // row >= 0 restricts the attention to a single ubatch row (used by the
+        // chained MTP draft graph): the kq mask column and k-idx entry for that
+        // row are sliced from the full-ubatch inputs. raw-attention layers only.
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                int il,
+                int row = -1) const;
+
+        // shared tail of the compressed-KV builders: permute -> softmax-weighted
+        // reduce over the block axis -> RMS norm -> per-block nope/pe split + rope.
+        // `values`/`scores` are [n_embd_head, ratio, n_blocks] pre-permute.
+        ggml_tensor * build_compressed_kv_reduce_finish(
+                ggml_tensor * values,
+                ggml_tensor * scores,
+                ggml_tensor * comp_pos,
+                ggml_tensor * norm,
+                int64_t n_embd_head,
+                int64_t n_blocks,
+                const char * name,
+                int il) const;
+
+        // shared persist tail of the CSA/LID/HCA compressor-state updates:
+        // gather the persisted rows and scatter them back into the ring cache.
+        void persist_comp_state(
+                ggml_tensor * state_kv,
+                ggml_tensor * state_score,
+                const llama_dsv4_comp_state * comp_state,
+                const llm_graph_input_dsv4::comp_input & inp,
                 int il) const;
 
         ggml_tensor * build_attention(
@@ -1152,7 +1182,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                int row = -1) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1217,12 +1248,12 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * kv,
                 ggml_tensor * sinks,
                 float kq_scale,
-                int il) const;
+                int il,
+                int row = -1) const;
 
-        ggml_tensor * build_hc_pre(
+        ggml_tensor * build_hc_weighted_sum(
                 ggml_tensor * x,
-                ggml_tensor * weights,
-                int il) const;
+                ggml_tensor * weights) const;
 
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,

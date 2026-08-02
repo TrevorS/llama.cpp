@@ -6,12 +6,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -116,6 +118,8 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    // never assigned anywhere else: without this it is read as indeterminate
+    // memory in dspark.cpp's decoder, arming the in-graph draft chain at random
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -495,6 +499,7 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1160,6 +1165,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // without this reserve the export tensor is not part of the worst-case
+    // allocation: after a graph-shape change (e.g. an nt>1 verify followed by
+    // an nt=1 decode) its memory gets recycled and the extracted rows go
+    // stale - same failure mode as set_embeddings_layer_inp below
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2111,14 +2122,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
-    embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    const uint32_t n_embd_nextn = model.hparams.n_embd_out();
+
+    logits.size     = has_logits     ? n_vocab*n_outputs_max        : 0;
+    embd.size       = has_embd       ? n_embd_out*n_outputs_max     : 0;
+    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max   : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        embd_nextn.size = (size_t) n_embd_nextn * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2298,8 +2311,9 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd_out; k++) {
-                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
+            const uint64_t n_embd_nextn = model.hparams.n_embd_out();
+            for (uint64_t k = 0; k < n_embd_nextn; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
             }
         }
 
@@ -2357,7 +2371,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // the DS4-family draft heads have few tensors but dense HC/MoE graphs —
+        // the 8*n_tensors default budget underestimates them badly
+        return std::max<uint32_t>(std::max(n_tokens * 40, 4096u), 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {
@@ -3748,6 +3764,38 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_is_swa_only(const llama_context * ctx, int32_t * n_swa) {
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    const auto & hparams = ctx->get_model().hparams;
+
+    if (n_swa) {
+        *n_swa = (int32_t) hparams.n_swa;
+    }
+
+    // only the standard window has the "reads exactly the last n_swa positions"
+    // shape - chunked/symmetric masks read outside it
+    if (hparams.swa_type != LLAMA_SWA_TYPE_STANDARD || hparams.n_swa == 0) {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (!hparams.is_swa(il)) {
+            return false;
+        }
+
+        // a DSV4 compressor layer carries ring state that is written from rows
+        // outside the window - the per-row-projection argument does not hold
+        if (hparams.dsv4_compress_ratios[il] != 0) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

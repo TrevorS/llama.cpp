@@ -107,6 +107,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// True when every layer of the context's model is standard sliding-window
+// attention over raw KV rows: swa_type == STANDARD, is_swa on every layer, and
+// no layer carries a DSV4 compressor ring (all compress ratios are 0). Under
+// this shape a cache row is a pure projection of its own input and attention at
+// position q reads only rows [q - n_swa + 1, q], so an ingest may drop
+// everything below that window. `n_swa` (optional) receives the window size.
+LLAMA_API bool llama_is_swa_only(const struct llama_context * ctx, int32_t * n_swa);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
@@ -124,3 +132,4 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
