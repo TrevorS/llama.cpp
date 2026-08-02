@@ -39,7 +39,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t write_lse);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -726,6 +727,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float * lse_ptr,
         const int ne01, const int ne02,
         const int ne12, const int nblocks_stream_k,
         const int gqa_ratio,
@@ -766,7 +768,9 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    const int64_t row_idx = ((int64_t) sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
+
+    dst += row_idx*D + tid;
 
     ggml_cuda_pdl_sync();
     // Load the partial result that needs a fixup
@@ -801,6 +805,10 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     // Write back final result:
     *dst = dst_val / rowsum;
+
+    if (lse_ptr != nullptr && tid == 0) {
+        lse_ptr[row_idx] = rowsum == 0.0f ? -INFINITY : max_val + logf(rowsum);
+    }
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -810,6 +818,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float * lse_ptr,
         const int ne01, const int ne02,
         const int gqa_ratio,
         const int total_work,
@@ -856,7 +865,9 @@ static __global__ void flash_attn_stream_k_fixup_general(
         return;
     }
 
-    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + tid;
+    const int64_t row_idx = ((int64_t) sequence*ne01 + jt*ncols1 + j)*ne02 + zt_Q + c;
+
+    dst += row_idx*D + tid;
 
     // Load the partial result that needs a fixup:
     float dst_val = 0.0f;
@@ -912,6 +923,10 @@ static __global__ void flash_attn_stream_k_fixup_general(
 
     // Write back final result:
     *dst = dst_val / rowsum;
+
+    if (lse_ptr != nullptr && tid == 0) {
+        lse_ptr[row_idx] = rowsum == 0.0f ? -INFINITY : max_val + logf(rowsum);
+    }
 }
 
 template<int D> // D == head size
@@ -990,6 +1005,13 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+
+    // Opt-in per-row log-sum-exp output, written to a tail slice past the regular result.
+    // Only supported on the stream-k (mma) path; enforced by supports_op. Sinks are included
+    // in the LSE (they are folded into the per-row (max, rowsum) before the meta/tail writes).
+    const bool has_lse = ggml_get_op_params_i32(KQV, 4) != 0;
+    float * lse_base = has_lse ? (float *) KQV->data + (int64_t) DV*Q->ne[1]*Q->ne[2]*Q->ne[3] : nullptr;
+    GGML_ASSERT(!has_lse || stream_k);
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1236,7 +1258,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        has_lse ? 1 : 0
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -1255,7 +1278,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta.ptr, lse_base,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
@@ -1272,7 +1295,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                (float *) KQV->data, dst_tmp_meta.ptr, lse_base,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
