@@ -86,9 +86,6 @@ void common_speculative_draft(common_speculative * spec);
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // pos of a draft-context KV cell that must survive the post-draft cleanup (-1 = none)
-// true if any implementation requires target nextn (pre-norm) embeddings to be extracted
-bool common_speculative_need_embd_nextn(common_speculative * spec);
-
 llama_pos common_speculative_dft_keep_pos(common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
