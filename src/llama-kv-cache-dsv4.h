@@ -8,6 +8,12 @@
 #include <unordered_map>
 #include <vector>
 
+// Packed MXFP4 lid container gate (LLAMA_DSV4_LID_CACHE_MXFP4, default ON;
+// also off when LLAMA_DSV4_FUSED_LID=0 — only the fused op has the
+// staged-dequant reader). Single definition so the cache alloc site and the
+// two graph sites (read + write in models/deepseek4.cpp) can never disagree.
+bool llama_dsv4_lid_cache_mxfp4();
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -251,6 +257,7 @@ public:
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;

@@ -1053,8 +1053,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        // SWA mask. For BLOCK_ANCHORED the reference point here is a
+                        // running max position, which sits up to a block ahead of the
+                        // anchor the NEXT block will use -- recycling on that basis
+                        // would drop history the next block still reads. Widen by the
+                        // block slack so eviction stays behind the anchored window.
+                        const uint32_t n_swa_ev = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                            ? n_swa + LLAMA_SWA_BLOCK_ANCHOR_SLACK : n_swa;
+
+                        if (llama_hparams::is_masked_swa(n_swa_ev, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -1348,6 +1355,43 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // store the current K values into the cache
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+
+    GGML_ASSERT(k->type == GGML_TYPE_MXFP4);
+    GGML_ASSERT(k_cur->type == GGML_TYPE_F32);
+
+    const int64_t n_embd_head = k_cur->ne[0];
+    const int64_t n_head      = k_cur->ne[1];
+    const int64_t n_tokens    = k_cur->ne[2];
+
+    const int64_t n_embd_gqa = n_embd_head*n_head;
+
+    // merge dims 0/1 (same as cpy_k)
+    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    const int64_t n_stream = k->ne[2];
+
+    if (n_stream > 1) {
+        const int64_t kv_size = get_size();
+
+        assert(n_embd_gqa == k->ne[0]);
+        assert(kv_size    == k->ne[1]);
+
+        // merge the buffer across all streams because the idxs are global
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+    }
+
+    // QAT-rounded scatter into the packed container
+    return ggml_dsv4_qat_set_rows(ctx, k, k_cur, k_idxs);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1681,7 +1725,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // apply SWA if any
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    // BLOCK_ANCHORED shares one window across the whole block, so the
+                    // test anchors on the sequence's first position in this batch
+                    // instead of the query's own position.
+                    const llama_pos p_ref = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                        ? seq_pos_min[seq_id] : p1;
+
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p_ref)) {
                         goto skip;
                     }
                 }
@@ -2071,7 +2121,13 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+                // same slack as the find_slot reuse test: seq_pos_max leads the
+                // next block's anchor, and dropping a cell here loses it from the
+                // serialized state permanently
+                const uint32_t n_swa_st = swa_type == LLAMA_SWA_TYPE_BLOCK_ANCHORED
+                    ? n_swa + LLAMA_SWA_BLOCK_ANCHOR_SLACK : n_swa;
+
+                const bool is_masked = llama_hparams::is_masked_swa(n_swa_st, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
             }
@@ -2752,6 +2808,10 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_qat(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_qat(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
