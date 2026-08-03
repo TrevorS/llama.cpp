@@ -159,4 +159,10 @@ AGENTS.local.md
 .env
 
 # local research artifacts (measured findings, harnesses) — kept out of the branch
-experiments/
+# git will not descend into an excluded DIRECTORY, so this must exclude the
+# contents (experiments/*) rather than the directory itself, or the negation
+# below cannot re-include the launcher.
+experiments/*
+!experiments/dspark/
+experiments/dspark/*
+!experiments/dspark/serve-lan.sh
