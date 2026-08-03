@@ -40,9 +40,16 @@ CVEC=${CVEC:-0}
 # start work that has hard-locked this box. Cache reuse is unaffected.
 GUARD=${GUARD:-2}
 GUARD_MIN=${GUARD_MIN:-8192}
-# Agentic default. Chat/manual: TEMP=1.0. Clients that send their own sampling
-# params override this per request.
-TEMP=${TEMP:-0.6}
+# DeepSeek's published sampling for V4-Flash: temperature 1.0, top_p 1.0.
+# The 0731 quant repo publishes top_p 0.95 specifically for Code Agent tasks,
+# which is what this box serves, so that is the default here.
+# min_p and top_k are set explicitly because llama.cpp's defaults (0.05 / 40)
+# are NOT DeepSeek's and silently truncate the distribution that temp 1.0 is
+# meant to sample from. Clients sending their own sampling override all of this.
+TEMP=${TEMP:-1.0}
+TOP_P=${TOP_P:-0.95}
+MIN_P=${MIN_P:-0.0}
+TOP_K=${TOP_K:-0}
 CVEC_DIR=~/Projects/ds4-refusal/llamacpp-iq3
 CVEC_GGUF=$CVEC_DIR/weights/native_nothink.gguf
 CVEC_SCALE_FILE=$CVEC_DIR/cvec_scale.txt   # live-read each graph build; echo 2.0 > it to retune
@@ -103,7 +110,8 @@ build/bin/llama-server \
   --spec-type draft-dspark -md '$D' -ngld 999 --spec-draft-n-max $NMAX --spec-draft-ubatch 256 \
   --cache-disk '$CACHE_DIR' --cache-disk-mb 65536 \
   --slot-save-path '$SLOT_DIR' \
-  --jinja --temp $TEMP --reasoning-format deepseek --cache-reuse 256 $CVEC_ARG \
+  --jinja --temp $TEMP --top-p $TOP_P --min-p $MIN_P --top-k $TOP_K \
+  --reasoning-format deepseek --cache-reuse 256 $CVEC_ARG \
   --host 0.0.0.0 --port $PORT --metrics --slots \
   2>&1 | tee '$LOG'
 "
