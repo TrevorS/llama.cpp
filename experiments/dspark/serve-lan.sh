@@ -61,6 +61,22 @@ CACHE_RAM=${CACHE_RAM:-1024}
 # is 2492) and do not go much above ~2800 (that blocks every deep store, silently disabling
 # the disk cache and putting the 244 s cold prefill back on the table after any restart).
 STORE_MIN_FREE=${STORE_MIN_FREE:-2700}
+# Context checkpoints. Upstream defaults to 32 per slot; each is a partial state snapshot
+# held in HOST RAM, so they accumulate through a conversation and are freed only when the
+# slot clears. MEASURED on live disk-cache entries: checkpoints are 66-81% of every entry
+# (486 MiB of a 732 MiB entry at 72k tokens), and the eager store allocates that same bulk
+# in host RAM on every store. This is the growth that killed two servers today (VmRSS 5391
+# at np2, 6076 at np1 -- np1 only delayed it).
+#
+# Safe to cut here because neither mechanism that would need them applies:
+#   * speculative rollback uses the n_rs_seq ring, not checkpoints -- draft-dspark sets
+#     need_n_rs_seq() = draft.n_max = 3, so the context resolves to SEQ_RM_TYPE_RS and the
+#     checkpoint path is only for contexts that LACK the ring
+#   * context shift never fires (agent clients compact client-side; 0 shifts observed)
+# The remaining consumer is prefix divergence deeper than the SWA window, which compaction
+# does not produce (it diverges at ~position 0, where a checkpoint holds nothing). Keep a
+# few rather than 0 so an early-message edit still has a rewind path.
+CKPT=${CKPT:-4}
 POWER=${POWER:-85}
 NMAX=${NMAX:-3}
 SESSION=${SESSION:-ds4-serve}
@@ -145,6 +161,7 @@ build/bin/llama-server \
   -fa on -ngl 999 -c $CTX -ub $UB -np $NP --kv-unified \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --spec-type draft-dspark -md '$D' -ngld 999 --spec-draft-n-max $NMAX --spec-draft-ubatch 256 \
+  --ctx-checkpoints $CKPT \
   --cache-ram $CACHE_RAM --cache-disk '$CACHE_DIR' --cache-disk-mb 65536 \
   --slot-save-path '$SLOT_DIR' \
   --jinja --temp $TEMP --top-p $TOP_P --min-p $MIN_P --top-k $TOP_K \
