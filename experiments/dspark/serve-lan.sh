@@ -31,6 +31,36 @@ set -uo pipefail
 PORT=${PORT:-8080}
 CTX=${CTX:-262144}
 UB=${UB:-1024}
+# -c is TOTAL context in llama.cpp; each slot gets CTX/NP. NP>1 stops a long
+# turn head-of-line blocking every request behind it (-np 1 queues them, and a
+# client timeout then fires without the request ever reaching a slot).
+NP=${NP:-1}
+# RAM prompt-cache tier. Upstream defaults --cache-ram to 8192 MiB, which on this
+# box is larger than the entire post-load headroom (~3.8 GiB avail at 384k/np2).
+# earlyoom SIGTERMs at 2% avail (2492 MiB), so the default allowance alone can walk
+# the server into a kill - it did, five times between 08-02 21:13 and 08-03 04:59.
+# Our eager L2 store writes the live slot prefix straight to disk and bypasses the
+# RAM tier entirely, and over-limit states divert to disk rather than being dropped,
+# so a small RAM tier costs no reuse. Must stay > 0: --cache-disk requires it.
+CACHE_RAM=${CACHE_RAM:-1024}
+# Eager-store headroom gate, MiB. The eager L2 store allocates a full state blob on the
+# HOST (~350 MiB at 36k tokens, ~2.3 GiB at 384k) and it grows with the conversation, so a
+# deep session is the largest allocation this server makes. earlyoom here runs -m 2,1 =
+# SIGTERM at 2% of 124610 MiB = 2492 MiB, so the gate must leave MORE than that free or the
+# store it just permitted gets the server killed. 3584 clears the trigger by ~1.1 GiB.
+# Cost of a skipped store is a re-prefill; cost of a kill is the whole session.
+#
+# MEASURED 08-03 on a live 81k-token agent session, which corrected two guesses:
+#   * state size is ~0.00211 MiB/token + ~97 MiB base -- 260 MiB at 77k tokens, so a FULL
+#     262144-token state is only ~650 MiB, not the ~2.3 GiB the older scaling law implied
+#   * avail settles at ~3.2-3.4 GiB during a deep session (it recovers between turns; it
+#     does NOT drift down monotonically the way the pre-fix config did)
+# 3072 was too tight against that: it skipped a 260 MiB store that would have left 2942 MiB,
+# i.e. still 450 MiB clear of the trigger. 2700 permits a worst-case ~650 MiB store at the
+# observed floor while keeping ~200 MiB above earlyoom. Do not go below ~2600 (the trigger
+# is 2492) and do not go much above ~2800 (that blocks every deep store, silently disabling
+# the disk cache and putting the 244 s cold prefill back on the table after any restart).
+STORE_MIN_FREE=${STORE_MIN_FREE:-2700}
 POWER=${POWER:-85}
 NMAX=${NMAX:-3}
 SESSION=${SESSION:-ds4-serve}
@@ -99,16 +129,23 @@ else
     echo "  refusal ablation OFF (stock model)"
 fi
 
+# setsid: detach from the tmux pane's controlling terminal and process group, so a
+# stray Ctrl-C in an attached pane cannot take the server down with it. Kept for
+# that reason only - it did NOT stop the mystery shutdowns, which turned out to be
+# earlyoom SIGTERM (see CACHE_RAM above). Note earlyoom logs those as
+# "kill failed: Timer expired", because llama-server's graceful exit exceeds its
+# 10 s wait - so a successful kill looks like a failed one in the journal.
 tmux new-session -d -s "$SESSION" "
-env GGML_CUDA_POWER=$POWER GGML_CUDA_GRANULARITY=layer \
+setsid env GGML_CUDA_POWER=$POWER GGML_CUDA_GRANULARITY=layer \
     LLAMA_DSV4_FUSED_LID=1 LLAMA_DSV4_HC_FUSED=1 \
-    LLAMA_SERVER_PREFILL_GUARD=$GUARD LLAMA_SERVER_PREFILL_GUARD_MIN=$GUARD_MIN $CVEC_ENV \
+    LLAMA_SERVER_PREFILL_GUARD=$GUARD LLAMA_SERVER_PREFILL_GUARD_MIN=$GUARD_MIN \
+    LLAMA_SERVER_STORE_MIN_FREE_MB=$STORE_MIN_FREE $CVEC_ENV \
 build/bin/llama-server \
   -m '$M' --alias ds4-flash-0731 -lm none \
-  -fa on -ngl 999 -c $CTX -ub $UB -np 1 --kv-unified \
+  -fa on -ngl 999 -c $CTX -ub $UB -np $NP --kv-unified \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --spec-type draft-dspark -md '$D' -ngld 999 --spec-draft-n-max $NMAX --spec-draft-ubatch 256 \
-  --cache-disk '$CACHE_DIR' --cache-disk-mb 65536 \
+  --cache-ram $CACHE_RAM --cache-disk '$CACHE_DIR' --cache-disk-mb 65536 \
   --slot-save-path '$SLOT_DIR' \
   --jinja --temp $TEMP --top-p $TOP_P --min-p $MIN_P --top-k $TOP_K \
   --reasoning-format deepseek --cache-reuse 256 $CVEC_ARG \
@@ -132,4 +169,5 @@ echo "  READY.  SoC $(soc)C  avail $(( $(grep MemAvailable /proc/meminfo|tr -dc 
 echo "    LAN        http://${LANIP:-?}:$PORT/v1"
 echo "    Tailscale  http://${TSIP:-?}:$PORT/v1"
 echo "    model id   ds4-flash-0731"
-echo "    attach     tmux attach -t $SESSION      stop  tmux kill-session -t $SESSION"
+echo "    attach     tmux attach -t $SESSION   (Ctrl-B then d detaches; Ctrl-C KILLS the server)"
+echo "    stop       pkill -x llama-server   (setsid detaches it from tmux, so kill-session alone will NOT stop it)"
