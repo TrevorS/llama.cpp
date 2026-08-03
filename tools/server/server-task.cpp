@@ -1936,7 +1936,15 @@ constexpr double   DKV_HALFLIFE_SECONDS = 6.0 * 3600.0; // 6h hit half-life (ds4
 // GiB-scale at long context. Unbounded, it would hold in RAM the very states
 // eviction is trying to free (and stall shutdown draining them). Drop the
 // oldest-queued spill when full — best-effort persistence, a miss just recomputes.
-constexpr size_t   DKV_MAX_WRITE_Q = 4;
+//
+// Bound by BYTES as well as count. A count-only cap is meaningless here because
+// entry size grows with the conversation: an agent session storing an ever-longer
+// prefix reaches ~350 MiB/entry at 36k tokens and ~2.3 GiB at 384k, so 4 queued
+// entries is 1.4 GiB early and 9 GiB deep. On a UMA box whose post-load headroom
+// is single-digit GiB that walks straight into the OOM killer — it did, five times
+// on the GB10, each time as a clean SIGTERM from earlyoom mid-agent-session.
+constexpr size_t   DKV_MAX_WRITE_Q       = 4;
+constexpr size_t   DKV_MAX_WRITE_Q_BYTES = 1024ull * 1024 * 1024; // 1 GiB of pending spills
 
 uint64_t dkv_fnv1a(const void * data, size_t n) {
     const uint8_t * p = (const uint8_t *) data;
@@ -2081,8 +2089,25 @@ bool server_prompt_disk_cache::spill(server_prompt_cache_state && state) {
         }
     }
 
-    while (write_q.size() >= DKV_MAX_WRITE_Q) {
-        SRV_WRN("disk prompt cache: spill queue full (%zu), dropping oldest pending write\n", write_q.size());
+    // a single entry larger than the whole byte budget would evict the queue and still
+    // not fit; skip it outright rather than dropping useful pending writes for nothing
+    const size_t bytes_new = state.size();
+    if (bytes_new > DKV_MAX_WRITE_Q_BYTES) {
+        SRV_WRN("disk prompt cache: %zu-token spill (%.3f MiB) exceeds the pending-write budget (%zu MiB), skipping\n",
+                toks.size(), bytes_new / (1024.0 * 1024.0), DKV_MAX_WRITE_Q_BYTES / (1024 * 1024));
+        return false;
+    }
+
+    size_t bytes_q = 0;
+    for (const auto & e : write_q) {
+        bytes_q += e.size();
+    }
+
+    while (!write_q.empty() &&
+           (write_q.size() >= DKV_MAX_WRITE_Q || bytes_q + bytes_new > DKV_MAX_WRITE_Q_BYTES)) {
+        SRV_WRN("disk prompt cache: spill queue full (%zu entries, %.3f MiB), dropping oldest pending write\n",
+                write_q.size(), bytes_q / (1024.0 * 1024.0));
+        bytes_q -= write_q.front().size();
         write_q.pop_front();
     }
     write_q.push_back(std::move(state));
@@ -2386,6 +2411,14 @@ bool server_prompt_disk_cache::load(server_prompt & prompt, const server_tokens 
     return true;
 }
 
+// file size that never throws and never trips the caller's error_code — a size we cannot
+// read just means this file goes unaccounted, which must not abort the scan
+static size_t dkv_file_size(const std::filesystem::directory_entry & de) {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(de.path(), ec);
+    return ec ? 0 : (size_t) sz;
+}
+
 void server_prompt_disk_cache::scan_existing() {
     std::error_code ec;
     if (!std::filesystem::exists(dir, ec)) {
@@ -2393,6 +2426,12 @@ void server_prompt_disk_cache::scan_existing() {
     }
 
     size_t n_incompat = 0, n_corrupt = 0, n_foreign = 0, n_unreadable = 0;
+    // bytes held by files we skipped. They are deliberately NOT deleted (a later run with
+    // the old -c / kv type / model matches them again), but they are also not in the index,
+    // so eviction cannot see them and they do not count against limit_bytes. Left unreported
+    // that is a silent overshoot: changing -c once orphans the entire previous cache on disk
+    // while the budget still believes it has the whole allowance free.
+    size_t bytes_skipped = 0;
     for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) { break; }
         if (!de.is_regular_file()) {
@@ -2408,7 +2447,7 @@ void server_prompt_disk_cache::scan_existing() {
             continue;
         }
         std::ifstream is(de.path(), std::ios::binary);
-        if (!is) { ++n_unreadable; continue; }
+        if (!is) { ++n_unreadable; bytes_skipped += dkv_file_size(de); continue; }
 
         uint32_t magic    = 0;
         uint64_t chash    = 0;
@@ -2420,26 +2459,26 @@ void server_prompt_disk_cache::scan_existing() {
         // expected and recoverable, a corrupt one is not, and reporting "0
         // existing entries" for both hides a whole cache silently vanishing
         if (!dkv_r(is, magic) || magic != DKV_MAGIC) {
-            ++n_foreign;  continue;
+            ++n_foreign;  bytes_skipped += dkv_file_size(de); continue;
         }
         if (!dkv_r(is, chash)) {
-            ++n_corrupt;  continue;
+            ++n_corrupt;  bytes_skipped += dkv_file_size(de); continue;
         }
         if (chash != compat_hash) {
-            ++n_incompat; continue; // leave the file; a later run may match again
+            ++n_incompat; bytes_skipped += dkv_file_size(de); continue; // leave the file; a later run may match again
         }
         if (!dkv_r(is, hits) || !dkv_r(is, last_hit) || !dkv_r(is, n_toks)) {
-            ++n_corrupt;  continue;
+            ++n_corrupt;  bytes_skipped += dkv_file_size(de); continue;
         }
         {   // reject a corrupt token count before it drives a huge allocation
             const int64_t rem = dkv_stream_remaining(is);
             if (rem < 0 || n_toks > (uint64_t) rem / sizeof(llama_token)) {
-                ++n_corrupt; continue;
+                ++n_corrupt; bytes_skipped += dkv_file_size(de); continue;
             }
         }
         llama_tokens toks(n_toks);
         if (n_toks && !is.read(reinterpret_cast<char *>(toks.data()), n_toks * sizeof(llama_token))) {
-            ++n_corrupt; continue;
+            ++n_corrupt; bytes_skipped += dkv_file_size(de); continue;
         }
 
         entry e;
@@ -2458,10 +2497,21 @@ void server_prompt_disk_cache::scan_existing() {
         // an incompatible sweep is the normal consequence of changing -c, the KV
         // types or the model, and it means the next sessions start cold. Say so
         // rather than silently reporting an empty cache.
-        SRV_WRN("disk prompt cache: skipped %zu file(s) - %zu incompatible (context/kv/model changed), "
-                "%zu corrupt, %zu foreign, %zu unreadable\n",
-                n_incompat + n_corrupt + n_foreign + n_unreadable,
+        SRV_WRN("disk prompt cache: skipped %zu file(s) holding %.3f MiB - %zu incompatible "
+                "(context/kv/model changed), %zu corrupt, %zu foreign, %zu unreadable\n",
+                n_incompat + n_corrupt + n_foreign + n_unreadable, bytes_skipped / (1024.0 * 1024.0),
                 n_incompat, n_corrupt, n_foreign, n_unreadable);
+
+        // skipped files are kept on purpose (restoring the old -c makes them valid again) but
+        // they are outside the index, so eviction cannot reclaim them and the budget does not
+        // know they exist. Only say so when they actually push real usage past the allowance —
+        // that is the point at which "budget 64 GiB" stops describing what is on the disk.
+        if (limit_bytes > 0 && bytes_skipped + disk_size() > limit_bytes) {
+            SRV_WRN("disk prompt cache: %.3f MiB of skipped files sits outside the %zu MiB budget and "
+                    "cannot be evicted; delete them to reclaim the space, or restore the previous "
+                    "settings to make them usable again\n",
+                    bytes_skipped / (1024.0 * 1024.0), limit_bytes / (1024 * 1024));
+        }
     }
 
     std::lock_guard<std::mutex> lk(mtx);
