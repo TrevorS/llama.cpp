@@ -2437,6 +2437,8 @@ void server_prompt_disk_cache::scan_existing() {
     if (!std::filesystem::exists(dir, ec)) {
         return;
     }
+
+    size_t n_incompat = 0, n_corrupt = 0, n_foreign = 0, n_unreadable = 0;
     for (const auto & de : std::filesystem::directory_iterator(dir, ec)) {
         if (ec) { break; }
         if (!de.is_regular_file()) {
@@ -2452,28 +2454,38 @@ void server_prompt_disk_cache::scan_existing() {
             continue;
         }
         std::ifstream is(de.path(), std::ios::binary);
-        if (!is) { continue; }
+        if (!is) { ++n_unreadable; continue; }
 
         uint32_t magic    = 0;
         uint64_t chash    = 0;
         uint32_t hits     = 0;
         int64_t  last_hit = 0;
         uint64_t n_toks   = 0;
-        if (!dkv_r(is, magic) || magic != DKV_MAGIC ||
-            !dkv_r(is, chash) || chash != compat_hash ||
-            !dkv_r(is, hits)  || !dkv_r(is, last_hit) ||
-            !dkv_r(is, n_toks)) {
-            continue; // foreign / incompatible / truncated — leave the file, just skip
+        // split from one combined test so the reason a file was skipped is
+        // reportable: an incompatible entry (changed -c, kv type, model) is
+        // expected and recoverable, a corrupt one is not, and reporting "0
+        // existing entries" for both hides a whole cache silently vanishing
+        if (!dkv_r(is, magic) || magic != DKV_MAGIC) {
+            ++n_foreign;  continue;
+        }
+        if (!dkv_r(is, chash)) {
+            ++n_corrupt;  continue;
+        }
+        if (chash != compat_hash) {
+            ++n_incompat; continue; // leave the file; a later run may match again
+        }
+        if (!dkv_r(is, hits) || !dkv_r(is, last_hit) || !dkv_r(is, n_toks)) {
+            ++n_corrupt;  continue;
         }
         {   // reject a corrupt token count before it drives a huge allocation
             const int64_t rem = dkv_stream_remaining(is);
             if (rem < 0 || n_toks > (uint64_t) rem / sizeof(llama_token)) {
-                continue;
+                ++n_corrupt; continue;
             }
         }
         llama_tokens toks(n_toks);
         if (n_toks && !is.read(reinterpret_cast<char *>(toks.data()), n_toks * sizeof(llama_token))) {
-            continue;
+            ++n_corrupt; continue;
         }
 
         entry e;
@@ -2486,6 +2498,16 @@ void server_prompt_disk_cache::scan_existing() {
         e.hits          = hits;
         e.last_hit_unix = last_hit;
         index.push_back(std::move(e));
+    }
+
+    if (n_incompat || n_corrupt || n_foreign || n_unreadable) {
+        // an incompatible sweep is the normal consequence of changing -c, the KV
+        // types or the model, and it means the next sessions start cold. Say so
+        // rather than silently reporting an empty cache.
+        SRV_WRN("disk prompt cache: skipped %zu file(s) - %zu incompatible (context/kv/model changed), "
+                "%zu corrupt, %zu foreign, %zu unreadable\n",
+                n_incompat + n_corrupt + n_foreign + n_unreadable,
+                n_incompat, n_corrupt, n_foreign, n_unreadable);
     }
 
     std::lock_guard<std::mutex> lk(mtx);
