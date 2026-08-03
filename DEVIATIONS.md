@@ -58,6 +58,26 @@ read as garbage.
 and dies with the process. Adds a disk tier with eager store (survives SIGKILL),
 shutdown spill, exact eviction reserve, and truncated-file guards.
 
+Two host-RAM bounds, both fixing defects in the above rather than in upstream:
+the eager store gated only on the *disk* budget while allocating a full state
+blob on the **host**, and the pending-spill queue capped entry *count* (4) for
+entries whose size is unbounded and grows with the conversation (~350 MiB at 36k
+tokens, ~2.3 GiB at 384k — so four of them is ~9 GiB). On a UMA box where the
+model already owns most of RAM, that is the largest allocation the server makes,
+and the OOM killer reaping it takes the whole server — losing the very
+conversation the store existed to protect. Now: a byte bound on the queue, and
+`LLAMA_SERVER_STORE_MIN_FREE_MB` (default 3072) skipping any store that would
+leave less than that free. Persistence is best-effort by design — a skipped
+store costs a re-prefill.
+
+The margin has two failure modes and must sit between them: below the OOM
+killer's trigger it does not protect, above the under-load available-memory floor
+it blocks *every* store and silently disables the disk cache. On this box
+(earlyoom `-m 2,1` ⇒ 2492 MiB) that window is ~1.5 GiB at `-c 262144` and only
+~250 MiB at `-c 393216`, which is why 384k is not a supported serving config
+here. Nothing needs it: the DS4-Flash template gates max reasoning on
+`reasoning_effort` alone and never references context length.
+
 **`4c0980758` — prefill guard.** Refuses a cold bulk re-prefill with 503.
 Agentic traffic at 0% cache reuse drove 33 back-to-back full re-prefills and
 wedged the machine at every duty level tried. Cache reuse is unaffected.
