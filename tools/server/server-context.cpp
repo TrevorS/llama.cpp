@@ -1580,8 +1580,15 @@ private:
                 llama_model_desc(llama_get_model(ctx_tgt), model_desc, sizeof(model_desc));
                 // any change here (model, ctx size, draft presence) must invalidate old files,
                 // since a serialized sequence state is only restorable into a matching setup.
-                const std::string compat_desc = string_format("%s|n_ctx=%d|n_embd=%d|draft=%d",
-                        model_desc, n_ctx, llama_model_n_embd(llama_get_model(ctx_tgt)), ctx_dft ? 1 : 0);
+                // n_parallel and kv_unified belong here: they change the KV cache stream
+                // geometry, so a state serialized under one value will not deserialize under
+                // another. Leaving them out is not a harmless miss -- the entry passes the
+                // hash gate, llama_state_seq_set_data_ext then returns short, and the restore
+                // fails INTO A FULL COLD PREFILL (measured: 269 s / 72712 tokens after an
+                // -np 2 -> -np 1 switch). A hash that says "compatible" must mean restorable.
+                const std::string compat_desc = string_format("%s|n_ctx=%d|n_embd=%d|draft=%d|n_par=%d|kvu=%d",
+                        model_desc, n_ctx, llama_model_n_embd(llama_get_model(ctx_tgt)), ctx_dft ? 1 : 0,
+                        params_base.n_parallel, params_base.kv_unified ? 1 : 0);
                 prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
                         params_base.cache_disk_dir,
                         compat_desc,
