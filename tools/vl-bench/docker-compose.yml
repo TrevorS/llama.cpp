@@ -1,0 +1,70 @@
+# VL-Bench Docker Compose configuration
+#
+# Usage:
+#   docker compose -f tools/vl-bench/docker-compose.yml run --rm bench status
+#   docker compose -f tools/vl-bench/docker-compose.yml run --rm bench bench_quick
+#   docker compose -f tools/vl-bench/docker-compose.yml run --rm profile profile
+#
+# For profiling with Nsight Systems (requires nsys on host):
+#   docker compose -f tools/vl-bench/docker-compose.yml run --rm profile profile
+
+services:
+  bench:
+    build:
+      context: ../..
+      dockerfile: tools/vl-bench/Dockerfile
+      args:
+        BASE_IMAGE: nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04
+    image: vl-bench:latest
+    volumes:
+      # Mount model files (adjust path as needed)
+      - ${MODEL_DIR:-./models}:/models:ro
+      # Mount results directory for persistence
+      - ${RESULTS_DIR:-./results}:/results
+      # Mount test images
+      - ${IMAGE_DIR:-./images}:/images:ro
+    environment:
+      - MODEL_PATH=/models/${MODEL_NAME:-model.gguf}
+      - MMPROJ_PATH=/models/${MMPROJ_NAME:-mmproj.gguf}
+      - TEST_IMAGE=/images/${TEST_IMAGE:-test.jpg}
+      - RESULTS_DIR=/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Allow access to perf events for profiling
+    privileged: false
+    security_opt:
+      - seccomp:unconfined
+
+  # Profile service with additional capabilities for Nsight
+  profile:
+    extends:
+      service: bench
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    volumes:
+      - ${MODEL_DIR:-./models}:/models:ro
+      - ${RESULTS_DIR:-./results}:/results
+      - ${IMAGE_DIR:-./images}:/images:ro
+      # Mount nsight tools from host if available
+      - /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro
+    environment:
+      - MODEL_PATH=/models/${MODEL_NAME:-model.gguf}
+      - MMPROJ_PATH=/models/${MMPROJ_NAME:-mmproj.gguf}
+      - TEST_IMAGE=/images/${TEST_IMAGE:-test.jpg}
+      - RESULTS_DIR=/results
+      - NSYS_PATH=/opt/nvidia/nsight-systems/bin/nsys
+
+  # Interactive shell for debugging
+  shell:
+    extends:
+      service: bench
+    entrypoint: /bin/bash
+    stdin_open: true
+    tty: true
