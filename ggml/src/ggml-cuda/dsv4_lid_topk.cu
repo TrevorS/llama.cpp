@@ -60,6 +60,31 @@ static __device__ __forceinline__ void dsv4_report_nan() {
     }
 }
 
+// One-shot report for a tile union that did not fit u_cap.
+//
+// The B2 tile path is exact only while the union of the tile's W token top-k
+// sets fits u_cap; past that dsv4_union_kernel drops the highest-index cells,
+// so a query silently loses keys the indexer chose for it. It is structurally
+// impossible only when u_cap >= W*top_k -- the shipped default (W=16, top_k=512,
+// u_cap=4096) is a quarter of its exact width of 8192, and the measured union at
+// d65k-d131k runs to a max around 5200 against a mean near 2400. So it does bite,
+// on the tail of the tile distribution, and until now it did so without a trace.
+//
+// Reported rather than fixed by widening: exactness costs about 2x on the union
+// half either way (W=8 doubles the tile count at the same u_cap; u_cap=8192
+// doubles the width at the same tile count), so the quality/throughput call needs
+// to be made against a real measurement of how often this fires in serving.
+static __device__ int dsv4_union_overflow_reported = 0;
+
+static __device__ __forceinline__ void dsv4_report_union_overflow(int u_max) {
+    if (atomicExch(&dsv4_union_overflow_reported, 1) == 0) {
+        printf("\nggml-cuda dsv4_lid_topk: tile union exceeded u_cap=%d; the highest-index "
+               "selected cells were DROPPED for this tile (attention is missing keys the "
+               "indexer chose). Raise LLAMA_DSV4_CSA_TILE_UCAP or lower LLAMA_DSV4_CSA_TILE. "
+               "Reported once per process.\n", u_max);
+    }
+}
+
 // scores-buffer load: the d_idx==128 score kernels store f16 (halves the
 // [nt, n_lid] DRAM round-trip); the scalar path keeps f32 to stay bit-exact
 // under its strict 0.0-tolerance gate. Sort compares stay f32 either way.
@@ -815,12 +840,27 @@ static __global__ void dsv4_union_kernel(
     if (threadIdx.x == 0) {
         int32_t * o = out + (int64_t) tile * nb1_out + (int64_t) s * nb3_out;
         int pos = 0;
-        for (int w = 0; w < n_words && pos < u_max; w++) {
+        int w   = 0;
+        for (; w < n_words && pos < u_max; w++) {
             uint32_t word = bm[w];
             while (word && pos < u_max) {
                 const int b = __ffs(word) - 1;
                 o[pos++] = w * 32 + b;
                 word &= word - 1;
+            }
+            // ran out of slots with bits still set in this word
+            if (word) {
+                dsv4_report_union_overflow(u_max);
+                break;
+            }
+        }
+        // ...or with whole words still to scan
+        if (pos == u_max) {
+            for (; w < n_words; w++) {
+                if (bm[w]) {
+                    dsv4_report_union_overflow(u_max);
+                    break;
+                }
             }
         }
         // pad with n_csa-1: the MAXIMUM representable index, so ascending order
