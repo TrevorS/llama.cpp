@@ -660,6 +660,55 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
     return prompt_tokens;
 }
 
+size_t host_mem_available() {
+    std::ifstream f("/proc/meminfo");
+    if (!f) {
+        return 0;
+    }
+    std::string key;
+    while (f >> key) {
+        if (key == "MemAvailable:") {
+            size_t kb = 0;
+            if (f >> kb) {
+                return kb * 1024;
+            }
+            return 0;
+        }
+        f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return 0;
+}
+
+size_t host_mem_min_free() {
+    // The margin must CLEAR whatever reaps the process, not merely equal it: leaving
+    // exactly the OOM killer's trigger free is still a kill. earlyoom's common
+    // 2%-of-RAM trigger is ~2.5 GiB on a 128 GiB host, so default to 3 GiB.
+    // strtoull, not atoi: atoi is int-width and silently overflows on a large
+    // value, which turns "gate everything" into a garbage threshold.
+    static const size_t v = [] {
+        const char * s = getenv("LLAMA_SERVER_STORE_MIN_FREE_MB");
+        const unsigned long long mb = s ? strtoull(s, nullptr, 10) : 3072ull;
+        const unsigned long long cap = (unsigned long long) SIZE_MAX / (1024ull * 1024ull);
+        return (size_t) (std::min(mb, cap) * 1024ull * 1024ull);
+    }();
+    return v;
+}
+
+bool host_mem_would_starve(size_t bytes, size_t * avail_out) {
+    const size_t min_free = host_mem_min_free();
+    if (min_free == 0) {
+        return false;
+    }
+    const size_t avail = host_mem_available();
+    if (avail_out) {
+        *avail_out = avail;
+    }
+    if (avail == 0) {
+        return false; // unmeasurable: never block on a box we cannot see
+    }
+    return bytes + min_free > avail;
+}
+
 size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
     if (len == 0) return 0;

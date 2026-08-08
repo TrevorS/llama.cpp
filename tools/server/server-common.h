@@ -264,6 +264,21 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// Host RAM the OS believes is obtainable without swapping, in bytes; 0 when unknown
+// (non-Linux, or /proc unreadable), which callers must treat as "skip the check".
+// MemAvailable, not MemFree: page cache is reclaimable and counting it as used would
+// refuse stores on a box that is actually fine.
+size_t host_mem_available();
+
+// Headroom the server keeps clear of whatever reaps the process, in bytes.
+// LLAMA_SERVER_STORE_MIN_FREE_MB, 0 disables every host-memory gate.
+size_t host_mem_min_free();
+
+// True when allocating `bytes` on the host would leave less than host_mem_min_free()
+// available. False whenever the gate is disabled or MemAvailable is unreadable, so a
+// box we cannot measure is never blocked.
+bool host_mem_would_starve(size_t bytes, size_t * avail_out = nullptr);
+
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
 // if is_placeholder is true, the media chunk will be treated as placeholder for counting tokens; the output tokens are not usable for actual inference (e.g. for submitting a task to server_queue)
 server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & prompt, const std::vector<raw_buffer> & files, bool is_placeholder = false);
