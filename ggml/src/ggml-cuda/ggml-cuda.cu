@@ -4350,6 +4350,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 //                            power/thermal throttle reason, then drop to
 //                            GGML_CUDA_POWER_MIN (default 60) until the reason
 //                            has stayed clear for 10s (Linux only, dlopen NVML)
+//   GGML_CUDA_POWER_TEMP_MAX=C  additionally treat GPU temp >= C as distress.
+//                            Throttle reasons are lagging -- the cap has already
+//                            engaged by the time they assert -- so this is the
+//                            leading tripwire. 0 (default) disables.
 //
 // Work intervals are measured with a cudaEvent pair around each graph compute; the
 // compensating sleep happens before the NEXT submit, when the previous compute has
@@ -4457,6 +4461,8 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
         p_reasons = (nvml_reasons_t) dlsym(lib, "nvmlDeviceGetCurrentClocksThrottleReasons");
     }
     nvml_util_t p_util = (nvml_util_t) dlsym(lib, "nvmlDeviceGetUtilizationRates");
+    typedef int (*nvml_temp_t)(void *, int, unsigned int *);
+    nvml_temp_t p_temp = (nvml_temp_t) dlsym(lib, "nvmlDeviceGetTemperature");
     void * handle = nullptr;
     if (p_init == nullptr || p_handle == nullptr || p_reasons == nullptr ||
         p_init() != 0 || p_handle(0, &handle) != 0) {
@@ -4474,6 +4480,28 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
     const auto poll_period  = std::chrono::milliseconds(500);
     const auto clear_period = std::chrono::seconds(10);
 
+    // Temperature tripwire (GGML_CUDA_POWER_TEMP_MAX, degrees C; 0 = off).
+    //
+    // Every reason bit above is a LAGGING signal: by the time the firmware asserts
+    // a slowdown the cap has already engaged, and on GB10 that is the state that can
+    // fail to clear and take the machine with it. Temperature leads it, so a ceiling
+    // set below the point where the cap latches converts a wedge into a slow run.
+    //
+    // Deliberately not defaulted: GB10 reports no usable thresholds to derive one
+    // from (nvidia-smi gives N/A for shutdown and slowdown limits, 0 for max
+    // operating), and inventing a number would be worse than leaving the operator to
+    // set it from measurement. For calibration, our own wedge-hunt telemetry on this
+    // box recorded a max of 71 C on the int8 indexer scorer and 78 C on fp4-mma, the
+    // latter being the configuration that wedged.
+    const int temp_max = [] {
+        const char * e = getenv("GGML_CUDA_POWER_TEMP_MAX");
+        return e ? atoi(e) : 0;
+    }();
+    if (temp_max > 0 && p_temp == nullptr) {
+        GGML_LOG_WARN("ggml_cuda: GGML_CUDA_POWER_TEMP_MAX=%d requested but nvmlDeviceGetTemperature "
+                      "is unavailable - temperature tripwire disabled\n", temp_max);
+    }
+
     bool engaged = false;
     auto last_set = std::chrono::steady_clock::now();
 
@@ -4487,14 +4515,33 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                     distress = true; // capped while working, not capped while idle
                 }
             }
+            int temp_c = -1;
+            if (temp_max > 0 && p_temp != nullptr) {
+                unsigned int t = 0;
+                if (p_temp(handle, /* NVML_TEMPERATURE_GPU */ 0, &t) == 0) {
+                    temp_c = (int) t;
+                    if (temp_c >= temp_max) {
+                        distress = true;
+                    }
+                }
+            }
             const auto now = std::chrono::steady_clock::now();
             if (distress) {
                 last_set = now;
                 if (!engaged) {
                     engaged = true;
                     ps->cur_pct.store(ps->min_pct, std::memory_order_relaxed);
-                    GGML_LOG_WARN("ggml_cuda: power throttle reason engaged (0x%llx) -> duty %d%%\n",
-                                  reasons, ps->min_pct);
+                    // Name the trigger: a reasons word of 0 with a temperature trip reads
+                    // like a spurious engage otherwise, and the two have different meanings
+                    // -- reasons are the firmware reacting, temperature is us getting ahead
+                    // of it.
+                    if (reasons == 0 && temp_c >= temp_max) {
+                        GGML_LOG_WARN("ggml_cuda: GPU temp %dC >= GGML_CUDA_POWER_TEMP_MAX=%dC -> duty %d%%\n",
+                                      temp_c, temp_max, ps->min_pct);
+                    } else {
+                        GGML_LOG_WARN("ggml_cuda: power throttle reason engaged (0x%llx, temp %dC) -> duty %d%%\n",
+                                      reasons, temp_c, ps->min_pct);
+                    }
                 }
             } else if (engaged && now - last_set > clear_period) {
                 engaged = false;
