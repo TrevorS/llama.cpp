@@ -122,6 +122,9 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    # extra environment variables for the server process, for behaviour that is
+    # tuned by env rather than by a CLI flag
+    extra_env: dict | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -142,6 +145,8 @@ class ServerProcess:
         }
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
+        if self.extra_env:
+            env.update({k: str(v) for k, v in self.extra_env.items()})
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return
