@@ -424,29 +424,6 @@ struct server_slot {
         return true;
     }
 
-    // Host RAM the OS believes is obtainable without swapping, in bytes; 0 when unknown
-    // (non-Linux, or /proc unreadable) which callers must treat as "skip the check".
-    // MemAvailable, not MemFree: page cache is reclaimable and counting it as used would
-    // refuse stores on a box that is actually fine.
-    static size_t host_mem_available() {
-        std::ifstream f("/proc/meminfo");
-        if (!f) {
-            return 0;
-        }
-        std::string key;
-        while (f >> key) {
-            if (key == "MemAvailable:") {
-                size_t kb = 0;
-                if (f >> kb) {
-                    return kb * 1024;
-                }
-                return 0;
-            }
-            f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-        }
-        return 0;
-    }
-
     // Eager L2 store, mirroring ds4_kvstore_maybe_store_continued: persist the LIVE slot
     // prefix straight to the disk tier, bypassing the RAM tier.
     //
@@ -480,21 +457,14 @@ struct server_slot {
         // makes -- and an OOM killer that reaps it takes the whole server with it, losing the
         // very conversation the store was meant to protect. Persistence is best-effort by
         // design (a miss just re-prefills), so trade the store for staying alive.
-        // The margin must CLEAR whatever reaps the process, not merely equal it: leaving
-        // exactly the OOM killer's trigger free is still a kill. earlyoom's common 2%-of-RAM
-        // trigger is ~2.5 GiB on a 128 GiB host, so default to 3 GiB. 0 disables the gate.
+        // See host_mem_min_free() for how the margin is chosen. 0 disables the gate.
         {
-            static const size_t min_free = [] {
-                const char * s = getenv("LLAMA_SERVER_STORE_MIN_FREE_MB");
-                return (size_t) (s ? atoi(s) : 3072) * 1024 * 1024;
-            }();
-
-            const size_t avail = min_free ? host_mem_available() : 0;
-            if (avail && size_tgt + size_dft + min_free > avail) {
+            size_t avail = 0;
+            if (host_mem_would_starve(size_tgt + size_dft, &avail)) {
                 SLT_WRN(*this, "eager disk store: skipping %d-token store, %.3f MiB state would leave "
                         "under %zu MiB free (%.3f MiB available) - raise/clear LLAMA_SERVER_STORE_MIN_FREE_MB to override\n",
                         (int) prompt.tokens.size(), (size_tgt + size_dft) / (1024.0 * 1024.0),
-                        min_free / (1024 * 1024), avail / (1024.0 * 1024.0));
+                        host_mem_min_free() / (1024 * 1024), avail / (1024.0 * 1024.0));
                 return false;
             }
         }

@@ -208,3 +208,64 @@ def test_cache_disk_restore_is_faithful(tmp_path):
         f"restored prefix changed the output: hot={hot_text!r} restored={res_restored.body['content']!r}"
     )
     server.stop()
+
+
+def test_cache_skipped_under_host_memory_pressure(tmp_path):
+    """Caching must decline rather than allocate when host RAM is short.
+
+    --cache-ram bounds the RAM tier, but the oversize path that diverts an entry to
+    the disk tier is deliberately exempt from it and still materialises the whole
+    state on the host first. On a UMA box that is the largest allocation the server
+    makes, and the try/catch around the resize does not protect it: under Linux
+    overcommit the resize succeeds and the reaper arrives when the pages are
+    touched, taking the server and the conversation with it.
+
+    Forcing the headroom floor above total RAM makes every allocation look starving,
+    so the gate has to fire on each attempt. Caching is best-effort, so the only
+    thing that may change is that nothing is cached -- never the output.
+    """
+    global server
+    cache_dir = server.cache_disk
+    log = tmp_path / "pressure.log"
+
+    prompt = {"prompt": "What is the capital of France?", "id_slot": 0,
+              "cache_prompt": True, "n_predict": 4}
+    displace = {"prompt": "Tell me a story about a brave little cat named Whiskers",
+                "id_slot": 0, "cache_prompt": True, "n_predict": 4}
+
+    # reference run, gate at its default
+    server.log_path = str(tmp_path / "ref.log")
+    server.start()
+    ref = server.make_request("POST", "/completion", data=prompt)
+    assert ref.status_code == 200
+    ref_text = ref.body["content"]
+    server.stop()
+
+    # same again, but every allocation now looks like it would starve the host
+    server = ServerPreset.tinyllama2()
+    server.temperature = 0.0
+    server.cache_ram = 256
+    server.cache_disk = cache_dir
+    server.cache_disk_min_tokens = 8
+    server.log_path = str(log)
+    # 1 PiB of required headroom: comfortably above any real host, and well inside
+    # the range the parser handles
+    server.extra_env = {"LLAMA_SERVER_STORE_MIN_FREE_MB": str(1 << 30)}
+    server.start()
+
+    res = server.make_request("POST", "/completion", data=prompt)
+    assert res.status_code == 200
+    assert server.make_request("POST", "/completion", data=displace).status_code == 200
+
+    # generation is unaffected...
+    assert res.body["content"] == ref_text
+
+    server.stop()
+
+    # ...and the RAM-tier allocator specifically declined instead of allocating.
+    # Matched on both fragments together: the eager disk-store gate emits its own
+    # "would leave under" line, so the phrase alone would pass without the
+    # allocator-side gate that this test exists to cover.
+    lines = [ln for ln in log.read_text().splitlines()
+             if "prompt state size" in ln and "would leave under" in ln]
+    assert lines, "expected the RAM-tier allocator's host-memory gate to decline an entry"
