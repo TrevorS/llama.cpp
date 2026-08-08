@@ -1771,6 +1771,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                 state_size_new / (1024.0 * 1024.0));
     }
 
+    // Host-memory headroom gate. --cache-ram bounds the RAM tier, but the disk-bound
+    // path above is deliberately EXEMPT from it and still materialises the whole state
+    // on the host before anything is spilled -- for a 256k slot that is the single
+    // largest allocation the server makes. The try/catch further down is not a defence:
+    // under Linux overcommit the resize succeeds and the reaper arrives when the pages
+    // are touched, which on a UMA box takes the server and the conversation with it.
+    // Caching is best-effort by definition, so decline the entry and re-prefill later.
+    {
+        size_t avail = 0;
+        if (host_mem_would_starve(state_size_new, &avail)) {
+            SRV_WRN(" - prompt state size %.3f MiB would leave under %zu MiB free (%.3f MiB available), skipping\n",
+                    state_size_new / (1024.0 * 1024.0),
+                    host_mem_min_free() / (1024 * 1024), avail / (1024.0 * 1024.0));
+            return nullptr;
+        }
+    }
+
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
