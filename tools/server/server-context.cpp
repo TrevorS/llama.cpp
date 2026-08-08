@@ -240,6 +240,101 @@ struct server_batch {
     }
 };
 
+// Process-wide speculative acceptance guard.
+//
+// A support model that does not match the target -- a draft head from a different
+// checkpoint generation, or a corrupt one -- does not fail loudly. It drafts, the
+// target rejects nearly everything, and the only symptom is that decode gets
+// slower than running with no draft at all. There is nothing in the gguf headers
+// to refuse by up front: for DeepSeek-V4 Flash the 0731 and legacy bases have
+// byte-identical headers and the MTP file identifies nothing, so the pairing can
+// only be judged from behaviour.
+//
+// Cross-generation pairing is not automatically wrong, so the trip point has to
+// sit well under the worst BENIGN pairing rather than near the good one. Measured
+// on 0731: matched pairing accepts 66.1%, a legacy MTP head against the 0731 base
+// still accepts 51.9% and stays ahead of no-speculation. 15% is far below both and
+// is roughly what a genuinely foreign or corrupt head scores.
+//
+// The disable is one-way. A mismatched head does not recover, and a guard that
+// re-armed would flap between speculating and not for the rest of the process.
+struct spec_accept_guard {
+    static std::atomic<uint64_t> n_drafted;
+    static std::atomic<uint64_t> n_accepted;
+    static std::atomic<bool>     tripped;
+
+    // Drafts to observe before judging. Large enough that a short unlucky run of
+    // hard tokens cannot trip it; small enough to fire early in a session.
+    // Both are env-overridable so the behaviour can be exercised in a test
+    // without needing a genuinely mispaired draft model to hand.
+    static uint64_t n_min_drafts() {
+        static const uint64_t v = [] {
+            const char * e = getenv("LLAMA_SPEC_ACCEPT_GUARD_MIN_DRAFTS");
+            return e ? (uint64_t) std::max(1, atoi(e)) : (uint64_t) 256;
+        }();
+        return v;
+    }
+
+    static double accept_floor() {
+        static const double v = [] {
+            const char * e = getenv("LLAMA_SPEC_ACCEPT_GUARD_FLOOR");
+            return e ? atof(e) / 100.0 : 0.15;
+        }();
+        return v;
+    }
+
+    static bool armed() {
+        static const bool on = [] {
+            const char * e = getenv("LLAMA_SPEC_ACCEPT_GUARD");
+            return !e || e[0] != '0';
+        }();
+        return on;
+    }
+
+    static bool is_tripped() {
+        return armed() && tripped.load(std::memory_order_relaxed);
+    }
+
+    static void add_drafted(uint64_t n) {
+        if (armed() && n) {
+            n_drafted.fetch_add(n, std::memory_order_relaxed);
+        }
+    }
+
+    // Called once per verification step, after the accepted count is known.
+    static void add_accepted(uint64_t n) {
+        if (!armed() || tripped.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        n_accepted.fetch_add(n, std::memory_order_relaxed);
+
+        const uint64_t drafted = n_drafted.load(std::memory_order_relaxed);
+        if (drafted < n_min_drafts()) {
+            return;
+        }
+
+        const double rate = (double) n_accepted.load(std::memory_order_relaxed) / (double) drafted;
+        if (rate >= accept_floor()) {
+            return;
+        }
+
+        // exchange so the report fires once even if several slots trip together
+        if (!tripped.exchange(true, std::memory_order_relaxed)) {
+            SRV_WRN("speculative decoding DISABLED: draft acceptance %.1f%% over %" PRIu64 " drafted tokens "
+                    "is below the %.0f%% floor - the draft model is very likely mispaired with the target "
+                    "(check that the draft and target come from the same checkpoint generation). "
+                    "Generation continues without speculation and is unaffected in quality. "
+                    "Set LLAMA_SPEC_ACCEPT_GUARD=0 to disarm.\n",
+                    100.0 * rate, drafted, 100.0 * accept_floor());
+        }
+    }
+};
+
+std::atomic<uint64_t> spec_accept_guard::n_drafted  {0};
+std::atomic<uint64_t> spec_accept_guard::n_accepted {0};
+std::atomic<bool>     spec_accept_guard::tripped    {false};
+
 struct server_slot {
     int id;
 
@@ -592,6 +687,16 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // Stop issuing NEW drafts once the acceptance guard trips. Deliberately
+        // gated here and not in can_speculate(): that predicate is asserted in
+        // the drafting path and steers sampling at the accept site, so flipping
+        // it while a draft is already in flight would desync those two. Returning
+        // 0 here just means no further draft is requested, and the in-flight one
+        // drains through the normal path.
+        if (spec_accept_guard::is_tripped()) {
             return 0;
         }
 
@@ -3248,6 +3353,7 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            spec_accept_guard::add_drafted(draft.size());
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -4210,6 +4316,8 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            spec_accept_guard::add_accepted(n_accepted);
 
             // per-round spec trace for the offline depth-0/1/2 oracle (LLAMA_SPEC_TRACE=1).
             // acceptance is prefix-monotone, so the accepted length at the run's draft
