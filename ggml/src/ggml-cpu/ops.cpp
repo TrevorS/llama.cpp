@@ -8670,7 +8670,15 @@ void ggml_compute_forward_dsv4_lid_topk(
                 acc += (dot > 0.0f ? dot : 0.0f) * wh;
             }
             const float mv = ((const float *) m_r)[j];
-            scores[j] = acc + mv;
+            // Clamp a non-finite score to -INF, matching dsv4_lds / dsv4_score_key16
+            // on CUDA. Two reasons, and the second is the load-bearing one:
+            //   1. semantics — a poisoned score must never be selected;
+            //   2. the partial_sort comparator below is `sa > sb || (sa == sb && a < b)`,
+            //      and every comparison against a NaN is false. That makes the
+            //      comparator a non-strict-weak-ordering, which is UB for
+            //      std::partial_sort -- not merely a wrong answer.
+            const float sv = acc + mv;
+            scores[j] = sv == sv ? sv : -INFINITY;
             order[j]  = (int32_t) j;
         }
 

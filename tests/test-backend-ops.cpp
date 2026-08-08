@@ -6254,21 +6254,25 @@ struct test_dsv4_lid_topk : public test_case {
     const int64_t n_past;  // causal mask: row t keeps keys [0, n_past+t], -INF above.
                            // -1 = uniform-random mask, i.e. NO masked rows at all —
                            // the score kernels' mask-probe early-out never fires.
+    const int poison_nan;  // inject NaN into every Nth mask entry (0 = off). A NaN
+                           // mask value carries straight into acc+mv, which is the
+                           // realistic upstream path for a poisoned score.
 
     std::string vars() override {
         return std::string("k_type=") + ggml_type_name(k_type) +
                ",d_idx=" + std::to_string(d_idx) + ",n_head=" + std::to_string(n_head) +
                ",n_lid=" + std::to_string(n_lid) + ",nt_s=" + std::to_string(nt_s) +
                ",n_stream=" + std::to_string(n_stream) + ",top_k=" + std::to_string(top_k) +
-               ",n_past=" + std::to_string(n_past);
+               ",n_past=" + std::to_string(n_past) + ",poison_nan=" + std::to_string(poison_nan);
     }
 
     test_dsv4_lid_topk(ggml_type k_type = GGML_TYPE_F32,
             int64_t d_idx = 128, int64_t n_head = 64, int64_t n_lid = 2048,
             int64_t nt_s = 512, int64_t n_stream = 1, int top_k = 512,
-            int64_t n_past = -1)
+            int64_t n_past = -1, int poison_nan = 0)
         : k_type(k_type), d_idx(d_idx), n_head(n_head), n_lid(n_lid),
-          nt_s(nt_s), n_stream(n_stream), top_k(top_k), n_past(n_past) {}
+          nt_s(nt_s), n_stream(n_stream), top_k(top_k), n_past(n_past),
+          poison_nan(poison_nan) {}
 
     // Output is index sets per row; compare order-independently (top-k selection
     // is a set — the downstream mask does not care about intra-row order).
@@ -6329,7 +6333,7 @@ struct test_dsv4_lid_topk : public test_case {
     // scratch in the selected set.
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (n_past < 0 || strcmp(t->name, "mask") != 0) {
+            if ((n_past < 0 && poison_nan == 0) || strcmp(t->name, "mask") != 0) {
                 init_tensor_uniform(t);
                 continue;
             }
@@ -6340,9 +6344,17 @@ struct test_dsv4_lid_topk : public test_case {
             for (int64_t s = 0; s < n_stream; s++) {
                 for (int64_t r = 0; r < nt_s; r++) {
                     float * row = m.data() + (s*nt_s + r)*n_lid;
-                    const int64_t keep = std::min(n_past + r + 1, n_lid);
+                    const int64_t keep = n_past < 0 ? n_lid : std::min(n_past + r + 1, n_lid);
                     for (int64_t j = 0;    j < keep;  j++) row[j] = dis(gen);
                     for (int64_t j = keep; j < n_lid; j++) row[j] = -INFINITY;
+                    if (poison_nan > 0) {
+                        // Offset the phase per row so the poisoned columns are not
+                        // the same on every token -- a per-column-uniform pattern
+                        // would let a broken clamp still agree with the reference.
+                        for (int64_t j = r % poison_nan; j < keep; j += poison_nan) {
+                            row[j] = NAN;
+                        }
+                    }
                 }
             }
             ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
@@ -10484,6 +10496,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2100,   40, 1, 256,  300));  // int8 tile: ~85% masked, whole dead tiles + diagonal band, partial token tile
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1024,   32, 1, 512,  200));  // int8 tile: top_k > live keys -> selection fills from the -INF tail
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 2, 512,  300));  // decode kernel: ~93% masked, -INF tail fill, n_stream=2
+    // NaN poisoning (poison_nan = inject NaN every Nth mask entry). A non-finite
+    // score must clamp to -INF identically on all three selection paths (scalar
+    // bitonic, d128 bitonic, d128 radix) and on the CPU reference. Left unclamped
+    // a positive NaN keys ABOVE +INF in the radix path and would be selected on
+    // every token; in the bitonic path it compares false both ways and makes the
+    // winner depend on evaluation order. The poison=2 cases leave fewer live keys
+    // than top_k, forcing selection into the clamped tail where the index
+    // tie-break between poisoned and masked entries has to agree exactly.
+    //                                       k_type,          d_idx, n_head, n_lid, nt_s, n_stream, top_k, n_past, poison_nan
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    4, 1, 256,   -1, 7));  // scalar bitonic, exact set match (0.0 tolerance)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    4, 1, 768,   -1, 2));  // scalar, forced into the clamped tail, exact set match
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,    4, 1, 512,   -1, 7));  // d128 bitonic (nt<16)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64, 17000,   20, 1, 512,   -1, 7));  // d128 radix (nt>=16, multi-pass)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  1024,   20, 1, 768,   -1, 2));  // d128 radix, forced into the clamped tail
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  4096,    1, 1, 512,   -1, 7));  // decode kernel (nt_s=1)
+    test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F16, 128, 64,  2048,   32, 1, 256,  400, 5));  // poison + causal mask: clamp interacts with the mask-probe early-out
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  5000,    4, 1, 128, 1000));  // scalar path (exact gate): ~80% masked, multi-chunk topk
     test_cases.emplace_back(new test_dsv4_lid_topk(GGML_TYPE_F32,  64,  8,  1024,    8, 1, 512,  200));  // scalar path (exact gate): -INF tail fill
 
