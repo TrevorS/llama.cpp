@@ -65,6 +65,65 @@ def test_with_and_without_draft():
     assert res.body["tokens"] == tokens_no_draft
 
 
+def test_accept_guard_disables_draft_losslessly():
+    """The acceptance guard must stop drafting without changing a single token.
+
+    A mispaired draft head is silent -- it just makes decode slower than no
+    speculation at all -- so the guard trips on measured acceptance. The property
+    that matters is that tripping is lossless: verification still gates every
+    token, so disabling the draft mid-stream can only change speed, never output.
+
+    The thresholds are forced (floor above 100%, so any observed rate is under it)
+    rather than arranged with a genuinely bad draft model, which would make the
+    test depend on how badly two tiny stories models happen to disagree.
+
+    The comparison is against the NO-DRAFT run, not against an unguarded draft
+    run. That is the property the guard actually promises -- once it trips you
+    are back to plain decoding -- and it is the only sound reference here:
+    draft and no-draft already diverge at this length on this model pair even
+    with the guard disarmed (see test_draft_matches_nodraft_64), so asserting
+    guarded == unguarded would be asserting the wrong thing.
+    """
+    global server
+
+    # reference: no draft model at all
+    server.model_draft = None
+    server.spec_type = None
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 64,
+    })
+    assert res.status_code == 200
+    content_no_draft = res.body["content"]
+    server.stop()
+
+    # draft model present, but the guard trips on the first verification step
+    create_server()
+    server.extra_env = {
+        "LLAMA_SPEC_ACCEPT_GUARD_MIN_DRAFTS": "1",
+        "LLAMA_SPEC_ACCEPT_GUARD_FLOOR": "101",
+    }
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 64,
+    })
+    assert res.status_code == 200
+    content_guarded = res.body["content"]
+    draft_n_guarded = res.body["timings"].get("draft_n", 0)
+
+    # tripping returns us to exactly the non-speculative result
+    assert content_guarded == content_no_draft
+    # ...and it stopped drafting rather than merely ignoring the drafts: only the
+    # single batch that produced the tripping measurement should be counted
+    assert 0 < draft_n_guarded <= server.spec_draft_n_max
+
+
 def test_different_draft_min_draft_max():
     global server
     test_values = [
