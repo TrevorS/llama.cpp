@@ -45,11 +45,43 @@
 static __device__ __forceinline__ float dsv4_ldk(const float * p) { return *p; }
 static __device__ __forceinline__ float dsv4_ldk(const half  * p) { return __half2float(*p); }
 
+// One-shot loud report for a non-finite score. The whole cost of this class of
+// bug is that it is SILENT: a NaN row reads downstream as 0% draft acceptance,
+// not as a crash, so it looks like a quality regression rather than a fault.
+// The atomic is only ever reached on the NaN path, so the guard is free when
+// the scores are clean.
+static __device__ int dsv4_nan_reported = 0;
+
+static __device__ __forceinline__ void dsv4_report_nan() {
+    if (atomicExch(&dsv4_nan_reported, 1) == 0) {
+        printf("\nggml-cuda dsv4_lid_topk: NON-FINITE indexer score detected and "
+               "clamped to -INF (this token's top-k is degraded; upstream q/k/weights/mask "
+               "are suspect). Reported once per process.\n");
+    }
+}
+
 // scores-buffer load: the d_idx==128 score kernels store f16 (halves the
 // [nt, n_lid] DRAM round-trip); the scalar path keeps f32 to stay bit-exact
 // under its strict 0.0-tolerance gate. Sort compares stay f32 either way.
-static __device__ __forceinline__ float dsv4_lds(const float * p) { return *p; }
-static __device__ __forceinline__ float dsv4_lds(const half  * p) { return __half2float(*p); }
+//
+// NaN clamp: the score kernels' own invariant (finite acc + {0,-INF} mask) holds
+// only while q/k/weights/mask are finite and acc does not overflow to +INF --
+// acc==+INF with a -INF mask is NaN. An unclamped NaN never compares greater OR
+// less, so which element wins a bitonic compare-exchange depends on evaluation
+// order: selection becomes nondeterministic rather than merely wrong. Clamping
+// to -INF makes a poisoned score behave exactly like a masked one.
+static __device__ __forceinline__ float dsv4_lds(const float * p) {
+    const float v = *p;
+    if (v == v) return v;
+    dsv4_report_nan();
+    return -INFINITY;
+}
+static __device__ __forceinline__ float dsv4_lds(const half  * p) {
+    const float v = __half2float(*p);
+    if (v == v) return v;
+    dsv4_report_nan();
+    return -INFINITY;
+}
 
 // ---------------------------------------------------------------------------
 // P3b packed MXFP4 lid container: 17B block-32 (e8m0 scale byte + 16 nibble
@@ -1186,11 +1218,30 @@ static __global__ void dsv4_topk_merge_kernel(
 // score), so "all > T, then lowest index among == T" is exactly dsv4_better.
 // The compaction MUST be an ordered scan (tiles ascending, in-tile prefix
 // preserves index order) — an atomic append would be nondeterministic in
-// WHICH ==T members win. No NaN can appear (finite acc + {0, -INF} mask).
+// WHICH ==T members win. A NaN should not be reachable (finite acc + {0, -INF}
+// mask), but that invariant is conditional on upstream finiteness and on acc
+// not overflowing to +INF, so dsv4_score_key16 clamps rather than trusting it —
+// see the note there for why an unclamped NaN is worse here than elsewhere.
 // ---------------------------------------------------------------------------
 
+// Order-preserving f16 -> u16 key. Keys run 0x0000 (most negative) to 0xFFFF.
+//
+// NaN clamp: a NaN half is exp==0x1F with a nonzero mantissa, so a POSITIVE NaN
+// (0x7C01-0x7FFF) keys to 0xFC01-0xFFFF — strictly ABOVE +INF's 0xFC00. Left
+// alone it would be the single highest key in the row and would be selected
+// into the top-k on every token, silently evicting a real candidate.
+//
+// Canonicalize to the -INF bit pattern rather than to key 0: that lands on the
+// same key -INF gets (0x03FF) and so matches BOTH the bitonic path (dsv4_lds
+// returns -INFINITY) and the CPU reference (same clamp). Sorting NaN strictly
+// below -INF instead would make the radix and bitonic paths disagree with each
+// other whenever selection has to reach into the masked tail.
 static __device__ __forceinline__ uint16_t dsv4_score_key16(const half h) {
     uint16_t hb = __half_as_ushort(h);
+    if ((hb & 0x7C00u) == 0x7C00u && (hb & 0x03FFu) != 0u) {
+        dsv4_report_nan();
+        hb = 0xFC00u; // -INF
+    }
     if (hb == 0x8000u) hb = 0u; // -0 == +0 under f32 compare
     return (hb & 0x8000u) ? (uint16_t) ~hb : (uint16_t) (hb | 0x8000u);
 }
