@@ -109,7 +109,13 @@ LOG=~/.cache/llama.cpp/ds4-serve.log
 cd /home/trevor/Projects/llama.cpp
 mkdir -p "$CACHE_DIR" "$SLOT_DIR" "$(dirname "$LOG")"
 
+# SoC = max ACPI thermal zone, per the 07-27 amendment that d0_gate.sh also
+# follows. It is NOT the GPU: those zones sit ~30 C above the GPU sensor at idle
+# (85.8 C vs 57 C measured 08-10), so reading "SoC" as a GPU temperature makes a
+# cold box look unsafe to start. Print both -- gpu() is the sensor NVML reports
+# and the one GGML_CUDA_POWER_TEMP_MAX actually trips on.
 soc(){ for z in /sys/class/thermal/thermal_zone*/temp; do cat "$z" 2>/dev/null; done|sort -rn|head -1|awk '{printf "%.1f",$1/1000}'; }
+gpu(){ nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null || echo "n/a"; }
 
 # Pre-flight the budget. On UMA a hard OOM takes the MACHINE, not a process, and
 # earlyoom is poll-based so it cannot stop a single large CUDA allocation.
@@ -131,7 +137,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 pgrep -x llama-server >/dev/null && { echo "  a llama-server is already running"; exit 1; }
 
-echo "  SoC $(soc)C  avail $(( $(grep MemAvailable /proc/meminfo|tr -dc '0-9')/1024 )) MiB"
+echo "  SoC $(soc)C  GPU $(gpu)C  avail $(( $(grep MemAvailable /proc/meminfo|tr -dc '0-9')/1024 )) MiB"
 echo "  starting in tmux session '$SESSION' (log: $LOG)"
 
 if [ "$CVEC" = "1" ]; then
