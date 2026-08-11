@@ -28,8 +28,8 @@
 // score kernel
 // ---------------------------------------------------------------------------
 
-// Mask-probe early-out (variant i, LLAMA_DSV4_LID_MASK_PROBE / kill-switch
-// DS4_CUDA_NO_MASK_PROBE=1). A key row whose mask entry is -INF contributes
+// Mask-probe early-out (variant i, LLAMA_DSV4_LID_MASK_PROBE=0 disables).
+// A key row whose mask entry is -INF contributes
 // -INF to the score no matter what the dot products are, so the score COMPUTE
 // (K load + quant + the n_head-deep dot loop) is dead work. The probe reads the
 // mask FIRST and, for masked rows, skips the compute but ALWAYS STORES -INF:
@@ -1600,14 +1600,11 @@ void ggml_cuda_op_dsv4_lid_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
         return e ? atoll(e) : (long long) 24576;
     }();
     // mask-probe early-out (see the note above dsv4_ldk): masked key rows skip
-    // the score compute but still store -INF. Bit-exact, so default ON.
-    // DS4_CUDA_NO_MASK_PROBE=1 is the kill-switch; LLAMA_DSV4_LID_MASK_PROBE=0
-    // is the same switch in this file's own flag idiom (either disables).
+    // the score compute but still store -INF. Bit-exact, so default ON;
+    // LLAMA_DSV4_LID_MASK_PROBE=0 disables. This used to also answer to
+    // DS4_CUDA_NO_MASK_PROBE, a vestige of the ds4_cuda.cu port lineage —
+    // two names for one switch, referenced by nothing outside this file.
     static const bool dsv4_lid_mask_probe = []() {
-        const char * off = getenv("DS4_CUDA_NO_MASK_PROBE");
-        if (off && off[0] != '0') {
-            return false;
-        }
         const char * e = getenv("LLAMA_DSV4_LID_MASK_PROBE");
         return !e || e[0] != '0';
     }();
