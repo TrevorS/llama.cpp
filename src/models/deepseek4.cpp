@@ -684,6 +684,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     // idle; see PROGRESS.md iteration 9), so past a depth threshold the fused
     // op wins. Threshold override: LLAMA_DSV4_FUSED_LID_TG_DEPTH (tokens;
     // 0 = always fuse decode, very large = never, i.e. pre-iteration-9).
+    //
+    // PRECEDENCE: this threshold is NOT consulted in the default config. The
+    // guard below is `fused_lid && (nt > 1 || n_lid >= tg_depth || mxfp4)`, and
+    // the MXFP4 container is default ON, so the third disjunct short-circuits
+    // and decode always fuses; with LLAMA_DSV4_FUSED_LID=0 the whole branch is
+    // skipped instead. The only way to reach the threshold is to turn the
+    // container off explicitly (LLAMA_DSV4_LID_CACHE_MXFP4=0), which is a
+    // diagnostic configuration. Kept for exactly that case.
     static const int64_t dsv4_lid_tg_depth = []() {
         const char * e = getenv("LLAMA_DSV4_FUSED_LID_TG_DEPTH");
         return e ? atoll(e) : (long long) 4096;
