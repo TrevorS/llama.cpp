@@ -127,8 +127,44 @@ draft quality than the shallow one.
 | backend-ops | 7 DSV4 ops, 2/2 backends each |
 | server tests | disk-cache 3/3 |
 
+**The PPL gate command**, which was not written down and cost a wrong run to
+recover (a code corpus at c32768 scores 1.16, nowhere near this gate):
+
+```
+llama-perplexity -m <UD-IQ3_XXS shard 1> -f ~/models/datasets/wiki.test.raw \
+  -c 512 -b 2048 -ngl 999 -fa on --no-mmap --chunks 100
+```
+
+wikitext, `n_ctx=512`, 100 chunks, `n_seq=4` (implied by 2048/512). The same
+protocol produced the older 5.0291/5.0177 anchors on the previous quant — the
+number moved because the **model** changed to UD-IQ3_XXS-v2, not the command.
+
 The 5.0177 PPL figure in older notes is **stale** — it predates ~90 upstream
 commits. Never report a PPL delta without rebuilding the baseline.
+
+**Acceptance has no standalone harness.** It is read from the server's
+per-request `draft_n` / `draft_n_accepted` timings (see `gb10-thermal/soak.sh`
+for the extraction), but the prompt set behind the 0.6357 and 0.8316 figures is
+not recorded anywhere, so those two gates are not currently reproducible from
+the repo alone. Write the probe down the next time it is run. Note the rule from
+`ds4-tile/FLAGS.md`: text-hash equality is **not** a valid equivalence check for
+a spec flag — speculation preserves the target distribution, so the text matches
+regardless of what the draft proposed. Gate on `draft_n`/`accepted`.
+
+### Re-validated on the 2026-08-10 rebase onto `030ebb558`
+
+| Gate | Result |
+| --- | --- |
+| PPL | 6.0735 ± 0.10675 — **exact match**, value and error bar |
+| backend-ops | 13236/13236, 2/2 backends |
+| DSV4 ops | 226/226 across the nine fused ops |
+| DSpark acceptance | **not run** — no recorded prompt set (see above) |
+
+One `CONV_TRANSPOSE_1D` case failed on the first full backend-ops pass
+(`ERR 4.8e-5 > 1e-7`, `ne_input=[1,7,1,1]`) and passed on the re-run, and passes
+in isolation on both this tree and pristine `030ebb558`. We touch no conv code.
+Treated as upstream flakiness, not a rebase regression — but if it recurs, it is
+a real data race worth reporting upstream rather than a threshold to relax.
 
 ## Draft model
 
