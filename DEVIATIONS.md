@@ -3,7 +3,7 @@
 Every difference between this branch and upstream, and why it exists. If a
 deviation is not listed here it should not exist — delete it or add a row.
 
-Base: upstream `3581ba0cf`. 15 commits, 53 files, `↑`4761 `↓`331.
+Base: upstream `6fdd0ac89`. 31 commits, 57 files, `↑`7825 `↓`307.
 
 ## Standing rules
 
@@ -165,6 +165,63 @@ One `CONV_TRANSPOSE_1D` case failed on the first full backend-ops pass
 in isolation on both this tree and pristine `030ebb558`. We touch no conv code.
 Treated as upstream flakiness, not a rebase regression — but if it recurs, it is
 a real data race worth reporting upstream rather than a threshold to relax.
+
+### Re-validated on the 2026-08-27 rebase onto `6fdd0ac89`
+
+301 upstream commits inherited. Conflicts in 6 of our 31 commits, 15 hunks
+across 9 files.
+
+| Gate | Result |
+| --- | --- |
+| PPL | 6.0735 ± 0.10675 — **exact match**, value and error bar |
+| PPL (older UD-IQ3_XXS quant) | 5.0291 ± 0.07884 — exact match to *that* model's anchor |
+| backend-ops | 13752/13752, 2/2 backends |
+| DSV4 ops | 229 cases across the ten fused ops |
+| DSpark acceptance | **not run** — still no recorded prompt set |
+
+Two exact PPL matches on two different quants is what licenses the three
+upstream adoptions below: each changes the DSV4 graph, and neither number moved.
+
+**Upstream has converged onto much of this work.** `common_speculative_impl_draft_dflash`
+now carries `is_dspark`, `sample_from_anchor` and `mask_token_id` upstream. Their
+DSpark block still lacks the Markov-head chaining, which is the defect that collapses
+a block to its anchor (26.0% / 1.8% / 0% / 0% / 0% per-position), so ours is kept.
+Upstream also added `sample_from_anchor`, read from `dflash.sample_from_anchor`; our
+0731 draft GGUF does not set that key, so it defaults true and the anchor semantics
+match what this fork did unconditionally. **If a future draft sets it false, the
+block layout changes under us** — check that key before trusting an acceptance number.
+
+Adopted from upstream, shrinking the diff:
+
+- **`ggml_rope_set_offset()`** (`873e5d8e3`) replaces the view/rope/concat partial-rope
+  dance in `build_compressed_kv_reduce_finish`. It sets `op_params[15]` on the rope
+  node so rotation starts at `n_embd_head_nope`; one concat, two views and a cont drop out.
+- **Single-gather overlap read.** Upstream reads all `2*ratio*n_blocks` rows with one
+  `ggml_get_rows` and views prev/cur out of it, instead of splitting the index tensor
+  and gathering twice.
+- **`need_embd` removal** (`f785fc9ea`). This was flagged as the rebase's semantic
+  hazard — silent acceptance collapse if the drivers stopped getting target embeddings.
+  It is **inert**: every impl in this fork returned `need_embd() -> false`, and
+  `server_slot::need_embd_nextn()` had **no caller**. The drivers enable what they need
+  directly in their constructors (`llama_set_embeddings_nextn(ctx_tgt/ctx_dft, ...)`).
+  The whole vestigial chain — both virtuals, both free functions, the header decls and
+  the slot accessor — is now gone, and this fork matches upstream exactly there.
+
+Kept against upstream, with the reason:
+
+- **`state_read` stays unconditional.** Upstream guards the block-cache reads with
+  `if (!partial_only)`; our writer emits them in partial mode too via `raw_flags`.
+  Adopting their guard would desync the reader from our own on-disk format.
+  Their per-seq `clear_compressed(seq_id, ...)` helper is a genuine improvement over
+  our `kv_csa->clear(true)` (which clears *all* sequences) — **queued, not taken**,
+  because changing restore scope mid-rebase is not gateable by PPL.
+- **`reasoning_effort` passthrough** is now upstream's, better than ours (it erases the
+  kwarg on `"none"`). Our deviation is down to one condition: an explicit
+  `chat_template_kwargs` entry still wins over the OAI field.
+
+One adaptation was forced: upstream changed `json` to `common_json`, whose iterator is
+not random-access, so `std::sort` over a `json` array no longer compiles. The slot-saves
+listing now sorts a plain vector and builds the array afterwards.
 
 ## Draft model
 
