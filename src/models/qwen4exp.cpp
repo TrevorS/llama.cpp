@@ -1400,13 +1400,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
 
-    // chained heads read the streams back, as the trunk hands them over
-    res->t_h_nextn = flat;
-
+    // The next draft step re-enters here, so the export has to carry the rows the reader
+    // expects. The draft context runs masked=true, i.e. output rows only, so the gather has
+    // to happen BEFORE the export -- exporting the ungathered tensor is invisible at n_max=1,
+    // where n_tokens == n_outputs, and silently misaligns every chained position after it.
+    // get_rows also yields a real node rather than a view, so the scheduler assigns it a
+    // backend for the readback. Same ordering as llama_model_deepseek4::graph_mtp.
     if (inp_out_ids) {
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
-        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
+
+    cb(flat, "h_nextn", -1);
+    res->t_h_nextn = flat;
+
+    inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, flat->ne[1]);
 
     // the final mixer is the output norm: there is no separate one
     cur = build_hc_mix(inpL, model.hc_head_norm, model.hc_head_down, model.hc_head_up, nullptr, nullptr, -1);
