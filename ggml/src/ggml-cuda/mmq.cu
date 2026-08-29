@@ -202,17 +202,24 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-    ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-        src1_scale.alloc(ne12*n_expert_used);
-    }
-
+    // src1 is [ne10, 1, n_tokens] for MUL_MAT_ID, so ne11 is always 1 here and
+    // ggml_cuda_mmq_get_J_max(..., 1) returns 0 -- no tail padding. mul_mat_q still loads a
+    // full J-column tile of y for the last tile of the last used expert, reading up to
+    // (J-1)*sizeof(block_q8_1_mmq) past the allocation (~18 KB at J=128). Whether that faults
+    // depends on how much slack the VMM pool left behind the buffer, which is why it only
+    // shows up at particular ubatch sizes. The flattened column count is the real one.
+    // ref: ggml-org/llama.cpp#27792
     const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
+
+    const size_t nbytes_src1_q8_1 = ne11_flat*ne10_padded * y_block_size/y_values_per_block +
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11_flat) * sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+    if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+        src1_scale.alloc(ne11_flat);
+    }
 
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
