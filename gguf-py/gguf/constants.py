@@ -2914,6 +2914,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PLE_NORM_QUERY,
         MODEL_TENSOR.PLE_NORM_CONV,
         MODEL_TENSOR.PLE_CONV1D,
+        # the MTP block reuses the per-layer tensors at index n_layer, plus these three
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,
