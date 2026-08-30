@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
@@ -471,14 +472,22 @@ void llama_batch_allocr::split_reset() {
 
     used.clear();
     used.resize(get_n_tokens(), false);
+    used_lb = 0;
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
-    // find the first unused token
-    uint32_t cur_idx = 0;
+    // LLAMA_BATCH_USED_LB=0 restores the rescan-from-0 behaviour for A/B on one build
+    static const bool use_lb = [] {
+        const char * e = getenv("LLAMA_BATCH_USED_LB");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    // find the first unused token, resuming from the lower bound rather than rescanning from 0
+    uint32_t cur_idx = use_lb ? used_lb : 0;
     while (cur_idx < used.size() && used[cur_idx]) {
         ++cur_idx;
     }
+    used_lb = cur_idx;
 
     // we are done
     if (cur_idx >= used.size()) {
@@ -645,6 +654,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             } else {
                 // truncate the seq so that at least n_keep_tail tokens remain
                 while (n_remaining(0) < n_keep_tail) {
+                    used_lb = std::min<uint32_t>(used_lb, (uint32_t) idxs.back());
                     used[idxs.back()] = false;
                     --n_used;
 
@@ -660,6 +670,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         // return the tokens of the deferred seqs back to the pool
         for (uint32_t s = n_keep; s < n_seqs; ++s) {
             for (const int32_t idx : idxs_per_seq[s]) {
+                used_lb = std::min<uint32_t>(used_lb, (uint32_t) idx);
                 used[idx] = false;
                 --n_used;
             }
