@@ -4415,6 +4415,15 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 //                            Throttle reasons are lagging -- the cap has already
 //                            engaged by the time they assert -- so this is the
 //                            leading tripwire. 0 (default) disables.
+//   GGML_CUDA_POWER_EXEMPT_MS=T  graph computes shorter than T ms pay no duty tax
+//                            (default 250, 0 = tax everything as before). The cap
+//                            this throttle exists to dodge is a *prefill* effect:
+//                            a prefill ubatch is a second or more of dense matmul,
+//                            a decode step is tens of ms of memory-bound streaming
+//                            that never approaches the cap. Taxing both cost ~14%
+//                            of decode throughput for no thermal benefit, so the
+//                            span duration -- already measured for the duty
+//                            accounting -- is used to tell the two phases apart.
 //
 // Work intervals are measured with a cudaEvent pair around each graph compute; the
 // compensating sleep happens before the NEXT submit, when the previous compute has
@@ -4439,6 +4448,8 @@ struct ggml_cuda_power_dev {
     uint64_t n_full    = 0; // pre-hooks where the ring was full (span unmeasured)
     double   meas_ms   = 0.0;
     double   sleep_ms  = 0.0;
+    uint64_t n_exempt  = 0;   // spans below the phase threshold (decode): measured, not taxed
+    double   exempt_ms = 0.0;
     // GGML_CUDA_POWER_GRANULARITY=layer[N]: chunked pacing state (direct-exec path only)
     cudaEvent_t chunk_start = nullptr;
     cudaEvent_t chunk_stop  = nullptr;
@@ -4456,6 +4467,7 @@ struct ggml_cuda_power_state {
     int  base_pct = 100;
     int  min_pct  = 60;
     int  chunk_nodes = 0; // 0 = per-graph pacing (default); >0 = pace every N launched nodes in direct-exec
+    double exempt_below_ms = 250.0; // graph computes shorter than this pay no duty tax (0 = tax all)
     std::atomic<int>  cur_pct{100};
     std::atomic<bool> stop_poller{false};
     std::thread poller;
@@ -4486,6 +4498,11 @@ struct ggml_cuda_power_state {
                         i, (unsigned long long) dev[i].n_pre, (unsigned long long) dev[i].n_meas,
                         (unsigned long long) dev[i].n_full, dev[i].meas_ms, dev[i].sleep_ms,
                         dev[i].debt_ms, 100.0*duty);
+                if (dev[i].n_exempt > 0) {
+                    fprintf(stderr, "[cuda-power] dev%d: exempt-spans=%llu exempt-meas=%.0fms "
+                            "(decode, untaxed)\n",
+                            i, (unsigned long long) dev[i].n_exempt, dev[i].exempt_ms);
+                }
                 if (dev[i].n_chunks > 0) {
                     const double cduty = dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms > 0.0
                         ? dev[i].chunk_meas_ms / (dev[i].chunk_meas_ms + dev[i].chunk_sleep_ms) : 1.0;
@@ -4648,10 +4665,21 @@ static ggml_cuda_power_state & ggml_cuda_power(void) {
             const int n = atoi(env_gran + 5);
             ps.chunk_nodes = n >= 8 && n <= 4096 ? n : 96;
         }
+        // phase split: a compute shorter than this is decode, and decode does not
+        // engage the power cap this throttle exists to dodge. Sized well above the
+        // longest decode compute (a deep-context MTP verify batch, tens of ms) and
+        // well below the shortest prefill ubatch (~1.5 s at ub1024).
+        const char * env_exempt = getenv("GGML_CUDA_POWER_EXEMPT_MS");
+        if (env_exempt != nullptr) {
+            const double v = atof(env_exempt);
+            if (v >= 0.0 && v <= 60000.0) {
+                ps.exempt_below_ms = v;
+            }
+        }
         ps.cur_pct.store(ps.base_pct, std::memory_order_relaxed);
-        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s\n",
+        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s exempt=%.0fms\n",
                       ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct,
-                      ps.chunk_nodes > 0 ? "layer" : "graph");
+                      ps.chunk_nodes > 0 ? "layer" : "graph", ps.exempt_below_ms);
 #ifdef __linux__
         if (ps.adapt) {
             ps.poller = std::thread(ggml_cuda_power_poller, &ps);
@@ -4726,7 +4754,11 @@ static void ggml_cuda_power_pre_compute(ggml_backend_cuda_context * cuda_ctx) {
         float ms = 0.0f;
         if (cudaEventElapsedTime(&ms, d.ev_start[d.tail], d.ev_stop[d.tail]) == cudaSuccess && ms > 0.05f) {
             const int pct = ps.cur_pct.load(std::memory_order_relaxed);
-            if (pct >= 1 && pct <= 99) {
+            if (ps.exempt_below_ms > 0.0 && (double) ms < ps.exempt_below_ms) {
+                // decode-sized span: measured for telemetry, but accrues no debt
+                d.n_exempt++;
+                d.exempt_ms += ms;
+            } else if (pct >= 1 && pct <= 99) {
                 d.debt_ms += (double) ms * (100 - pct) / pct;
             }
             d.n_meas++;
