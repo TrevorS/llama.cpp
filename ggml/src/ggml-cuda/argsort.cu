@@ -81,6 +81,17 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
     cudaStreamCaptureStatus capture_status;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
     is_capturing = (capture_status != cudaStreamCaptureStatusNone);
+
+    // On GB10 the non-capture branch is not a faster alternative, it is a much slower one: an
+    // nsys capture of MTP decode measured DeviceSegmentedSort at 1.344 s of GPU across 984
+    // launches against 0.729 s across 20376 for the SegmentedRadixSort branch. Since the radix
+    // variant is also the capture-safe one, prefer it unconditionally and keep the branch only
+    // as an escape hatch. GGML_CUDA_ARGSORT_RADIX=0 restores upstream's capture-only choice.
+    static const bool radix_always = [] {
+        const char * e = getenv("GGML_CUDA_ARGSORT_RADIX");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    is_capturing = is_capturing || radix_always;
 #endif  // USE_CUDA_GRAPH
 
     if (order == GGML_SORT_ORDER_ASC) {
