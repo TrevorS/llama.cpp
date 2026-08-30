@@ -3,7 +3,7 @@
 Every difference between this branch and upstream, and why it exists. If a
 deviation is not listed here it should not exist — delete it or add a row.
 
-Base: upstream `6fdd0ac89`. 31 commits, 57 files, `↑`7825 `↓`307.
+Base: upstream `c589f0ed1`. 37 commits, 68 files, `↑`8691 `↓`345.
 
 ## Standing rules
 
@@ -222,6 +222,29 @@ Kept against upstream, with the reason:
 One adaptation was forced: upstream changed `json` to `common_json`, whose iterator is
 not random-access, so `std::sort` over a `json` array no longer compiles. The slot-saves
 listing now sorts a plain vector and builds the array afterwards.
+
+## qwen4exp serving
+
+`serve-qwen` (in `~/bin`) is the validated recipe; every value in it was measured.
+The three that are not obvious:
+
+- **`-lm mmap --tensor-read-lazy on` is mandatory.** The PLE is marked
+  `TENSOR_READ_LAZY`, but `-lm auto` resolves to `none` on GB10, so the default
+  loads all 26.82 GiB resident and lazy never fires. Confirm by host memory, not
+  by log line — lazy leaves ~50 GiB available, resident leaves ~24 GiB.
+- **The draft's head is Q5_K, not Q8_0.** `output.weight` was 675 MB of the
+  draft's 827 MB per step and 12.6% of all decode GPU time; Q5_K is 437 MB for
+  +8% tg at flat acceptance. Free of quality risk by construction — the target
+  verifies every token, so a weaker draft costs acceptance, never correctness.
+  **Q4_K is slower than Q5_K** despite reading 22% fewer bytes; do not assume
+  `mul_mat_vec_q` is monotonic down the quant ladder.
+- **`--spec-draft-n-max 6`.** The optimum was 1 only because `graph_mtp`
+  published `t_h_nextn` before applying `inp_out_ids` (fixed in `278b29bc7`);
+  n=8 regresses because expert traffic does not amortise across the verify
+  batch — each token routes to its own 10 of 512 experts.
+
+Cumulative against the pre-`ec4d1e89f` config: **35.71 → 44.45 t/s (+24.5%)**,
+acceptance flat at ~0.75.
 
 ## Draft model
 
