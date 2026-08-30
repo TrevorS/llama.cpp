@@ -102,6 +102,7 @@ byte-identical in every leg except `MOE_GATE_FUSE`.
 | `UNION_GATHER` | flat | flat | **removed** (`a5d74026d`) |
 | `FUSE_INGEST` | flat | flat | **parked**, see below |
 | `GRAPH_SHAPE_KEY` | flat | flat | keep — bounds cache growth under agentic churn, which no single-prompt benchmark exercises |
+| `QWEN4EXP_RS_ROLLBACK` | flat | **+45.9% tg / +16.6% acc** (28k) | keep — the sharpest rule-2 case yet |
 
 `LLAMA_DSV4_MOE_GATE_FUSE=0` changes acceptance (0.6545 → 0.5977) and output
 length. **It is not a clean A/B control** — do not reach for it to isolate an
@@ -238,6 +239,15 @@ The three that are not obvious:
   verifies every token, so a weaker draft costs acceptance, never correctness.
   **Q4_K is slower than Q5_K** despite reading 22% fewer bytes; do not assume
   `mul_mat_vec_q` is monotonic down the quant ladder.
+- **The recurrent rollback ring is load-bearing at depth.** `qwen4exp` was missing
+  from `llm_arch_supports_rs_rollback`, which silently forced a full state snapshot
+  to host on every speculative cycle. Flat at 30-token prompts, **+45.9% tg and
+  +16.6% acceptance at 28k** (`37ac8c297`). Rule 2 in the flesh — shallow would
+  have argued for deleting it.
+- **`--backend-sampling` (`-bs`) is a loss here**: 36.88/35.10 vs 42.98/43.09 t/s,
+  ~15% down across all repeats. It removes the 248,320-wide CPU partial sort and
+  the logits readback and is still slower. Do not reach for it again without new
+  evidence.
 - **`--spec-draft-n-max 6`.** The optimum was 1 only because `graph_mtp`
   published `t_h_nextn` before applying `inp_out_ids` (fixed in `278b29bc7`);
   n=8 regresses because expert traffic does not amortise across the verify
