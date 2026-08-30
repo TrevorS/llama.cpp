@@ -3,7 +3,7 @@
 Every difference between this branch and upstream, and why it exists. If a
 deviation is not listed here it should not exist — delete it or add a row.
 
-Base: upstream `c589f0ed1`. 37 commits, 68 files, `↑`8691 `↓`345.
+Base: upstream `c589f0ed1`. 44 commits, 70 files, `↑`8800 `↓`350.
 
 ## Standing rules
 
@@ -89,6 +89,31 @@ vectors.
 **`641c61a8c` — `reasoning_effort` passthrough.** It was parsed and dropped, so
 a template branching on it never saw it.
 
+**`ec4d1e89f` — decode is exempt from the power duty cycle.** The firmware cap the
+throttle exists to dodge is a *prefill* effect; taxing decode too cost ~21% of tg
+for no thermal benefit. Spans shorter than `GGML_CUDA_POWER_EXEMPT_MS` (250) accrue
+no debt. Prefill still pays in full — verified by the `[cuda-power]` telemetry
+reporting 85.0% effective duty and zero exempt spans on a pp4096 run.
+
+**`37ac8c297` — qwen4exp joins the recurrent rollback allowlist.** It shares
+qwen35's GatedDeltaNet state and the same generic `build_rs` path but was missed in
+`llm_arch_supports_rs_rollback`, so `n_rs_seq` silently clamped to 0 and the server
+fell back to a full 112 MiB state snapshot to host on every speculative cycle.
+
+**`86b5fdc36` — the n-gram history scan is windowed.** `get_prev_tokens()` swept
+from position 0 to fill a `below` fallback that only an M-RoPE gap can reach; for a
+token ubatch it is O(context) per call for a value nothing reads.
+
+**`53eb047b6` — argsort prefers the capture-safe radix sort.** Upstream treats
+`DeviceSegmentedRadixSort` as the constrained fallback; on GB10 it is the faster
+path (0.729 s across 20376 launches vs 1.344 s across 984 for `DeviceSegmentedSort`
+in one capture).
+
+**`3b0aef182` — no more rescanning from zero.** `split_simple()` searched for the
+first unused token from index 0 on every call over a batch sized by the whole
+prompt; `llm_graph_input_ple::set_input()` heap-allocated a 3-element vector inside
+its per-token loop. Both are O(n^2) in prompt length.
+
 ## Measured: what pays and what does not
 
 Ablation at two shapes, same config, one server boot per leg. Acceptance was
@@ -102,11 +127,33 @@ byte-identical in every leg except `MOE_GATE_FUSE`.
 | `UNION_GATHER` | flat | flat | **removed** (`a5d74026d`) |
 | `FUSE_INGEST` | flat | flat | **parked**, see below |
 | `GRAPH_SHAPE_KEY` | flat | flat | keep — bounds cache growth under agentic churn, which no single-prompt benchmark exercises |
-| `QWEN4EXP_RS_ROLLBACK` | flat | **+45.9% tg / +16.6% acc** (28k) | keep — the sharpest rule-2 case yet |
+| `QWEN4EXP_RS_ROLLBACK` | flat | **+45.9% tg** (28k) | keep — the sharpest rule-2 case yet |
+| `KV_NGRAM_WINDOW` | — | +4.5% tg / +3.6% pp (28k, single leg) | keep — asymptotic, but see the floor below |
+| `BATCH_USED_LB` | — | **+6.75% tg** (28k, 19 reps) | keep |
+| `CUDA_ARGSORT_RADIX` | — | +2.13% (at the floor) | keep on GPU-time evidence, not on this |
+| `CUDA_POWER_EXEMPT_MS` | +21.4% tg | — | keep |
 
 `LLAMA_DSV4_MOE_GATE_FUSE=0` changes acceptance (0.6545 → 0.5977) and output
 length. **It is not a clean A/B control** — do not reach for it to isolate an
 unrelated bug.
+
+### This rig cannot resolve better than ~2%
+
+Measured, not assumed: two legs of the **identical** configuration, 19 repeats
+each, came out 44.99 and 45.92 — a **2.07%** spread. The within-leg standard error
+is 0.18%, so per-rep error bars understate the real uncertainty by an order of
+magnitude. The noise has a timescale longer than one leg's bench window, which is
+why more repeats inside a leg do not help; only more interleaved legs do, at ~10
+min each.
+
+Consequences for rule 1: an effect under ~2% cannot be shown or refuted by A/B
+here, so such a change must be justified by mechanism or by direct instrumentation
+(a kernel-time delta from a profile, an asymptotic argument) rather than by a
+throughput number. Two traps that cost real time this session: a 4-repeat window
+reports a mean that looks precise to 0.3% while sitting up to 1.3% off the true
+mean, and **completion text is not run-to-run deterministic at temperature 0** on
+these models, so text-hash equality cannot gate a change. Gate on `draft_n` /
+`draft_n_accepted`, which were byte-identical across every leg of every A/B here.
 
 ## Known debt
 
@@ -166,6 +213,26 @@ One `CONV_TRANSPOSE_1D` case failed on the first full backend-ops pass
 in isolation on both this tree and pristine `030ebb558`. We touch no conv code.
 Treated as upstream flakiness, not a rebase regression — but if it recurs, it is
 a real data race worth reporting upstream rather than a threshold to relax.
+
+### Re-validated 2026-08-30, after touching shared code for qwen4exp
+
+Not a rebase. The qwen4exp decode work landed changes in code DS4 also runs
+(`get_prev_tokens` in `llama-kv-cache.cpp`, `split_simple` in `llama-batch.cpp`,
+the argsort dispatch, and the duty-cycle debt path), none of which qwen4exp's own
+gates cover. DS4 was re-gated on its own model to catch that.
+
+| Gate | Result |
+| --- | --- |
+| PPL | **6.0735 ± 0.10675 — exact match**, value and error bar |
+| backend-ops | 13765/13765, 2/2 backends (was 13752; upstream added 13 cases) |
+| DSV4 + HC ops | 208/208, 2/2 backends |
+| DSpark acceptance | **not run** — still no recorded prompt set |
+
+The PPL match matters more than usual here: `split_simple` and `get_prev_tokens`
+are on every model's prefill path, and the batch cursor carries an invariant that
+`split_equal` can violate. An exact PPL on a model that exercises different split
+and cache paths than qwen4exp is the evidence that neither change altered
+behaviour.
 
 ### Re-validated on the 2026-08-27 rebase onto `6fdd0ac89`
 
