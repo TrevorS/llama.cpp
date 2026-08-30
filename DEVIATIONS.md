@@ -244,10 +244,13 @@ The three that are not obvious:
   to host on every speculative cycle. Flat at 30-token prompts, **+45.9% tg and
   +16.6% acceptance at 28k** (`37ac8c297`). Rule 2 in the flesh — shallow would
   have argued for deleting it.
-- **`--backend-sampling` (`-bs`) is a loss here**: 36.88/35.10 vs 42.98/43.09 t/s,
-  ~15% down across all repeats. It removes the 248,320-wide CPU partial sort and
-  the logits readback and is still slower. Do not reach for it again without new
-  evidence.
+- **Backend sampling is a loss here, and now we know why.** CUDA 13.0 ships CCCL
+  3.0.1; `top-k.cu` needs CCCL >= 3.2 for a real `DeviceTopK`, so below that
+  `ggml_top_k` falls back to "argsort + copy" — a top-k of 10 becomes a **full sort
+  of the 248,320-wide logit row**. Target-side `-bs` measured ~15% down; the draft
+  defaults to backend sampling and `--no-spec-draft-backend-sampling` is worth
+  +0.7% at 28k. **Both should be revisited if the toolkit's CCCL crosses 3.2** —
+  the verdict is about a missing kernel, not about backend sampling as an idea.
 - **`--spec-draft-n-max 6`.** The optimum was 1 only because `graph_mtp`
   published `t_h_nextn` before applying `inp_out_ids` (fixed in `278b29bc7`);
   n=8 regresses because expert traffic does not amortise across the verify
