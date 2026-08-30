@@ -170,5 +170,11 @@ private:
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
 
+    // lower bound on the first unused index: invariant is that no unused token exists below it.
+    // split_simple() consumes tokens in order and used to rescan from 0 on every call, which is
+    // O(n^2) across a long prompt (one call per ubatch over a batch sized by the whole prompt).
+    // Only ever advanced past tokens marked used, and clamped back whenever one is un-marked.
+    uint32_t used_lb = 0;
+
     int debug;
 };

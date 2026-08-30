@@ -1171,6 +1171,8 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<int32_t>     idx;
+    std::vector<int64_t>     ctx;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1193,7 +1195,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    idx.resize(n_heads * n_tokens);
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1205,11 +1207,14 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    // ctx is rewritten in full for every token below, so one buffer serves the whole ubatch;
+    // it used to be heap-allocated per token, which is 28k allocations of 24 bytes on a long prefill
+    ctx.resize(n_gram);
+
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
