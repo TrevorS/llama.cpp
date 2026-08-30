@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1916,9 +1918,26 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
     below.fill({ -1, LLAMA_TOKEN_NULL });
 
+    // Every lookup below asks for a position in [w0, p_max], so only that window can land in
+    // `hist`; the rest of the scan exists solely to find `below`, the nearest token *under* the
+    // window, which `lookup` reaches only when no position in [w0, p] is present at all. That
+    // needs an M-RoPE gap, which only an embd ubatch can produce -- a token ubatch has unique
+    // contiguous positions and always resolves inside the window.
+    //
+    // Scanning from 0 for that is O(context) on every decode step, and for_each_token_in walks
+    // LLAMA_MAX_SEQ bits per matching cell, so it is the single host cost here that grows with
+    // depth. Start the scan at the window for token ubatches and keep the full sweep for embd.
+    // LLAMA_KV_NGRAM_WINDOW=0 restores the unconditional full scan.
+    static const bool ngram_window = [] {
+        const char * e = getenv("LLAMA_KV_NGRAM_WINDOW");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    const llama_pos p_scan0 = (ngram_window && ubatch.token) ? std::max<llama_pos>(0, w0) : 0;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
+        v_cells[s].for_each_token_in(seqs, p_scan0, p_max + 1,
             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
                 if (pos >= w0) {
                     hist[key(seq_id, pos)] = tok;
