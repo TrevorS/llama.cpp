@@ -574,6 +574,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_SCATTER_ADD,
+        GGML_OP_HC_GATE_MIX,
 
         GGML_OP_UNARY,
 
@@ -2780,6 +2782,33 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Scatter a block output across hyper-connection streams and add it to the residual:
+    //   dst[e,c,t] = residual[e,c,t] + block[e,t] * 2*sigmoid(inject[c,t] * inv_hc)
+    // Replaces sigmoid + 2x scale + repeat_4d + mul + add, and avoids materialising the
+    // repeated [n_embd, hc, n_tokens] tensor entirely.
+    //   residual : [n_embd, hc, n_tokens]
+    //   block    : [n_embd, n_tokens]
+    //   inject   : [hc, n_tokens]
+    GGML_API struct ggml_tensor * ggml_hc_scatter_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block,
+            struct ggml_tensor  * inject,
+            float                 inv_hc);
+
+    // Gate the hyper-connection streams and collapse them to their scaled sum:
+    //   dst[e,t] = scale * sum_c x[e + c*n_embd, t] * gate[e + c*n_embd, t]
+    // Replaces mul + cont + (hc-1) adds over strided views + scale, and avoids
+    // materialising the [hc*n_embd, n_tokens] gated intermediate.
+    //   x, gate : [hc*n_embd, n_tokens]
+    //   dst     : [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_hc_gate_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            int                   hc,
+            float                 scale);
 
     // custom operators
 

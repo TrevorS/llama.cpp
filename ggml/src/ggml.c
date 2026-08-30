@@ -1081,6 +1081,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
+    "HC_SCATTER_ADD",
+    "HC_GATE_MIX",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
 
@@ -1107,7 +1109,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_FA_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1203,6 +1205,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
+    "hc_scatter_add(residual, block, inject)",
+    "hc_gate_mix(x, gate)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
 
@@ -1229,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_fa_merge(a,b)",
 };
 
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6741,6 +6745,78 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
+
+    return result;
+}
+
+// ggml_hc_gate_mix
+
+struct ggml_tensor * ggml_hc_gate_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        int                   hc,
+        float                 scale) {
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t hc_dim   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+
+    GGML_ASSERT(hc_dim % hc == 0);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(x, gate));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(gate));
+
+    const int64_t n_embd = hc_dim / hc;
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    int32_t params_i[1] = { hc };
+    ggml_set_op_params(result, params_i, sizeof(params_i));
+    ggml_set_op_params_f32(result, 1, scale);
+
+    result->op     = GGML_OP_HC_GATE_MIX;
+    result->src[0] = x;
+    result->src[1] = gate;
+
+    return result;
+}
+
+// ggml_hc_scatter_add
+
+struct ggml_tensor * ggml_hc_scatter_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block,
+        struct ggml_tensor  * inject,
+        float                 inv_hc) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(block->type    == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type   == GGML_TYPE_F32);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(residual->ne[3] == 1);
+    GGML_ASSERT(block->ne[0] == n_embd   && block->ne[1] == n_tokens && block->ne[2] == 1 && block->ne[3] == 1);
+    GGML_ASSERT(inject->ne[0] == hc      && inject->ne[1] == n_tokens && inject->ne[2] == 1 && inject->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(block));
+    GGML_ASSERT(ggml_is_contiguous(inject));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    ggml_set_op_params(result, &inv_hc, sizeof(inv_hc));
+
+    result->op     = GGML_OP_HC_SCATTER_ADD;
+    result->src[0] = residual;
+    result->src[1] = block;
+    result->src[2] = inject;
 
     return result;
 }
