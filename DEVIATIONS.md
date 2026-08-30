@@ -3,7 +3,7 @@
 Every difference between this branch and upstream, and why it exists. If a
 deviation is not listed here it should not exist — delete it or add a row.
 
-Base: upstream `a7cc83bba`. 45 commits, 70 files, `↑`8867 `↓`350.
+Base: upstream `a7cc83bba`. 46 commits, 74 files, `↑`8895 `↓`468.
 
 ## Standing rules
 
@@ -88,6 +88,16 @@ vectors.
 
 **`641c61a8c` — `reasoning_effort` passthrough.** It was parsed and dropped, so
 a template branching on it never saw it.
+
+**`45703be51` — revert of upstream `257813839` (TENSOR_READ_LAZY handling).** It
+routes every lazily-read tensor to the generic CPU buffer type, which moves our
+28.8 GB `per_layer_token_embd` out of `CPU_Mapped` and schedules the per-layer PLE
+gathers on the CPU backend. GB10 reports
+`pageableMemoryAccessUsesHostPageTables=1`, so the GPU can read those mmap'd pages
+directly — forcing them to a plain CPU buffer costs **73% of llama-bench prefill**
+(812.70 -> 222.70 t/s) with the GPU at 31.5% busy and 22-38 W, clock unthrottled.
+The work is not slower, it is on the wrong device. Plausibly correct upstream for
+discrete GPUs; wrong for the only part we serve.
 
 **`ec4d1e89f` — decode is exempt from the power duty cycle.** The firmware cap the
 throttle exists to dodge is a *prefill* effect; taxing decode too cost ~21% of tg
@@ -237,9 +247,35 @@ that surfaces it is actually starting the server the way production does. Worth
 keeping in the post-rebase checklist: **boot the real recipe, not just the gates.**
 
 Picked up in this rebase and directly relevant: `f1793c1c4` (CUDA: fast
-`mm_ids_helper` path for any `n_expert_used`) targets the kernel that profiled at
-11.9% of qwen4exp prefill and was deliberately left alone because upstream was
-working it. Not yet measured here.
+`mm_ids_helper` path for any `n_expert_used`). We were excluded from the fast path
+by the old `warp_size % n_expert_used == 0` gate — 32 % 10 = 2 — and the commit
+instantiates `launch_mm_ids_helper<10>` for exactly our config. The kernel goes
+**4.229 ms -> 0.607 ms per call, 11.9% -> 1.9%** of prefill, worth **+9.5%**
+end-to-end on pure upstream (741.98 -> 812.70).
+
+### The 21 commits also carried a 73% prefill regression, bisected
+
+`llama-bench pp4096` fell from ~675 to ~210 after the rebase. Bisected on **pure
+upstream** with none of our code in the tree, five steps:
+
+| commit | pp4096 |
+| --- | --- |
+| `c589f0ed1` (old base) | 747.62 |
+| `0b5be7e4a` | 741.98 |
+| `f1793c1c4` mm_ids fast path | **812.70** |
+| `257813839` TENSOR_READ_LAZY | **222.70** |
+| `a7cc83bba` (tip) | 211.67 |
+| `a7cc83bba` + revert | **813.86** |
+
+Reverted in `45703be51`; our tree went ~210 -> **754.42**, i.e. **+11.8% over the
+pre-rebase 673.88** once the mm_ids win is no longer masked.
+
+**The serving path never saw it.** `serve-qwen` passes `-lm mmap --lazy-mode on`
+explicitly and measured 570-580 t/s prefill both before and after the revert;
+llama-bench uses the default `auto` and took the full hit. That is worth
+remembering as a general hazard: a microbenchmark and the server can diverge by 4x
+on the same tree, so **a regression in one is not evidence about the other, in
+either direction.**
 
 ### Re-validated 2026-08-30, after touching shared code for qwen4exp
 
