@@ -1,5 +1,7 @@
 #include "llama-arch.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 
 #include <map>
@@ -1100,6 +1102,20 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 }
 
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+    // qwen4exp reaches the ring through the same generic build_rs path as qwen35/qwen35moe,
+    // whose GatedDeltaNet state it shares; it was simply missed when the arch was ported.
+    // Without it n_rs_seq clamps to 0, common_context_can_seq_rm() reports SEQ_RM_TYPE_FULL,
+    // and the server falls back to a full state snapshot per speculative cycle.
+    // LLAMA_QWEN4EXP_RS_ROLLBACK=0 restores that fallback for A/B on one build.
+    static const bool qwen4exp_rs = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_RS_ROLLBACK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        return qwen4exp_rs;
+    }
+
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
