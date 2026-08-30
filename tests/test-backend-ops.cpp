@@ -4088,6 +4088,73 @@ struct test_dsv4_hc : public test_case {
     }
 };
 
+// GGML_OP_HC_GATE_MIX
+struct test_hc_gate_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_GATE_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_hc_gate_mix(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 17)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
+        ggml_set_name(gate, "gate");
+
+        ggml_tensor * out = ggml_hc_gate_mix(ctx, x, gate, (int) hc, 1.0f/(float) hc);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_HC_SCATTER_ADD
+struct test_hc_scatter_add : public test_case {
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_SCATTER_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, hc, n_tokens);
+    }
+
+    test_hc_scatter_add(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 17)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * block = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(block, "block");
+
+        ggml_tensor * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(inject, "inject");
+
+        ggml_tensor * out = ggml_hc_scatter_add(ctx, residual, block, inject, 1.0f/(float) hc);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
@@ -9175,6 +9242,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    // qwen4exp hyper-connection scatter-add: real shape is n_embd=2560, hc=4
+    test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 1));
+    test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 17));
+    test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 512));
+    test_cases.emplace_back(new test_hc_gate_mix(1024, 2, 33));
+    test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 1));
+    test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 17));
+    test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 512));
+    test_cases.emplace_back(new test_hc_scatter_add(1024, 2, 33));
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));

@@ -5296,6 +5296,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_DSV4_HC_PRE:
             ggml_sycl_op_dsv4_hc_pre(ctx, dst);
             break;
+        case GGML_OP_HC_GATE_MIX:
+        case GGML_OP_HC_SCATTER_ADD:
         case GGML_OP_DSV4_HC_COMB:
             ggml_sycl_op_dsv4_hc_comb(ctx, dst);
             break;
