@@ -3,7 +3,7 @@
 Every difference between this branch and upstream, and why it exists. If a
 deviation is not listed here it should not exist — delete it or add a row.
 
-Base: upstream `c589f0ed1`. 44 commits, 70 files, `↑`8800 `↓`350.
+Base: upstream `a7cc83bba`. 45 commits, 70 files, `↑`8867 `↓`350.
 
 ## Standing rules
 
@@ -213,6 +213,33 @@ One `CONV_TRANSPOSE_1D` case failed on the first full backend-ops pass
 in isolation on both this tree and pristine `030ebb558`. We touch no conv code.
 Treated as upstream flakiness, not a rebase regression — but if it recurs, it is
 a real data race worth reporting upstream rather than a threshold to relax.
+
+### Re-validated on the 2026-08-30 rebase onto `a7cc83bba`
+
+21 upstream commits inherited. **Zero conflicts**, but 13 of our 45 commits took
+merged content rather than applying byte-identically — a clean rebase message is
+not the same as an unchanged tree, so the full gate set was run rather than a spot
+check.
+
+| Gate | Result |
+| --- | --- |
+| PPL | **6.0735 ± 0.10675 — exact match**, value and error bar |
+| backend-ops | 13919/13919, 2/2 backends (was 13765; upstream added 154 cases) |
+| DSV4 + HC ops | 208/208, 2/2 backends |
+| `test-llama-archs -a qwen4exp` | OK, GB10 8.87e-08 / CPU 0.00e+00 |
+| qwen depth (28k, MTP n6) | 45.18 t/s, acceptance 0.8240 (pre-rebase 43.48 / 0.8240) |
+
+**One break the gates could not have caught.** Upstream `bebc9350e` (#27969)
+renamed `--tensor-read-lazy` to `--lazy-mode` / `-lzm`, so the server refused to
+start with `error: invalid argument`. Nothing in backend-ops, the arch test or the
+PPL gate passes that flag — it is a *serving recipe* dependency, and the only thing
+that surfaces it is actually starting the server the way production does. Worth
+keeping in the post-rebase checklist: **boot the real recipe, not just the gates.**
+
+Picked up in this rebase and directly relevant: `f1793c1c4` (CUDA: fast
+`mm_ids_helper` path for any `n_expert_used`) targets the kernel that profiled at
+11.9% of qwen4exp prefill and was deliberately left alone because upstream was
+working it. Not yet measured here.
 
 ### Re-validated 2026-08-30, after touching shared code for qwen4exp
 
