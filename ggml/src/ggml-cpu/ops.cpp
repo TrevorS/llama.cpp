@@ -11560,6 +11560,115 @@ void ggml_compute_forward_gated_delta_net(
 }
 
 
+// ggml_compute_forward_hc_gate_mix
+
+static void ggml_compute_forward_hc_gate_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * gate = dst->src[1];
+
+    const int     hc     = ggml_get_op_params_i32(dst, 0);
+    const float   scale  = ggml_get_op_params_f32(dst, 1);
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = dst->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (nt + nth - 1) / nth;
+    const int64_t t0 = dr * ith;
+    const int64_t t1 = MIN(t0 + dr, nt);
+
+    for (int64_t t = t0; t < t1; ++t) {
+        const float * xr = (const float *) ((const char *) x->data    + t*x->nb[1]);
+        const float * gr = (const float *) ((const char *) gate->data + t*gate->nb[1]);
+        float       * dr_= (float       *) ((      char *) dst->data  + t*dst->nb[1]);
+        for (int64_t e = 0; e < n_embd; ++e) {
+            float acc = 0.0f;
+            for (int c = 0; c < hc; ++c) {
+                const int64_t i = (int64_t) c*n_embd + e;
+                acc += xr[i] * gr[i];
+            }
+            dr_[e] = acc * scale;
+        }
+    }
+}
+
+void ggml_compute_forward_hc_gate_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_gate_mix_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_hc_scatter_add
+
+static void ggml_compute_forward_hc_scatter_add_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * residual = dst->src[0];
+    const ggml_tensor * block    = dst->src[1];
+    const ggml_tensor * inject   = dst->src[2];
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    float inv_hc;
+    memcpy(&inv_hc, dst->op_params, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // one thread block per (stream, token) pair
+    const int64_t nr = hc * n_tokens;
+    const int64_t dr = (nr + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, nr);
+
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t c = i % hc;
+        const int64_t t = i / hc;
+
+        const float   inj = ((const float *) inject->data)[t*hc + c];
+        const float   w   = 2.0f / (1.0f + expf(-(inj * inv_hc)));
+
+        const float * res_row = (const float *) ((const char *) residual->data + c*residual->nb[1] + t*residual->nb[2]);
+        const float * blk_row = (const float *) ((const char *) block->data    + t*block->nb[1]);
+        float       * dst_row = (float       *) ((      char *) dst->data      + c*dst->nb[1]      + t*dst->nb[2]);
+
+        for (int64_t e = 0; e < n_embd; ++e) {
+            dst_row[e] = res_row[e] + blk_row[e] * w;
+        }
+    }
+}
+
+void ggml_compute_forward_hc_scatter_add(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_scatter_add_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_comb
 
 static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
