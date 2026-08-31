@@ -413,7 +413,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 // output byte in 150 records. That intervention never crossed the 1-vs-many boundary, where
 // rows_per_block and the variant choice also change, which is what this flag pins.
 #ifndef GGML_CUDA_MMVQ_BATCH_INVARIANT
-#define GGML_CUDA_MMVQ_BATCH_INVARIANT 1
+#define GGML_CUDA_MMVQ_BATCH_INVARIANT 0
 #endif
 
 static constexpr __host__ __device__ int mmvq_geom_cols(int ncols_dst) {
