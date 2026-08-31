@@ -16,7 +16,7 @@
 // applied at ncols_dst == 1 and has no counterpart in the MoE kernel -- so the fusion must
 // be refused as well, or the gate would be silently dropped.
 #ifndef GGML_CUDA_MMID_BATCH_INVARIANT
-#define GGML_CUDA_MMID_BATCH_INVARIANT 1
+#define GGML_CUDA_MMID_BATCH_INVARIANT 0
 #endif
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
