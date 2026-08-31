@@ -6,6 +6,16 @@
 
 #include <cstdint>
 
+// [TAG_FATTN_BATCH_INVARIANT]
+// Flash attention varies with the token count in three places: the kernel family (fp32
+// warp-dot VEC at one token, f16 tensor-core MMA above), the ncols1 ladder inside MMA, and
+// the KV work-split, which is derived from the padded KV length rather than the token
+// count. Defined here rather than in fattn.cu because fattn-common.cuh is included first
+// and by several translation units; flip it in this one place.
+#ifndef GGML_CUDA_FATTN_BATCH_INVARIANT
+#define GGML_CUDA_FATTN_BATCH_INVARIANT 0
+#endif
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -1109,6 +1119,20 @@ void launch_fattn(
         }
     }
 
+    // [TAG_FATTN_BATCH_INVARIANT]
+    // Both work-splits below are derived from ntiles_KV, i.e. from the *padded KV length*,
+    // not from the token count. That is the last thing standing between a pinned build and
+    // end-to-end exactness: a solo decode at position p attends over pad256(p+1) keys and a
+    // 7-token verify over pad256(p+7), and when those land in different 256-buckets the KV
+    // range is cut at different points and the partial sums are combined in a different
+    // order. The extra keys are fully masked and contribute nothing mathematically -- they
+    // only move the split.
+    //
+    // Under the flag both paths fall back to one block per output tile, which walks its KV
+    // range sequentially. A trailing fully-masked tile then rescales by exp(0) = 1 and adds
+    // 0, both exact, so the padding stops mattering. The cost is real and lands on decode:
+    // at Q->ne[1] == 1 there are only a handful of output tiles, and splitting the KV range
+    // is precisely how this kernel fills the GPU. Measure before believing it is affordable.
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1160,7 +1184,8 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+        const bool use_stream_k = !GGML_CUDA_FATTN_BATCH_INVARIANT &&
+            (cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1189,12 +1214,18 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
+        // [TAG_FATTN_BATCH_INVARIANT] one block per tile, so the KV range is never cut
+        if (GGML_CUDA_FATTN_BATCH_INVARIANT) {
+            parallel_blocks = 1;
+        }
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks;
+                 !GGML_CUDA_FATTN_BATCH_INVARIANT && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
