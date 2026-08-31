@@ -575,8 +575,44 @@ a solo decode at position p sees `n_kv = pad256(p+1)` while the verify batch see
 `pad256(p+7)`. When those fall in different 256-buckets the split and the combine
 order differ. That fits the evidence exactly: divergence now appears only after
 hundreds of tokens, at whichever crossing lands differently, and the two short
-prompts never hit one. Closing it needs a fixed-partition FA — real kernel work,
-not another predicate.
+prompts never hit one. (The next paragraph's "needs real kernel work" prediction
+turned out wrong — the one-block-per-tile predicate was enough.)
+
+### The KV-split pin validates — and the breach needs saturation, not a crossing
+
+2026-08-31, `experiments/batch-invariance/run_sweep.sh`: three arms (plain / all
+pins / control = pins with `-DGGML_CUDA_FATTN_KVSPLIT_INVARIANT=0`) x five
+prefills, chunk 7, 64 tokens. Prefills 250/506/762 make the width-1 baseline and
+the first chunk land in different 256-buckets (`pad256(prefill+1) !=
+pad256(prefill+chunk)`); 8 and 260 are same-bucket controls. `[shape]`/`[roll]`
+max abs logit delta:
+
+| arm | p8 | p250 | p260 | p506 | p762 |
+| --- | --- | --- | --- | --- | --- |
+| plain | 5.43 | 11.16 | 11.26 | 10.72 | 10.30 |
+| control (no KV-split pin) | 0 | 0 | 0 | 0 | **8.39** |
+| all pins | 0 | 0 | 0 | 0 | **0** |
+
+Three findings. **The pin works**: the pinned arm is exact at every prefill,
+including the one that breaches the control. **The control isolates it**: the
+only difference between the two pinned arms is the KV-split macro, so the p762
+breach is that split and nothing else. **A bucket crossing alone is not
+sufficient**: the control stayed exact at 250 and 506, where the prediction said
+it would break. Read off the dispatch, the reason is that below saturation
+stream-k hands every block exactly one KV unit at both lengths
+(`nblocks = ntiles_KV * ntiles_dst` while that is `<= max_blocks`), the chunk's
+extra units are fully masked and contribute exact zeros, and the real-key
+partials group identically. Only once `ntiles_KV * ntiles_dst` exceeds
+`max_blocks` (~48 here, first reached at the 768 -> 1024 crossing) do the block
+boundaries start cutting inside the real range at length-dependent points. So
+the divergence window opens at `n_kv` ~768 on this config and recurs at every
+crossing after — which also fits the e2e first-diff positions once prompt
+lengths are added in. (This grouping mechanism is dispatch-arithmetic, not
+instrumented; the five cells are the measurement.)
+
+The width gate added with the macro split (`fattn-common.cuh:1143`) means
+prefill keeps stream-k; the arm equality above is between width-1 and width-7
+schedules, which both sit under the gate.
 
 **Serving cost, measured cleanly.** Same five prompts, `n_predict` 600,
 `cache_prompt` off, ABBA within each config, both arms snapshotting the whole
