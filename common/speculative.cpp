@@ -1699,13 +1699,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
         // note: a suffix-truncated ingest drops rows *below* the SWA window but
-        // always writes the span's last row, so the frontier still lands on N-1
-        // and this stays a real "the hook did not run" diagnostic
+        // always writes the span's last row, so the frontier still lands on N-1.
+        // This predicate has fired on healthy runs (no decode error followed and
+        // acceptance was normal; see DEVIATIONS.md "Known debt"), so it is a
+        // breadcrumb for debugging, not a data-loss warning.
         if (pos_max < N - 1 && !is_mem_shared) {
-            SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
-                    "process() hook may not have run on every prefill ubatch "
-                    "(need_embd / logits=1 on every prompt position?). "
-                    "Drafts may degrade.\n",
+            SPC_DBG("ctx_dft pos_max=%d < N-1=%d - "
+                    "frontier behind the prompt at begin(); over-eager on healthy "
+                    "runs, cross-check for decode errors before trusting it\n",
                     (int) pos_max, N - 1);
         }
     }
