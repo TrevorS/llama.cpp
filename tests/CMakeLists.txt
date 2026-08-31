@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-spec-decode-exactness.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
