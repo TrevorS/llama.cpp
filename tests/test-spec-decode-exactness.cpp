@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -44,6 +46,7 @@ struct trace_entry {
     int64_t     ne[4];
     float       v[8];
     int         n_v;
+    bool        is_idx;   // an I32 row: a selection, so any change is a different choice
 };
 
 static std::vector<trace_entry> g_trace;
@@ -56,10 +59,16 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
     if (!g_trace_on) {
         return true;
     }
-    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_I32) {
         return true;
     }
     if (!ggml_is_contiguous(t) || t->data == nullptr) {  // strided views are not worth chasing here
+        return true;
+    }
+    // ggml names unlabelled nodes by graph index, and the two graphs do not have
+    // the same node count, so "node_27" is a different node in each. Only nodes the
+    // model named through cb() can be matched across runs.
+    if (strncmp(ggml_get_name(t), "node_", 5) == 0) {
         return true;
     }
     trace_entry e;
@@ -73,8 +82,15 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
     if (e.n_v <= 0) {
         return true;
     }
+    e.is_idx = t->type == GGML_TYPE_I32;
     if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, e.v, 0, e.n_v*sizeof(float));
+    } else if (t->type == GGML_TYPE_I32) {
+        int32_t tmp[8];
+        ggml_backend_tensor_get(t, tmp, 0, e.n_v*sizeof(int32_t));
+        for (int i = 0; i < e.n_v; ++i) {
+            e.v[i] = (float) tmp[i];
+        }
     } else {
         ggml_fp16_t tmp[8];
         ggml_backend_tensor_get(t, tmp, 0, e.n_v*sizeof(ggml_fp16_t));
@@ -344,29 +360,44 @@ int main(int argc, char ** argv) {
         const auto b = capture(chunk);
         printf("  [trace] %zu nodes at chunk 1, %zu at chunk %u\n", a.size(), b.size(), chunk);
 
-        // walk both in order, matching by name, and report the first value move
-        size_t ia = 0, ib = 0, n_shown = 0;
-        while (ia < a.size() && ib < b.size() && n_shown < 12) {
-            if (a[ia].name != b[ib].name) {
-                printf("  [trace] node stream diverges: %s (chunk 1) vs %s (chunk %u)\n",
-                       a[ia].name.c_str(), b[ib].name.c_str(), chunk);
-                break;
+        // the two graphs do not have the same node count, so match by name and
+        // compare the k-th occurrence of each name in one against the other
+        std::map<std::string, std::vector<const trace_entry *>> by_name;
+        for (const auto & e : b) {
+            by_name[e.name].push_back(&e);
+        }
+        std::map<std::string, size_t> seen;
+        size_t n_shown = 0, n_idx = 0;
+        for (const auto & ea : a) {
+            const auto it = by_name.find(ea.name);
+            if (it == by_name.end()) {
+                continue;
             }
+            const size_t k = seen[ea.name]++;
+            if (k >= it->second.size()) {
+                continue;
+            }
+            const trace_entry & eb = *it->second[k];
             double d = 0.0;
-            for (int i = 0; i < std::min(a[ia].n_v, b[ib].n_v); ++i) {
-                d = std::max(d, (double) std::fabs(a[ia].v[i] - b[ib].v[i]));
+            for (int i = 0; i < std::min(ea.n_v, eb.n_v); ++i) {
+                d = std::max(d, (double) std::fabs(ea.v[i] - eb.v[i]));
             }
-            if (d > 0.0) {
-                printf("  [trace] %-40s %-12s [%5lld x %5lld]  max|d| = %g\n",
-                       a[ia].name.c_str(), a[ia].op.c_str(),
-                       (long long) a[ia].ne[0], (long long) a[ia].ne[1], d);
-                n_shown++;
+            if (d == 0.0) {
+                continue;
             }
-            ia++; ib++;
+            if (ea.is_idx) {
+                n_idx++;
+            }
+            if (n_shown < 16 || (ea.is_idx && n_idx <= 8)) {
+                printf("  [trace] %-44s %-12s [%5lld x %5lld] %s max|d| = %g\n",
+                       ea.name.c_str(), ea.op.c_str(),
+                       (long long) ea.ne[0], (long long) ea.ne[1],
+                       ea.is_idx ? "SELECTION" : "         ", d);
+            }
+            n_shown++;
         }
-        if (n_shown == 0) {
-            printf("  [trace] no traced node moved\n");
-        }
+        printf("  [trace] %zu traced nodes moved, %zu of them selections (expert ids and the like)\n",
+               n_shown, n_idx);
         printf("\n");
     }
 
