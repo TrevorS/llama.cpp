@@ -24,7 +24,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
 
     // [TAG_FATTN_BATCH_INVARIANT] every speculative width takes the same arm as a wide batch
-    if (GGML_CUDA_FATTN_BATCH_INVARIANT && Q->ne[1] <= 8 &&
+    if ((GGML_CUDA_FATTN_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_FATTN)) && Q->ne[1] <= 8 &&
             !(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) &&
             !(GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
@@ -479,7 +479,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
     // [TAG_FATTN_BATCH_INVARIANT] VEC only exists for 1 and 2 columns, so widths 1..8 can only
     // be made to agree by sending all of them to MMA
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0
-        && !(GGML_CUDA_FATTN_BATCH_INVARIANT && Q->ne[1] <= 8);
+        && !((GGML_CUDA_FATTN_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_FATTN)) && Q->ne[1] <= 8);
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
