@@ -804,7 +804,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 // 1..MMVF_MAX_BATCH_SIZE into it is therefore a real fix rather than a different variance.
 // Build with -DGGML_CUDA_MMVF_BATCH_INVARIANT=1.
 #ifndef GGML_CUDA_MMVF_BATCH_INVARIANT
-#define GGML_CUDA_MMVF_BATCH_INVARIANT 0
+#define GGML_CUDA_MMVF_BATCH_INVARIANT 1
 #endif
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {

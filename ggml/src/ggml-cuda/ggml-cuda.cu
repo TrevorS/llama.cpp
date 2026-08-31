@@ -1847,7 +1847,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    // [TAG_MMID_BATCH_INVARIANT] the fused form's mat-vec geometry is width-keyed, so
+    // pinning MUL_MAT_ID to the MoE kernel refuses the fused path outright
+    if (tensor->op == GGML_OP_MUL_MAT_ID &&
+            (GGML_CUDA_MMID_BATCH_INVARIANT || dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc))) {
         return false;
     }
 

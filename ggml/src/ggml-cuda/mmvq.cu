@@ -425,7 +425,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 // output byte in 150 records. That intervention never crossed the 1-vs-many boundary, where
 // rows_per_block and the variant choice also change, which is what this flag pins.
 #ifndef GGML_CUDA_MMVQ_BATCH_INVARIANT
-#define GGML_CUDA_MMVQ_BATCH_INVARIANT 0
+#define GGML_CUDA_MMVQ_BATCH_INVARIANT 1
 #endif
 
 static constexpr __host__ __device__ int mmvq_geom_cols(int ncols_dst) {
@@ -1127,7 +1127,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && ncols_dst > 1) {
+    if (has_ids && (GGML_CUDA_MMID_BATCH_INVARIANT || ncols_dst > 1)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
