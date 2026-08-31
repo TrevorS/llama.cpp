@@ -466,6 +466,37 @@ So exactness is not reachable by fixing *bookkeeping*, and `7d71c3a90` — which
 did fix a real conv-state bug and moved three of the five diverge.py prompts a
 long way — was never going to finish the job.
 
+### It diverges on everything and costs nothing measurable
+
+Since the divergence is real and not going away by itself, the question becomes
+whether it costs anything. Same eval, same seed, same prompts, one server each
+(`qwen-evals/run_eval.py --reps 3 --seed 4242 --reasoning low`), 7 items x 3 reps
+x 2 phases per arm:
+
+| | no-spec | spec |
+| --- | --- | --- |
+| OPEN | 18/21 (86%) | 20/21 (95%) |
+| CHOICE | 18/21 (86%) | 19/21 (90%) |
+| identical replies | — | **0 / 42** |
+
+Paired, which is the statistic that matters: **spec better on 3, worse on 0, same
+on 39.** Not evidence that speculation *helps* — three wins and no losses out of
+42 is a sign test at p = 0.125 — but it is a clean absence of loss. Reply length
+is flat too (4354 vs 4109 characters mean), so it is not trading quality for
+brevity. `diverge.py` on the same servers puts the first differing token at
+133-323 across four of five prompts with acceptance 0.74-0.88; the fifth
+(`count`, "count from 1 to 60") is **token-identical**, which is the control you
+would want — a task whose top-2 gap is enormous never flips.
+
+Two things blunt this test and should be fixed before leaning on it harder: the
+eval sits at its ceiling on six of seven items, so it can only show a loss; and
+the draft-coverage warning under **Known debt** fired on some requests, which
+means less speculation and therefore an answer closer to the no-draft one.
+
+So the practical position is: speculation produces **a different sample of the
+same quality**, at ~+30% decode on this workload. What it does not produce is
+the model's own no-draft answer.
+
 ### The mechanism has a name, and the kernel is ours to fix
 
 This is **batch invariance**, and it is well documented. Thinking Machines'
