@@ -20,9 +20,10 @@
 //   [det]      the same path twice, to separate a wrong answer from an unstable one
 //   [shape]    same tokens, chunked vs one-at-a-time, no rollback at all
 //   [ckpt]     saving and restoring a sequence, across every source/destination state
+//   [ckpt-roll] a restore followed by a trim, which is how the prompt cache reuses
 //   [roll-ar]  rolling back further than the last ubatch was wide
 //   [roll]     the real speculative loop - chunk, partial accept, roll back, continue
-//   [trace]    (SPEC_TRACE=1) the first graph node whose value moves with the shape
+//   [trace]    (SPEC_TRACE=1) which graph nodes move when the shape changes
 //
 // Every phase reports the numeric spread and the only thing greedy sampling
 // actually sees: argmax flips.
@@ -36,10 +37,12 @@
 
 
 // ---------------------------------------------------------------------------
-// [trace] mode: record the leading values of every graph tensor for one decode,
-// then replay the same decode at a different chunk size and report the first
+// [trace] mode: record the leading values of every named graph tensor for one
+// decode, replay the same decode at a different chunk width, and report every
 // node whose column-0 values move. Column 0 is the same token in both runs, so
 // a correct backend reproduces it regardless of how many tokens sit beside it.
+// I32 rows are flagged as selections: a changed index is a different choice,
+// not a rounding difference, which is how the expert routing shows up.
 struct trace_entry {
     std::string name;
     std::string op;
@@ -163,7 +166,7 @@ static void accumulate(diff_stats & st, const float * a, const float * b, int n_
 }
 
 static void report(const char * label, const diff_stats & st, uint32_t n_cmp) {
-    printf("  %-28s max|dlogit| = %-11.6g  argmax flips = %u/%u", label, st.max_abs, st.n_flips, n_cmp);
+    printf("  %-46s max|dlogit| = %-11.6g  argmax flips = %u/%u", label, st.max_abs, st.n_flips, n_cmp);
     if (st.first_pos >= 0) {
         printf("  first at pos %d", st.first_pos);
     }
@@ -504,6 +507,78 @@ int main(int argc, char ** argv) {
                 if (cmp(label, ref, out, false).n_flips) {
                     rc = 1;
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ [ckpt-roll]
+    // The server reaches a rollback through the prompt cache, not only through the
+    // accept/reject loop: on a partial prefix match it restores a context checkpoint
+    // and then trims the few positions the new prompt does not want. A restore only
+    // rewrites the live state, so the snapshot planes still belong to whatever the
+    // destination context was doing before, and the trim reads one of them.
+    if (has_rs) {
+        printf("\n  checkpoint restore followed by a trim\n");
+
+        std::vector<llama_token> other(toks.size());
+        for (size_t i = 0; i < toks.size(); ++i) {
+            other[i] = (llama_token) ((toks[i] + 5077) % n_vocab);
+        }
+        const uint32_t n_back  = std::min(chunk - 1, n_rs_seq);
+        const uint32_t n_dirty = n_pre + std::min(n_tok, chunk);
+
+        common_prompt_checkpoint ckpt;
+        run_t ref;
+        {
+            llama_context * ctx = make_ctx(params, model, cfg);
+            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre + n_back)) {
+                exit(1);
+            }
+            ckpt.update_tgt(ctx, 0, 0);
+            // the source trims the same positions from the state it just built
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_pre, -1)) {
+                fprintf(stderr, "%s : source trim refused\n", __func__);
+                exit(1);
+            }
+            ref.resize(n_tok);
+            for (uint32_t i = 0; i < n_tok; ++i) {
+                if (!decode_span(ctx, toks, n_pre + i, 1)) {
+                    exit(1);
+                }
+                const float * l = llama_get_logits_ith(ctx, 0);
+                ref[i].assign(l, l + n_vocab);
+            }
+            llama_free(ctx);
+        }
+
+        for (uint32_t dst_mode = 0; dst_mode < 2; ++dst_mode) {
+            llama_context * ctx = make_ctx(params, model, cfg);
+            if (ctx == nullptr) {
+                exit(1);
+            }
+            if (dst_mode == 1 && !decode_span(ctx, other, 0, n_dirty)) {
+                exit(1);
+            }
+            ckpt.load_tgt(ctx, 0, 0);
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_pre, -1)) {
+                fprintf(stderr, "%s : trim after restore refused (mode %u)\n", __func__, dst_mode);
+                llama_free(ctx);
+                rc = 1;
+                continue;
+            }
+            run_t out(n_tok);
+            for (uint32_t i = 0; i < n_tok; ++i) {
+                if (!decode_span(ctx, toks, n_pre + i, 1)) {
+                    exit(1);
+                }
+                const float * l = llama_get_logits_ith(ctx, 0);
+                out[i].assign(l, l + n_vocab);
+            }
+            llama_free(ctx);
+
+            if (cmp(dst_mode == 0 ? "[ckpt-roll] into a fresh context"
+                                  : "[ckpt-roll] over another prompt", ref, out, false).n_flips) {
+                rc = 1;
             }
         }
     }

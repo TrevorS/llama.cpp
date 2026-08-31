@@ -406,7 +406,26 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// [TAG_MMVQ_BATCH_INVARIANT]
+// The geometry below is picked from ncols_dst, so a 1-token decode and an n-token
+// speculative verify reduce the same dot product through differently shaped cross-warp
+// trees in tmp_shared and do not agree bitwise. Greedy speculative decoding needs them
+// to: one ULP is enough to flip a near-tied argmax, and on a 512-expert router it swaps
+// the expert set outright, which is not a rounding difference at all.
+//
+// Building with -DGGML_CUDA_MMVQ_BATCH_INVARIANT=1 pins the geometry, and the runtime
+// variant choice, to whatever the ncols_dst == 1 call would have used. That leaves the
+// single-token decode path exactly as tuned and makes the wider calls match it.
+#ifndef GGML_CUDA_MMVQ_BATCH_INVARIANT
+#define GGML_CUDA_MMVQ_BATCH_INVARIANT 0
+#endif
+
+static constexpr __host__ __device__ int mmvq_geom_cols(int ncols_dst) {
+    return GGML_CUDA_MMVQ_BATCH_INVARIANT ? 1 : ncols_dst;
+}
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    ncols_dst = mmvq_geom_cols(ncols_dst);
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -534,6 +553,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    ncols_dst = mmvq_geom_cols(ncols_dst);
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
@@ -1133,7 +1153,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            if (GGML_CUDA_MMVQ_BATCH_INVARIANT) {
+                // the widths above 1 only instantiate the plain variant, so pin this one too
+                launch(std::false_type{}, std::false_type{});
+            } else if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
