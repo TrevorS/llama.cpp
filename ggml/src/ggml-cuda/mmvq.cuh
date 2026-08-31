@@ -2,6 +2,23 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// [TAG_MMID_BATCH_INVARIANT]
+// MUL_MAT_ID takes two different kernels either side of one token: the dedicated
+// mul_mat_vec_q_moe above ncols_dst == 1, the general mul_mat_vec_q at exactly 1. They
+// cannot agree bitwise -- the MoE kernel walks K with blocks_per_iter = vdr*warp_size/qi
+// and reduces warp-locally, while the general kernel folds nwarps partials through
+// tmp_shared. With 512 experts at top-10 that is enough to select a different expert set,
+// which is a different computation rather than a different rounding.
+//
+// Building with -DGGML_CUDA_MMID_BATCH_INVARIANT=1 sends every width, including 1, to the
+// MoE kernel, which is already invariant in ncols_dst (nothing but the bounds check and
+// the token index depend on it). The price is the fused up+gate+SwiGLU, which only ever
+// applied at ncols_dst == 1 and has no counterpart in the MoE kernel -- so the fusion must
+// be refused as well, or the gate would be silently dropped.
+#ifndef GGML_CUDA_MMID_BATCH_INVARIANT
+#define GGML_CUDA_MMID_BATCH_INVARIANT 1
+#endif
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
