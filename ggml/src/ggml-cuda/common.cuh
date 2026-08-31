@@ -27,10 +27,66 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// [TAG_BATCH_INVARIANT_RUNTIME]
+// Runtime counterpart to the GGML_CUDA_*_BATCH_INVARIANT build macros, so one binary can
+// serve as both arms of an exactness A/B. GGML_CUDA_BATCH_INVARIANT="1" or "all" turns on
+// every pin including fusion-off; a comma list of mmvf,mmvq,mmid,fattn,fattn_kvsplit,nofuse
+// selects pins individually (note "fattn" is family+ncols1 only -- add "fattn_kvsplit" for
+// the KV work-split, or use "all"). Read once per process, so dispatch stays stable across
+// CUDA graph captures. Build macros still force their pin regardless of the env var.
+//
+// The runtime mmvq pin is stronger than the build macro, not equal to it: instead of
+// detuning width 1 to the plain variant it multi-launches the tuned width-1 kernel per
+// column, so its outputs match an *unpinned* solo decode bit for bit -- do not expect
+// bitwise equality against a -DGGML_CUDA_MMVQ_BATCH_INVARIANT=1 build.
+enum ggml_cuda_bi_bits {
+    GGML_CUDA_BI_MMVF          = 1 << 0,
+    GGML_CUDA_BI_MMVQ          = 1 << 1,
+    GGML_CUDA_BI_MMID          = 1 << 2,
+    GGML_CUDA_BI_FATTN         = 1 << 3,
+    GGML_CUDA_BI_FATTN_KVSPLIT = 1 << 4,
+    GGML_CUDA_BI_NOFUSE        = 1 << 5,
+};
+
+static inline int ggml_cuda_batch_invariant_flags() {
+    static const int flags = []() {
+        const char * env = getenv("GGML_CUDA_BATCH_INVARIANT");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+        if (strcmp(env, "1") == 0 || strcmp(env, "all") == 0) {
+            return (int) (GGML_CUDA_BI_MMVF | GGML_CUDA_BI_MMVQ | GGML_CUDA_BI_MMID |
+                          GGML_CUDA_BI_FATTN | GGML_CUDA_BI_FATTN_KVSPLIT | GGML_CUDA_BI_NOFUSE);
+        }
+        int f = 0;
+        for (const char * p = env; *p != '\0';) {
+            const char * end = strchr(p, ',');
+            const size_t n   = end != nullptr ? (size_t) (end - p) : strlen(p);
+            const auto is = [&](const char * name) {
+                return strlen(name) == n && strncmp(p, name, n) == 0;
+            };
+            if      (is("mmvf"))          { f |= GGML_CUDA_BI_MMVF;          }
+            else if (is("mmvq"))          { f |= GGML_CUDA_BI_MMVQ;          }
+            else if (is("mmid"))          { f |= GGML_CUDA_BI_MMID;          }
+            else if (is("fattn"))         { f |= GGML_CUDA_BI_FATTN;         }
+            else if (is("fattn_kvsplit")) { f |= GGML_CUDA_BI_FATTN_KVSPLIT; }
+            else if (is("nofuse"))        { f |= GGML_CUDA_BI_NOFUSE;        }
+            else {
+                // an unnoticed typo here would silently un-pin an A/B arm
+                GGML_LOG_WARN("GGML_CUDA_BATCH_INVARIANT: unknown token '%.*s' ignored\n", (int) n, p);
+            }
+            p += n + (end != nullptr ? 1 : 0);
+        }
+        return f;
+    }();
+    return flags;
+}
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
