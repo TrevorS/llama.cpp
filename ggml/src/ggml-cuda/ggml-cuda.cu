@@ -1849,7 +1849,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // [TAG_MMID_BATCH_INVARIANT] the fused form's mat-vec geometry is width-keyed, so
     // pinning MUL_MAT_ID to the MoE kernel refuses the fused path outright
     if (tensor->op == GGML_OP_MUL_MAT_ID &&
-            (GGML_CUDA_MMID_BATCH_INVARIANT || dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc))) {
+            (GGML_CUDA_MMID_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_MMID) ||
+             dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc))) {
         return false;
     }
 
@@ -3419,7 +3420,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
-    static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")))
+        || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_NOFUSE);
     if (disable_fusion) {
         return 0;
     }

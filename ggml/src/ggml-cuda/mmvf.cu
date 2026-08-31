@@ -827,7 +827,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-                if (GGML_CUDA_MMVF_BATCH_INVARIANT) {
+                if (GGML_CUDA_MMVF_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_MMVF)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {
@@ -847,7 +847,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
-                if (GGML_CUDA_MMVF_BATCH_INVARIANT) {
+                if (GGML_CUDA_MMVF_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_MMVF)) {
                     return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {

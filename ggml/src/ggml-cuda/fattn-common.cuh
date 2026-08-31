@@ -1140,7 +1140,8 @@ void launch_fattn(
     // Applied only at Q->ne[1] <= 8: the two schedules being reconciled (solo decode and a
     // <=8-wide verify) both sit below that, while prefill is identical between them anyway
     // and keeps stream-k.
-    const bool pin_kv_split = GGML_CUDA_FATTN_KVSPLIT_INVARIANT && Q->ne[1] <= 8;
+    const bool pin_kv_split = (GGML_CUDA_FATTN_KVSPLIT_INVARIANT ||
+        (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_FATTN_KVSPLIT)) && Q->ne[1] <= 8;
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
