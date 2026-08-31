@@ -789,6 +789,24 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// [TAG_MMVF_BATCH_INVARIANT]
+// The thresholds below are a kernel-family switch, not a tiling choice: under them the
+// call goes to mul_mat_vec_f, over them to MMF tensor-core tiles or cuBLAS. On GB10
+// `ampere_mma_available` is true, so F16 switches at ne11 == 2 and F32 at ne11 == 4 --
+// and the ADA arm just below the ampere one is unreachable here. qwen4exp's router
+// (`ffn_gate_inp`, F32 [2560, 512]) therefore takes a different kernel in a 1-token decode
+// than in a 7-token speculative verify, feeding a 512-expert top-10 selection that only
+// needs a ULP to pick a different expert set.
+//
+// mul_mat_vec_f itself is batch-invariant: `block_size_best` is derived from `ncols` (the
+// K dimension) and the per-column accumulators `sumf[ncols_dst]` share one K loop, so
+// widening ncols_dst adds columns without touching the reduction. Pinning every width
+// 1..MMVF_MAX_BATCH_SIZE into it is therefore a real fix rather than a different variance.
+// Build with -DGGML_CUDA_MMVF_BATCH_INVARIANT=1.
+#ifndef GGML_CUDA_MMVF_BATCH_INVARIANT
+#define GGML_CUDA_MMVF_BATCH_INVARIANT 0
+#endif
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -809,6 +827,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                if (GGML_CUDA_MMVF_BATCH_INVARIANT) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
@@ -826,6 +847,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                if (GGML_CUDA_MMVF_BATCH_INVARIANT) {
+                    return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
