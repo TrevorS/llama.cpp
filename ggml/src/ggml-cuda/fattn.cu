@@ -16,9 +16,7 @@
 // the other way: fattn-vec.cuh only instantiates cols_per_block 1 and 2, and at DKQ=DV=256
 // a width-8 accumulator would not fit in registers. So the single-token decode gives up its
 // VEC path, which is the tuned one -- this costs decode and has to be measured, not assumed.
-#ifndef GGML_CUDA_FATTN_BATCH_INVARIANT
-#define GGML_CUDA_FATTN_BATCH_INVARIANT 0
-#endif
+// The flag itself lives in fattn-common.cuh, which is included above.
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
