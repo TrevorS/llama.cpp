@@ -177,6 +177,17 @@ that is a property of the server loop, not of the model math.
 
 ## Known debt
 
+**The MTP draft context does not always see the whole prefill.**
+`common_speculative_impl_draft_mtp::begin` (`common/speculative.cpp:1746-1757`)
+warns when `ctx_dft`'s frontier is behind the prompt, and it fires in ordinary
+serving: 5 of the first 17 requests of the 2026-08-30 quality A/B logged
+`ctx_dft pos_max=29 < N-1=370`, i.e. 30 positions ingested against a 371-token
+prompt. Drafts on those requests are made from almost no context, so acceptance
+collapses for them. Not yet chased. Note the direction it biases a spec-vs-vanilla
+comparison: less speculation means the output is *closer* to the no-draft answer,
+so it blunts such a test rather than failing it.
+
+
 **`FUSE_INGEST` should be removed.** Measured flat at both depths, so it is
 unnecessary complexity by rule 1. Retained only because unpicking it touches
 five pieces of cross-round driver state (`pending_g_last`, `verify_tok`,
@@ -613,8 +624,9 @@ bounds are tighter than "it happens not to fire":
   ran and overwrote `n_past`. Every ordinary checkpoint keeps the invariant
   `n_tokens == pos_min + 1 == pos_max + 1`, which leaves `p0 = cell.pos + 1`.
 
-**The one breach needs `--slot-save-path`.** `create_checkpoint(*slot, 0, 0,
-pos_max)` at `server-context.cpp:2895` synthesizes a checkpoint with
+**The one breach needs `--slot-save-path`, and the line is ours.**
+`create_checkpoint(*slot, 0, 0, pos_max)` at `server-context.cpp:2897` — added by
+`09e12513a`, not upstream — synthesizes a checkpoint with
 `pos_min = 0` against `pos_max = N-1`, which both bypasses the gate and makes
 the restore land on `p0 = cell.pos` instead of `cell.pos + 1` — a depth-1 read
 of a plane the restore never wrote, silently, with `seq_rm` returning true.
