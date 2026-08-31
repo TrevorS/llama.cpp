@@ -401,9 +401,17 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 // to: one ULP is enough to flip a near-tied argmax, and on a 512-expert router it swaps
 // the expert set outright, which is not a rounding difference at all.
 //
-// Building with -DGGML_CUDA_MMVQ_BATCH_INVARIANT=1 pins the geometry, and the runtime
-// variant choice, to whatever the ncols_dst == 1 call would have used. That leaves the
-// single-token decode path exactly as tuned and makes the wider calls match it.
+// Building with -DGGML_CUDA_MMVQ_BATCH_INVARIANT=1 pins the geometry to the ncols_dst == 1
+// switch arm and forces every width onto the plain variant, so all of 1..8 launch the same
+// shape. Note what that costs and what it does not reach:
+//   - it gives up small_k and halve_iters at ncols_dst == 1, which is the GB10 bs=1 tuning
+//   - it does NOT reach MUL_MAT_ID: mul_mat_vec_q_case returns at the has_ids && ncols_dst > 1
+//     branch below, before this is consulted, so on a MoE model the expert matmuls still take
+//     a different kernel at 1 token than at 7
+// And nwarps alone is evidence-against as the mechanism: on llama.cpp#25618 thc1006 forced the
+// warp count across widths 3..8 on sm_86, moved kernel runtime by 26.68%, and changed not one
+// output byte in 150 records. That intervention never crossed the 1-vs-many boundary, where
+// rows_per_block and the variant choice also change, which is what this flag pins.
 #ifndef GGML_CUDA_MMVQ_BATCH_INVARIANT
 #define GGML_CUDA_MMVQ_BATCH_INVARIANT 0
 #endif
