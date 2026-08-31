@@ -573,11 +573,31 @@ hundreds of tokens, at whichever crossing lands differently, and the two short
 prompts never hit one. Closing it needs a fixed-partition FA — real kernel work,
 not another predicate.
 
-**Serving throughput is not yet measured cleanly.** The pinned run gives
-20.89 no-spec / 33.94 spec, the earlier unpinned one 26.35 / 42.21, but those ran
-different workloads (diverge.py alone at 1200 tokens vs the full eval at 4000), so
-the absolute gap is not attributable. What is internally consistent is that
-speculation still pays **+62%** with the pins on, against +60% without. A clean
+**Serving cost, measured cleanly.** Same five prompts, `n_predict` 600,
+`cache_prompt` off, ABBA within each config, both arms snapshotting the whole
+`build/bin` tree and running under their own `LD_LIBRARY_PATH`:
+
+| arm | legs | tg mean |
+| --- | --- | --- |
+| plain / no-spec | 21.86, 22.27 | **22.07** |
+| pinned / no-spec | 20.21, 20.44 | **20.33** |
+| plain / spec | 34.48 | 1 leg |
+| pinned / spec | 32.21 | 1 leg |
+
+**No-spec costs 7.9%**, which is the solid number — arms do not overlap, ordering
+is consistent across the ABBA pairs, and it independently reproduces
+llama-bench's 8.1%. Spec reads -6.6% but on one leg each with a 26-46 t/s
+per-request spread, so treat it as provisional. The speculative gain survives
+either way: **+56% plain, +58% pinned**. Acceptance is slightly *higher* pinned
+(0.7400 vs 0.7245), matching the e2e run — steadier numerics make the draft agree
+with the target more often.
+
+**A harness trap worth not repeating.** `llama-server` is a 72 KB launcher; the
+pins live in `libggml-cuda.so`, which it loads at run time. Snapshotting only the
+executable makes both arms load the *same* library, and the A/B then reports a
+confident four-arm null that never varied anything. The script now copies the
+whole `bin` directory per arm and `cmp`s the two `libggml-cuda.so` before
+measuring, aborting if they match. A clean
 serving A/B needs the same workload both ways.
 
 ### The mechanism has a name, and the kernel is ours to fix
