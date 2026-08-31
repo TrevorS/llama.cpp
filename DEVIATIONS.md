@@ -614,6 +614,66 @@ The width gate added with the macro split (`fattn-common.cuh:1143`) means
 prefill keeps stream-k; the arm equality above is between width-1 and width-7
 schedules, which both sit under the gate.
 
+### The cost, decomposed by depth — and where the old 8.1% actually lived
+
+Same three arms, `bench_cost.sh` (tg128, r=10, all arms `GGML_CUDA_DISABLE_FUSION=1`):
+
+| tg128 | plain | ctl (4 pins) | all pins (+KV-split) | total vs plain |
+| --- | --- | --- | --- | --- |
+| d0 | 23.61 | 20.66 | 23.14 | −2.0% |
+| d4096 | 22.30 | 19.99 | 21.03 | −5.7% |
+| d16384 | 19.96 | 18.24 | 17.20 | −13.8% |
+| d32768 | 18.20 | 16.87 | 13.60 | **−25.3%** |
+
+- **The KV-split pin is *faster* than stream-k at shallow depth** (+12% at d0 over
+  ctl — one block per tile skips the fixup, exactly the short-context case the
+  code comment at `fattn-common.cuh:1179` describes) and crosses over around
+  d8-16k, reaching −19% pin-vs-ctl at d32k. The exactness bill is depth-rented,
+  not flat.
+- **The four dispatch pins alone cost −7 to −12%** (ctl vs plain), *shrinking*
+  with depth as FA's share grows.
+- **Prefill did not regress** under the width gate: `pp2048` 253-291 pinned vs
+  226-252 plain across all depths (error bars ±16-41, treat as did-not-regress).
+- **The old "8.1% pin cost" was mostly fusion-off.** Warm legs on the plain
+  binary put fusion ON at 24.7-25.3 vs OFF at 23.0-23.6 (−5 to −8%; the one
+  20.66 fusion-on leg was the cold first leg of an ABBA and should be
+  discarded), and today's plain fusion-off 23.61 vs all-pins fusion-off 23.14
+  is −2%: the recorded 25.58 → 23.52 collapse was fusion-off plus pins, not
+  pins alone. The earlier oddity ("disabling fusion measures faster than
+  leaving it on with the pins") was therefore a pin×fusion interaction, not a
+  fork-wide fusion regression.
+
+**The follow-up that matters:** fusion is only a divergence source because the
+fused mat-vec kernels exist solely at `ne1 == 1`. Relaxing that gate to
+`ne1 <= 8` and multi-launching the fused width-1 kernel once per column (the
+same column-local trick the runtime mmvq pin uses) would make fusion itself
+batch-invariant — reclaiming ~8 of the ~10 shallow-depth points that exactness
+currently costs. Unbuilt; recorded here as the next lever.
+
+### One binary, one env var: the runtime toggle
+
+`GGML_CUDA_BATCH_INVARIANT` ([TAG_BATCH_INVARIANT_RUNTIME], `common.cuh`) turns
+the pins on at run time in a default build: `1`/`all` for everything including
+fusion-off, or a comma list of `mmvf,mmvq,mmid,fattn,fattn_kvsplit,nofuse` for
+per-pin controls. Read once per process (stable across CUDA graph captures);
+the build macros still force their pin regardless. Every pin is a host-side
+dispatch decision except mmvq's width-2..8 geometry, which the toggle handles
+by launching the *tuned* width-1 kernel once per column — column arithmetic is
+column-local end to end, so each launch is bit-identical to a solo decode of
+that column. That makes the runtime mmvq pin *stronger* than the build macro
+(no detuning to the plain variant) but not bitwise-comparable to a compiled-pin
+build; the invariance property (chunked == solo within one binary+env) is the
+one that holds, and the one that matters.
+
+Verified on `build-rt` (default build), prefill 762 (the breaching cell), chunk
+7: env unset → `[shape]` 8.62 (plain behavior); `=1` → `max|dlogit| = 0`
+everywhere, with the `nofuse` bit doing fusion's job (no `GGML_CUDA_DISABLE_FUSION`
+set); `=mmvf,mmvq,mmid,fattn,nofuse` (all but the KV-split bit) → `[shape]`
+8.75, reproducing the control arm's breach signature per-bit. Serving-cost
+numbers should still come from compiled-pin builds — the mmvq multi-launch adds
+~10^3 launches per ungraphed verify step — but for exactness work the
+two-build-tree snapshot dance is retired.
+
 **Serving cost, measured cleanly.** Same five prompts, `n_predict` 600,
 `cache_prompt` off, ABBA within each config, both arms snapshotting the whole
 `build/bin` tree and running under their own `LD_LIBRARY_PATH`:
