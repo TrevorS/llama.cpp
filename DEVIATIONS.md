@@ -440,17 +440,60 @@ The chain, from `SPEC_TRACE=1`:
 - a different expert set is not a rounding difference, and the rest of the stack
   compounds it into whole logits
 
-Chunk 1 is exact; chunk 2 already reaches 4.29. That hard step matches the
-GEMV-to-GEMM switch, not any gradual accumulation. It is also not ours and not
-qwen4exp's: dense Ministral-3B on the same test gives 0.22 (Q4_K_M) and 0.38
-(Q8_0). Forcing MMQ changes nothing, and the three env-gated changes of our own
-that touch these paths (`LLAMA_KV_NGRAM_WINDOW`, `GGML_CUDA_ARGSORT_RADIX`,
+Chunk 1 is exact; chunk 2 already reaches 4.29 — a hard step, not accumulation.
+It is also not ours and not qwen4exp's: dense Ministral-3B on the same test
+gives 0.22 (Q4_K_M) and 0.38 (Q8_0). The three env-gated changes of our own that
+touch these paths (`LLAMA_KV_NGRAM_WINDOW`, `GGML_CUDA_ARGSORT_RADIX`,
 `LLAMA_BATCH_USED_LB`) are each bit-identical when disabled.
 
-So exactness is not reachable by fixing bookkeeping, and `7d71c3a90` — which
+(An earlier note here said "forcing MMQ changes nothing". Disregard it —
+`GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_FORCE_CUBLAS` are `#ifdef` build macros,
+not environment variables, so setting them in the environment did nothing at
+all. The run was a no-op, not a control.)
+
+So exactness is not reachable by fixing *bookkeeping*, and `7d71c3a90` — which
 did fix a real conv-state bug and moved three of the five diverge.py prompts a
-long way — was never going to finish the job. The open question is no longer
-"why does it differ" but "does it cost anything", which is an eval question.
+long way — was never going to finish the job.
+
+### The mechanism has a name, and the kernel is ours to fix
+
+This is **batch invariance**, and it is well documented. Thinking Machines'
+*Defeating Nondeterminism in LLM Inference* names the same three offenders —
+matmul (data-parallel vs split-K by batch dimension), RMSNorm, and attention
+(split-KV by query count) — and reports ~20% on matmul and vLLM 26 s -> 42-55 s
+for 1000 sequences to remove it. SGLang shipped it for dense models at a
+measured 34% average slowdown, explicitly **not** covering MoE. llama.cpp has an
+open PR (#16016, since 2025-09-15, unmerged) for a CUDA deterministic mode, and
+it covers FP16/BF16 matmul only — not the quantized path we are on.
+
+Upstream issue **#25618 is our bug**, open since 2026-07-13 with 19 comments and
+still `bug-unconfirmed`: "Speculative decoding (draft-mtp / draft-dspark): greedy
+output diverges from vanilla on quantized targets". Independent reproductions on
+Metal, Vulkan and ROCm; the reporter's BF16 target matched vanilla 10/10 while
+Q4_K_M matched 9/10. Ankk98 took the Vulkan side apart into six path mismatches,
+every one of them "the N=1 kernel is not the N>1 kernel", and fixed each by
+forcing a single path — including one that is exactly ours: *"parallel verify
+used integer-dot MMVQ (NUM_COLS > 1) while sequential recheck used NUM_COLS == 1.
+Those paths disagree."*
+
+On CUDA/GB10 the dispatch does **not** switch families — `ggml_cuda_should_use_mmvq`
+returns true up to `MMVQ_MAX_BATCH_SIZE` = 8, so a 1-token decode and a 7-token
+verify both land in `mul_mat_vec_q`. What differs is the geometry inside it:
+
+| | `nwarps` | `rows_per_block` | variants available |
+| --- | --- | --- | --- |
+| `ncols_dst` = 1 | 4 (8 with our GB10 `halve_iters`) | 1 | plain, `small_k`, `halve_iters` |
+| `ncols_dst` = 5..8 | 2 | 2 | plain only |
+
+Different `nwarps` means a differently shaped cross-warp reduction through
+`tmp_shared`, so the same dot product does not come out bitwise equal. `mul_mat_id`
+is worse: `ncols_dst > 1` goes to a dedicated MoE kernel (one warp per token)
+while `ncols_dst == 1` uses the general one.
+
+`GGML_CUDA_MMVQ_BATCH_INVARIANT` (build flag, default off) pins both the geometry
+and the runtime variant choice to whatever the `ncols_dst == 1` call would have
+used, which leaves the single-token decode exactly as tuned and makes the wider
+calls match it.
 
 **A generated model cannot gate any of this.** On the `test-llama-archs`
 qwen4exp model every phase scores an exact zero, including a 6-deep rollback run
