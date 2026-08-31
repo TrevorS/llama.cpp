@@ -161,9 +161,19 @@ here, so such a change must be justified by mechanism or by direct instrumentati
 (a kernel-time delta from a profile, an asymptotic argument) rather than by a
 throughput number. Two traps that cost real time this session: a 4-repeat window
 reports a mean that looks precise to 0.3% while sitting up to 1.3% off the true
-mean, and **completion text is not run-to-run deterministic at temperature 0** on
-these models, so text-hash equality cannot gate a change. Gate on `draft_n` /
-`draft_n_accepted`, which were byte-identical across every leg of every A/B here.
+mean. Gate on `draft_n` / `draft_n_accepted`, which were byte-identical across
+every leg of every A/B here.
+
+An earlier version of this section also claimed that completion text is not
+run-to-run deterministic at temperature 0, and used that to argue text-hash
+equality could never gate a change. **That was wrong**, and it was wrong in the
+expensive direction: it retired the one check that would have caught the
+speculative-decoding divergence below. `test-spec-decode-exactness` measures it
+directly — single-token decode, chunked decode, chunked decode with rollback,
+and all six checkpoint save/restore combinations each reproduce bit-for-bit
+across fresh contexts on both qwen4exp and Ministral-3B, `max|dlogit| = 0`. What
+is *not* stable is the same prompt run twice through the speculative server, and
+that is a property of the server loop, not of the model math.
 
 ## Known debt
 
@@ -204,10 +214,15 @@ commits. Never report a PPL delta without rebuilding the baseline.
 per-request `draft_n` / `draft_n_accepted` timings (see `gb10-thermal/soak.sh`
 for the extraction), but the prompt set behind the 0.6357 and 0.8316 figures is
 not recorded anywhere, so those two gates are not currently reproducible from
-the repo alone. Write the probe down the next time it is run. Note the rule from
-`ds4-tile/FLAGS.md`: text-hash equality is **not** a valid equivalence check for
-a spec flag — speculation preserves the target distribution, so the text matches
-regardless of what the draft proposed. Gate on `draft_n`/`accepted`.
+the repo alone. Write the probe down the next time it is run.
+
+`ds4-tile/FLAGS.md` says text-hash equality is not a valid equivalence check for
+a spec flag, on the grounds that speculation preserves the target distribution
+so the text matches whatever the draft proposed. Read it narrowly: it is a fair
+warning that a text match does not prove a *draft-side* flag did anything, and
+`draft_n`/`accepted` remain the right gate for that. It is not a licence to skip
+the text comparison, because the premise fails here — see **Speculative decoding
+is not token-exact** below.
 
 ### Re-validated on the 2026-08-10 rebase onto `030ebb558`
 
@@ -359,7 +374,7 @@ listing now sorts a plain vector and builds the array afterwards.
 `serve-qwen` (in `~/bin`) is the validated recipe; every value in it was measured.
 The three that are not obvious:
 
-- **`-lm mmap --tensor-read-lazy on` is mandatory.** The PLE is marked
+- **`-lm mmap --lazy-mode on` is mandatory.** The PLE is marked
   `TENSOR_READ_LAZY`, but `-lm auto` resolves to `none` on GB10, so the default
   loads all 26.82 GiB resident and lazy never fires. Confirm by host memory, not
   by log line — lazy leaves ~50 GiB available, resident leaves ~24 GiB.
@@ -388,6 +403,86 @@ The three that are not obvious:
 
 Cumulative against the pre-`ec4d1e89f` config: **35.71 → 44.45 t/s (+24.5%)**,
 acceptance flat at ~0.75.
+
+### Speculative decoding is not token-exact, and cannot be made so
+
+Greedy speculative decoding is supposed to reproduce the non-speculative output
+token for token. On qwen4exp it does not: every prompt in `qwen-evals/diverge.py`
+diverges from the no-draft answer. The working theory for a long time was that
+some piece of per-token recurrent state was not being rolled back. It was wrong.
+
+`test-spec-decode-exactness` compares each decode path against a single-token
+baseline and against a second run of itself. On UD-IQ4_XS, prefill 8, 21 tokens,
+chunk 7, `n_rs_seq` 6:
+
+| phase | max abs logit delta | argmax flips |
+| --- | --- | --- |
+| `[det]` every path twice | 0 | 0/21 |
+| `[ckpt]` 6 save/restore combinations | 0 | 0/21 |
+| `[shape]` chunked vs one-at-a-time | 4.62 | 2/21 |
+| `[roll]` chunk, partial accept, roll back | 4.62 | 2/21 |
+
+`[roll]` matching `[shape]` bit for bit, at both acceptance patterns and every
+rollback depth 1..6, is the whole answer: **rollback contributes nothing.** The
+divergence is that the target computes different logits for the same token
+depending on how many tokens sit beside it in the ubatch, and speculation is
+precisely a change of that shape — one token per decode without a draft, `1 +
+n_draft` with one.
+
+The chain, from `SPEC_TRACE=1`:
+
+- the first `MUL_MAT` already moves, by 3.8e-06 on a `[320 x 1]` row
+- through layer 0 everything stays small: `linear_attn_out` 6e-08,
+  `ffn_moe_logits` 9.5e-07, `ffn_moe_probs` 7e-10
+- from layer 6 the `ffn_moe_argsort` rows differ in their **top 8 entries**, by
+  as much as 363. With 512 experts and top-10 there are near-ties everywhere, so
+  a 1e-06 nudge to the router picks a different expert set
+- a different expert set is not a rounding difference, and the rest of the stack
+  compounds it into whole logits
+
+Chunk 1 is exact; chunk 2 already reaches 4.29. That hard step matches the
+GEMV-to-GEMM switch, not any gradual accumulation. It is also not ours and not
+qwen4exp's: dense Ministral-3B on the same test gives 0.22 (Q4_K_M) and 0.38
+(Q8_0). Forcing MMQ changes nothing, and the three env-gated changes of our own
+that touch these paths (`LLAMA_KV_NGRAM_WINDOW`, `GGML_CUDA_ARGSORT_RADIX`,
+`LLAMA_BATCH_USED_LB`) are each bit-identical when disabled.
+
+So exactness is not reachable by fixing bookkeeping, and `7d71c3a90` — which
+did fix a real conv-state bug and moved three of the five diverge.py prompts a
+long way — was never going to finish the job. The open question is no longer
+"why does it differ" but "does it cost anything", which is an eval question.
+
+**A generated model cannot gate any of this.** On the `test-llama-archs`
+qwen4exp model every phase scores an exact zero, including a 6-deep rollback run
+with prefill 1, where the deeper snapshot planes were never written at all. Its
+recurrent state simply does not reach its logits. This is why
+`test-recurrent-state-rollback` is green in CI and fails on the real model.
+
+### The snapshot ring goes stale after a narrow ubatch
+
+Found while chasing the above, and unrelated to it. `[roll-ar]` advances R tokens
+one at a time and rolls all R back, which must return to where it started:
+
+| depth | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | --- | --- | --- | --- | --- | --- |
+| max abs logit delta | 2.54 | 8.25 | 10.20 | 8.93 | 12.40 | 13.85 |
+
+`build_recurrent_attn` copies only `min(n_seq_tokens, K)` snapshot planes into
+the cache, and `build_conv_state` clamps its window rather than shifting, so
+after a narrow ubatch the deeper planes still describe positions from an
+earlier, wider one. A rollback reads them as if they were valid. This is what
+makes `test-recurrent-state-rollback` fail its dirty-ctx case on the real model:
+its reference logits come from a replay that had already read a stale plane.
+
+**The speculative path cannot reach it** — a rollback there is always shallower
+than the chunk that just wrote the planes — which is why it is recorded rather
+than fixed. The two candidate fixes both have a real cost: shifting the planes
+is 6 x 112.57 MiB read and written per decode step, about 23% of a step at 45
+t/s, and paid on every step to protect a case we never take. Making the planes a
+true ring — a per-cell base index, so a write moves the index instead of the
+data — is free at runtime but reaches into `mem_cell`, `find_slot`, `s_copy`,
+both state serialisers and every `build_conv_state` caller, for five
+architectures whose only test models cannot detect a mistake in it.
 
 ## Draft model
 
