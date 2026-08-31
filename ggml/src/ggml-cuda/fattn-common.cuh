@@ -16,6 +16,13 @@
 #define GGML_CUDA_FATTN_BATCH_INVARIANT 0
 #endif
 
+// The KV work-split pin is separable from the family/ncols1 pins so that a control build
+// can isolate it (-DGGML_CUDA_FATTN_KVSPLIT_INVARIANT=0 with the umbrella flag on). It
+// defaults to the umbrella flag.
+#ifndef GGML_CUDA_FATTN_KVSPLIT_INVARIANT
+#define GGML_CUDA_FATTN_KVSPLIT_INVARIANT GGML_CUDA_FATTN_BATCH_INVARIANT
+#endif
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -1133,6 +1140,11 @@ void launch_fattn(
     // 0, both exact, so the padding stops mattering. The cost is real and lands on decode:
     // at Q->ne[1] == 1 there are only a handful of output tiles, and splitting the KV range
     // is precisely how this kernel fills the GPU. Measure before believing it is affordable.
+    //
+    // Applied only at Q->ne[1] <= 8: the two schedules being reconciled (solo decode and a
+    // <=8-wide verify) both sit below that, while prefill is identical between them anyway
+    // and keeps stream-k.
+    const bool pin_kv_split = GGML_CUDA_FATTN_KVSPLIT_INVARIANT && Q->ne[1] <= 8;
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1193,7 +1205,7 @@ void launch_fattn(
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
-        const bool use_stream_k = !GGML_CUDA_FATTN_BATCH_INVARIANT && should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
+        const bool use_stream_k = !pin_kv_split && should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1223,7 +1235,7 @@ void launch_fattn(
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
         // [TAG_FATTN_BATCH_INVARIANT] one block per tile, so the KV range is never cut
-        if (GGML_CUDA_FATTN_BATCH_INVARIANT) {
+        if (pin_kv_split) {
             parallel_blocks = 1;
         }
 
@@ -1233,7 +1245,7 @@ void launch_fattn(
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
         for (int parallel_blocks_test = parallel_blocks;
-                 !GGML_CUDA_FATTN_BATCH_INVARIANT && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+                 !pin_kv_split && parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_dst * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
