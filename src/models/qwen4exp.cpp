@@ -1212,18 +1212,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+    const auto   mem_size = mctx_cur->get_size();
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    // Writing only the final tail is correct without speculation, but it is not enough
+    // when the recurrent rollback ring is active. A conv state is a summary of past
+    // tokens and cannot be un-summarised, so rejecting a drafted token requires the
+    // state as it stood *before* that token -- a value that only exists if it was
+    // written down while the ubatch was processed. The delta-net state gets this from
+    // the GDN kernel (it writes one snapshot slot per token); the conv state has to do
+    // it here. Missing this made speculative decoding silently non-exact: every prompt
+    // diverged from the no-draft output within ~30 tokens, while acceptance and
+    // throughput both looked healthy.
+    //
+    // Mirrors [TAG_RECURRENT_ROLLBACK_SPLITS] in delta-net-base.cpp, which the shared
+    // helper applies for qwen35/qwen35moe. Same assumption: the trailing (n_rs_seq + 1)
+    // tokens of a sequence share one ubatch, which split_equal()'s n_keep_tail argument
+    // guarantees whenever n_rs_seq > 0.
+    const int64_t K = cparams.n_rs_seq == 0 ? 1 : (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+    for (int64_t t = 1; t <= K; ++t) {
+        int64_t s_idx = conv_input->ne[0] - state_cols - K + t;
+        if (s_idx < 0) {
+            s_idx = 0;
+        }
+        const int64_t s_slot = K - t;   // slot 0 = newest state, slot s = s tokens back
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, s_idx));
+
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                (s_slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    }
 
     return conv_input;
 }
