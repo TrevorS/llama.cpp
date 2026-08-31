@@ -71,7 +71,16 @@ static bool trace_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
     // ggml names unlabelled nodes by graph index, and the two graphs do not have
     // the same node count, so "node_27" is a different node in each. Only nodes the
     // model named through cb() can be matched across runs.
-    if (strncmp(ggml_get_name(t), "node_", 5) == 0) {
+    const char * tname = ggml_get_name(t);
+    if (strncmp(tname, "node_", 5) == 0 || tname[0] == '\0' || tname[0] == ' ') {
+        return true;
+    }
+    // Recurrent-cache writes are not comparable this way. A per-token activation is
+    // [n_embd, n_tokens], so its element 0 is the chunk's first token in both runs.
+    // A cache row is the rollback ring, whose slot 0 holds the state after the *last*
+    // token of the ubatch - a different token in each run. Comparing them measures one
+    // step of the recurrence, not a batch-invariance failure.
+    if (strncmp(tname, "cache_", 6) == 0) {
         return true;
     }
     trace_entry e;

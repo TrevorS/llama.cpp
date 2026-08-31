@@ -495,6 +495,64 @@ and the runtime variant choice to whatever the `ncols_dst == 1` call would have
 used, which leaves the single-token decode exactly as tuned and makes the wider
 calls match it.
 
+**It covers the dense path only.** `mul_mat_vec_q_case` returns at
+`mmvq.cu:1018` for `has_ids && ncols_dst > 1` — the dedicated MoE kernel — before
+the flag is ever consulted, and `mul_mat_vec_q_moe_launch` never calls
+`calc_launch_params`. So on a MoE model every expert matmul still takes a
+different kernel than the 1-token path. The flag as written cannot make qwen4exp
+exact on its own.
+
+### The full audit: what else is keyed on the token count
+
+Ranked by expected contribution. Only the first two are measured; the rest are
+read off the dispatch.
+
+| | op | site | 1 token vs 7 |
+| --- | --- | --- | --- |
+| 1 | `MUL_MAT_ID` (512 experts x 48 layers) | `mmvq.cu:1018` | dedicated MoE kernel, 1 warp/token, **no cross-warp reduction at all** vs the general kernel's `tmp_shared` tree |
+| 2 | dense quantized `MUL_MAT` | `mmvq.cu:415,543` | `nwarps` 4-or-8 vs 2, `rows_per_block` 1 vs 2 — **flag handles this** |
+| 3 | fused up+gate+SwiGLU | `ggml-cuda.cu:1844` | one fused kernel at 1 token, three ops at >1 (fusion refused when `dst->ne[2] != 1`) |
+| 4 | `FLASH_ATTN_EXT` family | `fattn.cu:462-482` | `fattn-vec` (fp32 warp dot) vs `fattn-mma-f16` (tensor-core tiles) — a different algorithm |
+| 5 | `FLASH_ATTN_EXT` KV split | `fattn-common.cuh:1142` | stream-k cuts the KV range into a different number of chunks and recombines in a different order |
+| 6 | dense F16/BF16/F32 `MUL_MAT` | `mmvf.cu:830,855` | MMVF (warp dot) at `ne11 == 1`, MMF (mma tiles) at >= 2, because `ampere_mma_available` is true on SM121 |
+| 7 | `SUM_ROWS` (indexer score) | `sumrows.cu:36` | `(nrows/nsm) < 2` picks a different block width, so a different accumulate grouping — only inside one `n_kv` band |
+| 8 | `TOP_K` (indexer) | `argsort.cu:98` | `DeviceRadixSort` vs `DeviceSegmentedRadixSort`; no FP arithmetic, but `relu` and `-INF` masking manufacture exact ties |
+
+**Not pinnable without giving something up.** Once a matmul reaches cuBLAS
+(`ggml-cuda.cu:1909`) the tiling and split-K are cuBLAS-internal and there is no
+ggml-side knob. And pinning the FA stream-k split means using the 1-token split
+for a 7-token verify, i.e. discarding the occupancy stream-k exists to recover —
+the same trade Thinking Machines report as the dominant cost of attention
+invariance.
+
+### Suspects cleared
+
+- **The gated delta net is innocent on CUDA.** `gated_delta_net.cu:170` launches
+  one kernel with no `n_tokens` branch; `n_tokens` is only the trip count of a
+  sequential loop. The `build_delta_net_autoregressive` / `_chunking` split at
+  `delta-net-base.cpp:435` is real but dead here — with `n_rs_seq > 0`,
+  `build_recurrent_attn` calls `ggml_gated_delta_net` directly and never reaches
+  it. The `LLM_FUSED_OP_GDN_AR`/`GDN_CH` tags are capability probes read only by
+  `llama-context.cpp:524`; they select no kernel. Worth an assert so the split
+  cannot open up later.
+- **The router argsort is a consequence, not a cause.** At `n_expert` = 512 the
+  dispatch takes the bitonic early return (`argsort.cu:283`), one block per row,
+  identical at 1 and 7 rows. The `nrows == 1` radix split is unreachable for it.
+- **`RMS_NORM`, `SOFT_MAX`, `SSM_CONV`, `topk_moe`, the hyper-connection ops, the
+  lightning indexer, and every elementwise op** are one-block-per-row or flat
+  grids, with block width derived from the K dimension rather than the token
+  count.
+
+### A trap in our own trace tooling
+
+The first version of `[trace]` reported `cache_s_l0` moving by 9.3e-04, far more
+than anything else at layer 0, and it was wrong. A per-token activation is
+`[n_embd, n_tokens]`, so its element 0 is the chunk's first token in both runs and
+is comparable. A recurrent-cache row is the rollback ring, and slot 0 holds the
+state after the **last** token of the ubatch — a different token in each run. The
+number was one step of the recurrence, not an invariance failure. `cache_*`
+tensors are now excluded from the comparison.
+
 **A generated model cannot gate any of this.** On the `test-llama-archs`
 qwen4exp model every phase scores an exact zero, including a 6-deep rollback run
 with prefill 1, where the deeper snapshot planes were never written at all. Its
