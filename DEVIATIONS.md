@@ -514,6 +514,72 @@ So the practical position is: speculation produces **a different sample of the
 same quality**, at ~+30% decode on this workload. What it does not produce is
 the model's own no-draft answer.
 
+### Batch invariance achieved at the kernel level, and what it bought
+
+Five sources, every one of them a switch on the **width-1** path, all now behind
+build flags that default off:
+
+| flag | what it pins |
+| --- | --- |
+| `GGML_CUDA_MMVF_BATCH_INVARIANT` | F32/F16 mat-vec family (`mmvf.cu:812/829`) |
+| `GGML_CUDA_MMVQ_BATCH_INVARIANT` | quantized mat-vec geometry (`mmvq.cu:415/543`) |
+| `GGML_CUDA_MMID_BATCH_INVARIANT` | `mul_mat_id`'s family switch (`mmvq.cu:1018`) |
+| `GGML_CUDA_FATTN_BATCH_INVARIANT` | FA family + `ncols1` (`fattn.cu:462`, `:13-32`) |
+| `GGML_CUDA_DISABLE_FUSION=1` (env) | fusion gated on `ne1 == 1` (`ggml-cuda.cu:1814`) |
+
+With all five, `test-spec-decode-exactness` reports **`max|dlogit| = 0`, 0/21
+flips** at chunk 2 and chunk 7 with `-fa on`. A 7-token verify batch is bitwise
+identical to single-token decode.
+
+**Why every partial attempt read as a null.** Each pin removes one source while
+the others keep injecting ~1e-06, and a 512-expert top-10 router turns any
+perturbation into a different expert set. There was never going to be a gradual
+descent — it is all-or-nothing, and the four "nulls" (including the `mul_mat_id`
+pin, which *raised* the number from 2.84 to 4.50) were real progress the
+measurement could not show. Do not read a single-pin null as evidence against
+that pin.
+
+**Cost: 8.1% of width-1 decode**, tg128 25.58 -> 23.52 on llama-bench, prefill
+flat (the pins only touch widths <= 8). Compare SGLang's ~34% for the same
+guarantee on dense models. Two oddities recorded rather than explained:
+`pp512` carries +/-13% error bars and reads far below our 754 t/s, so treat it as
+a did-not-regress guard only; and disabling fusion measures *faster* than leaving
+it on with the pins (23.52 vs 21.97), which is the opposite of the prediction.
+
+### End to end it is better, not exact -- and the reason is n_kv
+
+Server built with all four pins, `GGML_CUDA_DISABLE_FUSION=1`, `diverge.py`
+no-draft vs speculative, 1200 tokens:
+
+| prompt | first diff before | first diff now | acceptance |
+| --- | --- | --- | --- |
+| hard | 323 | 388 | 0.85 |
+| code | 300 | **938** | 0.78 |
+| prose | 206 | **859** | 0.76 |
+| math | 133 | **identical** | 0.84 |
+| count | identical | identical | 0.92 |
+
+Two of five token-identical, the rest diverging 1.2-3.1x later, and acceptance up
+across the board (0.76-0.92 from 0.74-0.88) — consistent numerics make the draft
+agree with the target more often.
+
+**The harness cannot see what is left.** It runs at a fixed `n_kv` of 256; the
+server's grows. FA's stream-k partition is a function of the **KV length**, not
+the token count (`fattn-mma-f16.cuh:1820`, `iter_k = ceil(ne11 / nbatch_fa)`), so
+a solo decode at position p sees `n_kv = pad256(p+1)` while the verify batch sees
+`pad256(p+7)`. When those fall in different 256-buckets the split and the combine
+order differ. That fits the evidence exactly: divergence now appears only after
+hundreds of tokens, at whichever crossing lands differently, and the two short
+prompts never hit one. Closing it needs a fixed-partition FA — real kernel work,
+not another predicate.
+
+**Serving throughput is not yet measured cleanly.** The pinned run gives
+20.89 no-spec / 33.94 spec, the earlier unpinned one 26.35 / 42.21, but those ran
+different workloads (diverge.py alone at 1200 tokens vs the full eval at 4000), so
+the absolute gap is not attributable. What is internally consistent is that
+speculation still pays **+62%** with the pins on, against +60% without. A clean
+serving A/B needs the same workload both ways.
+
 ### The mechanism has a name, and the kernel is ours to fix
 
 This is **batch invariance**, and it is well documented. Thinking Machines'
