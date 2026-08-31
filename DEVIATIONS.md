@@ -505,10 +505,10 @@ brevity. `diverge.py` on the same servers puts the first differing token at
 (`count`, "count from 1 to 60") is **token-identical**, which is the control you
 would want — a task whose top-2 gap is enormous never flips.
 
-Two things blunt this test and should be fixed before leaning on it harder: the
-eval sits at its ceiling on six of seven items, so it can only show a loss; and
-the draft-coverage warning under **Known debt** fired on some requests, which
-means less speculation and therefore an answer closer to the no-draft one.
+One thing blunts this test and should be fixed before leaning on it harder: the
+eval sits at its ceiling on six of seven items, so it can only show a loss. (The
+draft-coverage warning also fired during it, but that warning was later shown to
+be over-eager — see **Known debt** — so it does not qualify the result.)
 
 So the practical position is: speculation produces **a different sample of the
 same quality**, at ~+30% decode on this workload. What it does not produce is
@@ -521,11 +521,16 @@ build flags that default off:
 
 | flag | what it pins |
 | --- | --- |
-| `GGML_CUDA_MMVF_BATCH_INVARIANT` | F32/F16 mat-vec family (`mmvf.cu:812/829`) |
-| `GGML_CUDA_MMVQ_BATCH_INVARIANT` | quantized mat-vec geometry (`mmvq.cu:415/543`) |
-| `GGML_CUDA_MMID_BATCH_INVARIANT` | `mul_mat_id`'s family switch (`mmvq.cu:1018`) |
-| `GGML_CUDA_FATTN_BATCH_INVARIANT` | FA family + `ncols1` (`fattn.cu:462`, `:13-32`) |
-| `GGML_CUDA_DISABLE_FUSION=1` (env) | fusion gated on `ne1 == 1` (`ggml-cuda.cu:1814`) |
+| `GGML_CUDA_MMVF_BATCH_INVARIANT` | F32/F16 mat-vec family (`mmvf.cu:830/850`) |
+| `GGML_CUDA_MMVQ_BATCH_INVARIANT` | quantized mat-vec geometry (`mmvq.cu:419/1060`) |
+| `GGML_CUDA_MMID_BATCH_INVARIANT` | `mul_mat_id`'s family switch (`mmvq.cu:1026`, fused-MoE refusal `ggml-cuda.cu:1851`) |
+| `GGML_CUDA_FATTN_BATCH_INVARIANT` | FA family + `ncols1` (`fattn.cu:27/482`); umbrella — also implies the KV-split pin below |
+| `GGML_CUDA_FATTN_KVSPLIT_INVARIANT` | FA KV work-split: one block per output tile, sequential KV walk (`fattn-common.cuh:1143/1184/1215`); defaults to the umbrella flag, force `0` for a control isolating it; gated on width <= 8 so prefill keeps stream-k |
+| `GGML_CUDA_DISABLE_FUSION=1` (env) | fusion — runtime env read at `ggml-cuda.cu:3420`, mat-vec forms gated on `ne1 == 1` |
+
+(The first four are raw preprocessor macros, not CMake options — set them via
+`-DCMAKE_CUDA_FLAGS="-DGGML_CUDA_MMVF_BATCH_INVARIANT=1 …"`. The fusion knob is a
+runtime env var and must accompany every pinned invocation.)
 
 With all five, `test-spec-decode-exactness` reports **`max|dlogit| = 0`, 0/21
 flips** at chunk 2 and chunk 7 with `-fa on`. A 7-token verify batch is bitwise
