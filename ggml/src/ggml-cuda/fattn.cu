@@ -5,6 +5,21 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// [TAG_FATTN_BATCH_INVARIANT]
+// Flash attention picks a different kernel *family* at one token than at several -- the
+// fp32 warp-dot VEC kernel versus f16 tensor-core MMA tiles -- and then, inside MMA, a
+// different ncols1 from a ladder that steps at 2, 3 and 5. ncols1 sets nbatch_fa, the
+// online-softmax rescale period, so it is an accumulation schedule and not just a tiling.
+//
+// Building with -DGGML_CUDA_FATTN_BATCH_INVARIANT=1 sends every width 1..8 to MMA and pins
+// ncols1 to the widest arm, which is already instantiated. The VEC family cannot be pinned
+// the other way: fattn-vec.cuh only instantiates cols_per_block 1 and 2, and at DKQ=DV=256
+// a width-8 accumulator would not fit in registers. So the single-token decode gives up its
+// VEC path, which is the tuned one -- this costs decode and has to be measured, not assumed.
+#ifndef GGML_CUDA_FATTN_BATCH_INVARIANT
+#define GGML_CUDA_FATTN_BATCH_INVARIANT 0
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -133,6 +148,14 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
+
+    // [TAG_FATTN_BATCH_INVARIANT] every speculative width takes the same arm as a wide batch
+    if (GGML_CUDA_FATTN_BATCH_INVARIANT && Q->ne[1] <= 8 &&
+            !(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) &&
+            !(GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        return;
+    }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
@@ -588,7 +611,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, 
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // [TAG_FATTN_BATCH_INVARIANT] VEC only exists for 1 and 2 columns, so widths 1..8 can only
+    // be made to agree by sending all of them to MMA
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0
+        && !(GGML_CUDA_FATTN_BATCH_INVARIANT && Q->ne[1] <= 8);
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
