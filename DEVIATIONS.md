@@ -486,14 +486,30 @@ verify both land in `mul_mat_vec_q`. What differs is the geometry inside it:
 | `ncols_dst` = 5..8 | 2 | 2 | plain only |
 
 Different `nwarps` means a differently shaped cross-warp reduction through
-`tmp_shared`, so the same dot product does not come out bitwise equal. `mul_mat_id`
-is worse: `ncols_dst > 1` goes to a dedicated MoE kernel (one warp per token)
-while `ncols_dst == 1` uses the general one.
+`tmp_shared`. `mul_mat_id` is worse: `ncols_dst > 1` goes to a dedicated MoE
+kernel (one warp per token) while `ncols_dst == 1` uses the general one.
 
-`GGML_CUDA_MMVQ_BATCH_INVARIANT` (build flag, default off) pins both the geometry
-and the runtime variant choice to whatever the `ncols_dst == 1` call would have
-used, which leaves the single-token decode exactly as tuned and makes the wider
-calls match it.
+**But the warp count is not the mechanism, and that is settled upstream.** On
+#25618 thc1006 forced the `MMVQ_PARAMETERS_GENERIC` warp counts across widths
+3..8 on sm_86, confirmed with SASS that the edit reached the machine code and
+only there, moved kernel runtime by up to **26.68%**, and changed **not one
+output byte** in 150 records per build. Their divergence rates do group along the
+dispatch boundaries (widths 2-4, 5-8, 9+), so the table describes *where* the
+boundaries are — it just is not what puts the widths in different groups. They
+also established that divergence starts at **width 2**, the smallest speculative
+width there is: 57 of 75 requests differed from baseline at `--spec-draft-n-max 1`.
+
+That intervention never crossed the 1-vs-many boundary, which is the one that
+matters for us — `rows_per_block` (1 vs 2) and the `small_k` / `halve_iters`
+variant choice both change only there, and neither was touched. So the flag is
+still worth running, but the expectation should be that it is not sufficient on
+its own, and the leading candidates are the **family switches**: `mul_mat_id`,
+flash attention's VEC-vs-MMA split, and MMVF-to-MMF for F16/BF16 weights.
+
+`GGML_CUDA_MMVQ_BATCH_INVARIANT` (build flag, default off) pins the geometry to
+the `ncols_dst == 1` arm and forces every width onto the plain variant, so all of
+1..8 launch the same shape. It is not free: it gives up `small_k` and
+`halve_iters` at `ncols_dst == 1`, which is the GB10 bs=1 tuning.
 
 **It covers the dense path only.** `mul_mat_vec_q_case` returns at
 `mmvq.cu:1018` for `has_ids && ncols_dst > 1` — the dedicated MoE kernel — before
@@ -575,15 +591,58 @@ earlier, wider one. A rollback reads them as if they were valid. This is what
 makes `test-recurrent-state-rollback` fail its dirty-ctx case on the real model:
 its reference logits come from a replay that had already read a stale plane.
 
-**The speculative path cannot reach it** — a rollback there is always shallower
-than the chunk that just wrote the planes — which is why it is recorded rather
-than fixed. The two candidate fixes both have a real cost: shifting the planes
-is 6 x 112.57 MiB read and written per decode step, about 23% of a step at 45
-t/s, and paid on every step to protect a case we never take. Making the planes a
-true ring — a per-cell base index, so a write moves the index instead of the
-data — is free at runtime but reaches into `mem_cell`, `find_slot`, `s_copy`,
-both state serialisers and every `build_conv_state` caller, for five
-architectures whose only test models cannot detect a mistake in it.
+A full reachability audit says **not reachable in our serving config**, and the
+bounds are tighter than "it happens not to fire":
+
+- **The speculative loop is safe by arithmetic.** With D drafted tokens the
+  rollback depth is `D + 1 - accepted.size()` and `accepted.size() >= 1`, so the
+  depth is at most D, while the same ubatch wrote `min(D+1, K) = D+1` planes.
+  The requested plane is always one the immediately preceding ubatch wrote. The
+  split guarantee holds too: `split_equal(..., n_keep_tail = n_rs_seq + 1)`
+  admits a sequence only when its remaining count is 0 or >= `n_keep_tail`, so a
+  generating slot's 7 tokens are never deferred mid-chunk. A corollary is that
+  `use_ckpt_tgt` in the accept path can never be true in RS mode — that branch
+  is dead code.
+- **SPEC=0 is dead** — `n_rs_seq` is 0, `build_recurrent_attn` takes its
+  single-plane branch, and there is no ring at all.
+- **The prompt cache is protected by exactly one position.** For a hybrid,
+  `seq_pos_min` is the max of the two sub-memories' minima and the recurrent
+  minimum is its tail cell's `pos`, so `pos_min` is the sequence frontier. That
+  makes the checkpoint gate and the partial-rollback condition the *same*
+  condition, so whenever the trim could roll back, the checkpoint block already
+  ran and overwrote `n_past`. Every ordinary checkpoint keeps the invariant
+  `n_tokens == pos_min + 1 == pos_max + 1`, which leaves `p0 = cell.pos + 1`.
+
+**The one breach needs `--slot-save-path`.** `create_checkpoint(*slot, 0, 0,
+pos_max)` at `server-context.cpp:2895` synthesizes a checkpoint with
+`pos_min = 0` against `pos_max = N-1`, which both bypasses the gate and makes
+the restore land on `p0 = cell.pos` instead of `cell.pos + 1` — a depth-1 read
+of a plane the restore never wrote, silently, with `seq_rm` returning true.
+`POST /slots/0?action=save` then `?action=restore` then any completion reaches
+it, and the synthetic checkpoint survives into the RAM and disk prompt-cache
+tiers. Containment is one line: pass the real `seq_pos_min`, or use
+`it->pos_max + 1` at the restore site. **We do not pass `--slot-save-path`.**
+
+So the ring stays as it is. Both fixes cost more than the exposure: shifting the
+planes is 6 x 112.57 MiB read and written per decode step, about 23% of a step at
+45 t/s, paid always to protect a case we never take; and making the planes a true
+ring — a per-cell base index, so a write moves the index instead of the data — is
+free at runtime but reaches into `mem_cell`, `find_slot`, `s_copy`, both state
+serialisers and every `build_conv_state` caller, for five architectures whose
+only test models cannot detect a mistake in it.
+
+### A different hybrid hazard, found on the way
+
+`llama_memory_recurrent::get_can_shift()` returns **true** ("shifting the pos is
+trivial for recurrent models"), but a mid-sequence removal is not representable
+in a recurrent state at all. Called with a finite `p1 <= cell.pos` — which is
+what context shift (`seq_rm(id, n_keep, n_keep + n_discard)`) and cache reuse
+(`seq_rm(id, head_p, head_c)`) both do — `seq_rm` skips the partial branch, skips
+the tail invalidation, matches no cell in its loop, and **returns true having
+done nothing**. The attention cache is then shifted or reused while the recurrent
+state still summarises the discarded tokens. No warning, and it needs no
+speculation. Not ours to fix today, but do not enable `--ctx-shift` or
+`--cache-reuse` on a hybrid model expecting correct output.
 
 ## Draft model
 
