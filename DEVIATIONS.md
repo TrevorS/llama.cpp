@@ -177,15 +177,32 @@ that is a property of the server loop, not of the model math.
 
 ## Known debt
 
-**The MTP draft context does not always see the whole prefill.**
+**The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
 `common_speculative_impl_draft_mtp::begin` (`common/speculative.cpp:1746-1757`)
-warns when `ctx_dft`'s frontier is behind the prompt, and it fires in ordinary
-serving: 5 of the first 17 requests of the 2026-08-30 quality A/B logged
-`ctx_dft pos_max=29 < N-1=370`, i.e. 30 positions ingested against a 371-token
-prompt. Drafts on those requests are made from almost no context, so acceptance
-collapses for them. Not yet chased. Note the direction it biases a spec-vs-vanilla
-comparison: less speculation means the output is *closer* to the no-draft answer,
-so it blunts such a test rather than failing it.
+warns when `ctx_dft`'s position is behind the prompt, and it fired 11 times
+during the 2026-08-30 quality A/B (`ctx_dft pos_max=29 < N-1=370`). I recorded
+that as a real coverage gap that collapsed acceptance on those requests. **It is
+not**, on the evidence available:
+
+- `llama_decode[N] returned` appears **0** times in that server's log, and
+  `inconsistent sequence positions` **0** times, both of which are `LOG_ERR` and
+  would be visible at default verbosity. So the draft never failed to seed and
+  drafting was never disabled.
+- Speculation was healthy on the same server: tg 32-37 t/s against 25-27
+  no-spec, and `diverge.py` measured acceptance 0.74-0.88 on it.
+
+The likely reading is that `begin()` measures coverage before the ingest
+pipeline has finished, so the predicate is right and the conclusion in its own
+message ("Drafts may degrade") is not. Worth retexting or moving the check, not
+worth chasing as a data-loss bug.
+
+**Open lead, untested:** on an ordinary prefix-cache hit the first ingested draft
+row may be paired with `pending_h` still holding the *previous* request's last
+`h` row (`common/speculative.cpp:1804-1808`), because the checkpoint path that
+would repair it (`common_speculative_set_state`) is gated on
+`pos_min >= pos_min_thold`, which is false for a non-SWA target on a plain prefix
+hit. If real this would degrade drafts on *every* warm request rather than some.
+Not measured.
 
 
 **`FUSE_INGEST` should be removed.** Measured flat at both depths, so it is
