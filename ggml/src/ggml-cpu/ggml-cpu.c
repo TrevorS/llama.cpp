@@ -2394,11 +2394,20 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
-        case GGML_OP_SET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
+                //
+                // Fork: a large gather is the exception. qwen4exp's n-gram table is a 28 GB
+                // mmap that only this op reads, 16 rows per token, and one thread faulting its
+                // pages in one at a time stalls a whole prefill ubatch behind the disk; the
+                // rows are independent, so spread them and the faults across the threads.
+                // Small lookups (token embeddings, decode) keep the single task.
+                n_tasks = ggml_nelements(node->src[1]) >= 4096 ? n_threads : 1;
+            } break;
+        case GGML_OP_SET_ROWS:
+            {
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
