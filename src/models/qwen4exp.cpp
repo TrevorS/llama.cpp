@@ -6,6 +6,13 @@
 #include <algorithm>
 #include <cinttypes>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -1348,7 +1355,108 @@ public:
     std::vector<llama_token> prev;
     std::vector<int32_t>     idx;
     std::vector<int64_t>     ctx;
+    std::vector<uintptr_t>   pages;
+
+    // tell the kernel which pages of the table the gather is about to read
+    void prefetch_rows(const std::vector<int32_t> & rows_idx);
 };
+
+// The table is a lazily read mmap and the CPU gather demand-faults it one row at a time:
+// 16 scattered rows per token, each a major fault when cold, on the one thread running
+// get_rows. Advising the kernel about every page a prefill ubatch is about to touch lets
+// the reads overlap instead of serialising behind the gather. A decode-sized batch is not
+// worth the syscalls. LLAMA_QWEN4EXP_PLE_PREFETCH=0 disables.
+void llm_graph_input_ple::prefetch_rows(const std::vector<int32_t> & rows_idx) {
+#ifdef __linux__
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_PLE_PREFETCH");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    if (!enabled || rows_idx.size() < 2048) {
+        return;
+    }
+
+    const ggml_tensor * t = pmodel.per_layer_tok_embd;
+
+    if (t == nullptr || t->data == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+        return;
+    }
+
+    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    static const uintptr_t pmask = ~(page - 1);
+
+    const size_t    row_size = ggml_row_size(t->type, t->ne[0]);
+    const uintptr_t base     = (uintptr_t) t->data;
+
+    // a row may straddle two pages
+    pages.clear();
+    pages.reserve(2*rows_idx.size());
+
+    for (const int32_t r : rows_idx) {
+        const uintptr_t a = base + (uintptr_t) r*row_size;
+        const uintptr_t p0 = a & pmask;
+        const uintptr_t p1 = (a + row_size - 1) & pmask;
+
+        pages.push_back(p0);
+        if (p1 != p0) {
+            pages.push_back(p1);
+        }
+    }
+
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    // coalesce neighbouring pages into runs
+    std::vector<struct iovec> runs;
+    runs.reserve(pages.size());
+
+    for (const uintptr_t p : pages) {
+        if (!runs.empty() && (uintptr_t) runs.back().iov_base + runs.back().iov_len == p) {
+            runs.back().iov_len += page;
+        } else {
+            runs.push_back({ (void *) p, (size_t) page });
+        }
+    }
+
+    // one process_madvise per 1024 runs where the kernel has it; per-run madvise otherwise
+    static int pidfd = -2;   // -2 untried, -1 unavailable
+
+#if defined(SYS_process_madvise) && defined(SYS_pidfd_open)
+    if (pidfd == -2) {
+        pidfd = (int) syscall(SYS_pidfd_open, (int) getpid(), 0);
+    }
+
+    if (pidfd >= 0) {
+        bool ok = true;
+
+        for (size_t i = 0; ok && i < runs.size(); i += 1024) {
+            const size_t n = std::min<size_t>(1024, runs.size() - i);
+
+            if (syscall(SYS_process_madvise, pidfd, runs.data() + i, n, MADV_WILLNEED, 0) < 0) {
+                ok = false;
+            }
+        }
+
+        if (ok) {
+            return;
+        }
+
+        // unsupported here (an old kernel, a sandbox): fall through once, then stay on madvise
+        close(pidfd);
+        pidfd = -1;
+    }
+#else
+    pidfd = -1;
+#endif
+
+    for (const auto & run : runs) {
+        madvise(run.iov_base, run.iov_len, MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(rows_idx);
+#endif
+}
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
@@ -1412,6 +1520,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    prefetch_rows(idx);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
