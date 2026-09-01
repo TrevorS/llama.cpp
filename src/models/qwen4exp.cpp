@@ -476,6 +476,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             n_embd, hc, n_tokens, 1);
     cb(res_hc, "hc_init", -1);
 
+    // ds4-style refusal steering (mirrors deepseek4.cpp:1504-1512): project the
+    // direction out of ffn_out (and, unless LLAMA_CVEC_FFN_ONLY, also attn_out)
+    // before its HC-combine. ds4's SHIPPED, validated recipe is ffn_out ONLY --
+    // adding attn steering reintroduced an "attn-poison" bug that capped flips at
+    // 5%, so set LLAMA_CVEC_FFN_ONLY=1 to match ds4 exactly.
+    //
+    // Default (no env) applies post-HC on the wide residual, which ablates the
+    // direction independently from each of the hc streams. That is shape-legal
+    // (ggml_can_repeat is pure modulo, sum_rows is dimension-agnostic) but costs
+    // a full [n_embd, hc, n_tokens] repeat, so prefer the ffn_out site.
+    static const bool cvec_at_ffn   = getenv("LLAMA_CVEC_AT_FFN") != nullptr;
+    static const bool cvec_ffn_only = getenv("LLAMA_CVEC_FFN_ONLY") != nullptr;
+    static const bool cvec_at_attn  = cvec_at_ffn && !cvec_ffn_only;
+
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
@@ -497,6 +511,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+        }
+
+        // attn_out steering, pre-HC (skipped in ds4's ffn-only recipe)
+        if (cvec_at_attn) {
+            cur = build_cvec(cur, il);
         }
 
         // The whole reduction has to move together: build_hc_combine sizes itself from the
@@ -523,7 +542,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
+        // ffn_out steering, pre-HC -- the ds4-validated site. Narrow
+        // [n_embd, n_tokens], so this is also the tensor to capture at.
+        if (cvec_at_ffn) {
+            cur = build_cvec(cur, il);
+        }
+
         res_hc = build_hc_combine(res_hc, cur, inject, il);
+        if (!cvec_at_ffn) {
+            res_hc = build_cvec(res_hc, il);
+        }
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
