@@ -863,6 +863,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    const int64_t width = top_k->ne[0];
+    const int64_t n_tps = top_k->ne[1];
+    const int64_t n_kv  = mctx_cur->get_n_kv();
+
+    // Gather instead of mask once the selection is small against the cache. The masked scan
+    // still reads every K/V row of the cache (the CUDA kernels skip only a masked suffix), so
+    // at depth its cost grows with n_kv while the gathered window stays 2051 rows per query.
+    // The two costs meet near 2*n_tps*width == n_kv; the margin keeps the per-query windows
+    // small against the compute buffer of a decode graph. Flash attention keeps V as rows,
+    // which the row gather needs. LLAMA_QWEN4EXP_QSA_GATHER=0 forces the scan for A/B and
+    // =2 forces the gather wherever flash attention allows it (tests, shallow parity runs).
+    static const int qsa_gather = []() {
+        const char * e = getenv("LLAMA_QWEN4EXP_QSA_GATHER");
+        return e == nullptr ? 1 : atoi(e);
+    }();
+
+    const bool gather = cparams.flash_attn && (qsa_gather == 2 || (qsa_gather != 0 && 4*n_tps*width < n_kv));
+
+    ggml_tensor * cur = gather
+        ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
+        : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    // the rotation is its own inverse, so undo it on the value side of the output
+    if (inp->self_v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+
+    return cur;
+}
+
+// The window stays whole and the mask hides every cell the selection leaves out.
+// The mask build copies the MLA sparse path in llm_graph_context::build_attn.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             top_k,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_cur = inp->mctx;
+
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     // prepare new kq mask - starts filled with -INFINITY
@@ -895,15 +936,88 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
-    cb(cur, "kqv_out", il);
+    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+}
 
-    // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+// Key and value traffic follows the budget instead of the cache: every query rides the stream
+// axis of the attention carrying the window its own selection named. The attention mask is
+// gathered at the same cells, so a query's reach (causality, sequence membership, the
+// always-visible tail) is exactly what the scan would have left it. Shape after ServeurpersoCom's
+// #27977, which was never resubmitted upstream.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             top_k,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t width    = top_k->ne[0];
+    const int64_t n_tps    = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+    const int64_t n_q      = n_tps*n_stream;
+
+    ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
+
+    const int64_t n_kv = k_all->ne[2];
+
+    // a cell holds its heads back to back, so one row of the gather is one whole cell
+    GGML_ASSERT(k_all->nb[2] == k_all->nb[1]*k_all->ne[1]);
+    GGML_ASSERT(v_all->nb[2] == v_all->nb[1]*v_all->ne[1]);
+
+    ggml_tensor * k_cells = ggml_view_3d(ctx0, k_all, k_all->ne[0]*k_all->ne[1], n_kv, n_stream,
+            k_all->nb[2], k_all->nb[3], 0);
+    ggml_tensor * v_cells = ggml_view_3d(ctx0, v_all, v_all->ne[0]*v_all->ne[1], n_kv, n_stream,
+            v_all->nb[2], v_all->nb[3], 0);
+
+    // a cell index names a cell of its own stream, and the ubatch lays the queries of a stream
+    // out contiguously, so the flat index of a window is the index of its query
+    ggml_tensor * idx_stream = ggml_reshape_2d(ctx0, top_k, width*n_tps, n_stream);
+
+    ggml_tensor * k_sel = ggml_get_rows(ctx0, k_cells, idx_stream);
+    ggml_tensor * v_sel = ggml_get_rows(ctx0, v_cells, idx_stream);
+
+    k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
+    v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
+
+    // gathering the attention mask at the selected cells leaves the same values the scan path
+    // would put there, so the window carries the reach of its query
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream);
+    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+
+    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
+            kq_mask->nb[0], kq_mask->nb[1], 0);
+
+    ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
+
+    ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
+    mask = ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q);
+
+    // the flash attention kernels pick their vector and GQA paths only when the K rows are a
+    // multiple of 256, so pad the window with zero rows that a -inf mask tail keeps out of the
+    // softmax. A masked pad row is exact: its logit never enters the maximum or the sum.
+    const int64_t width_pad = GGML_PAD(width, 256);
+    if (width_pad != width) {
+        const int64_t n_pad = width_pad - width;
+
+        k_sel = ggml_pad(ctx0, k_sel, 0, 0, n_pad, 0);
+        v_sel = ggml_pad(ctx0, v_sel, 0, 0, n_pad, 0);
+
+        ggml_tensor * mask_pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_pad, 1, 1, n_q);
+        mask_pad = ggml_fill(ctx0, mask_pad, -INFINITY);
+
+        mask = ggml_concat(ctx0, mask, mask_pad, 0);
     }
+    cb(k_sel, "qsa_k_sel", il);
+    cb(v_sel, "qsa_v_sel", il);
 
-    return cur;
+    mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+    cb(mask, "qsa_mask_sel", il);
+
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
