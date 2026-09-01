@@ -4224,6 +4224,18 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // stop at the first end-of-generation token. Anything the draft chained past
+                // it would be committed to the KV and recurrent state, and a recurrent model
+                // cannot trim it on the next turn (the ring is single-use), so that turn finds
+                // its prompt diverging inside the previous answer and re-prefills it whole
+                // (upstream #28049). The tail is at most n_draft - 1 tokens, within the ring.
+                for (size_t i = 0; i + 1 < accepted.size(); ++i) {
+                    if (llama_vocab_is_eog(vocab, accepted[i])) {
+                        accepted.resize(i + 1);
+                        break;
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
