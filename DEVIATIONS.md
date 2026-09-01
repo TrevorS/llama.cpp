@@ -127,6 +127,52 @@ first unused token from index 0 on every call over a batch sized by the whole
 prompt; `llm_graph_input_ple::set_input()` heap-allocated a 3-element vector inside
 its per-token loop. Both are O(n^2) in prompt length.
 
+**`77bb6a95b` — QSA attention gathers the selected cells at depth.** The masked
+scan read every K/V row of the cache in each of the 12 QSA layers per decode token
+(3.2 GB at 131k, an 11.8 ms floor before the kernel's own overhead; the CUDA mask
+skip is a suffix bound gated on `Q->ne[1] >= 1024`). `build_qsa_gather` gathers
+the 2051 selected rows per query, each query on the flash-attention stream axis
+with its own window and its mask gathered at the same cells, padded to 2304 rows
+with a -inf tail so the vector and GQA kernels stay eligible. Engages when
+`4*n_tps*width < n_kv`; `LLAMA_QWEN4EXP_QSA_GATHER=0` forces the scan, `=2` the
+gather. Shape after #27977, which upstream never resubmitted.
+
+**`fa7e7cf2c` — pooled indexer keys are cached in the indexer cache's V plane.**
+Every graph recomputed every block key (gather all raw keys, add, norm, rope over
+all blocks, x12 layers): 18-21 ms per token at 131k. The V plane, which scoring
+never reads, is retyped F32 with `idx_dim/ratio` per cell so a block's cells are
+one key row, and a graph pools only the blocks this ubatch wrote or whose row
+holds something else, or everything after a structural change (non-suffix
+`seq_rm`, `seq_cp`, shifts, restores, a stream with several sequences, 2d
+positions). Bit-identical to recomputing, checked by `test-qsa-pool-cache` on the
+generated model. The plane shrinks from 512 to 128 B per cell (1.5 GiB to 384 MiB
+at 262k). `LLAMA_QSA_POOL_CACHE=0` disables. The host `set_input_qsa` scan is
+still O(n_kv) per ubatch.
+
+**`35aee0e4c` — F32 weights stay on the mat-vec kernel up to batch 8.** Upstream
+hands F32 x F32 to cuBLAS sgemm from `ne11 == 4`, or to the TF32 mma path when
+`ne01 % 32 == 0`. On qwen4exp that is 216 latency-bound cuBLAS launches per
+speculative verify step (HC inject, shared-expert gate, delta-net alpha/beta) and
+a router computing its logits with 10-bit mantissas at widths 4..8 only. Same rule
+the mmvf batch-invariance pin applies, now on by default.
+
+**`aa5f5dda9` — the server stops accepting draft tokens past the first EOG.**
+Tokens chained past an end-of-generation stayed in the KV and recurrent state; a
+recurrent model cannot trim them on the next turn, so that turn re-prefilled the
+whole previous answer (upstream #28049). Not seen biting in our logs (the
+`<|im_end|>\n<|im_start|>` continuation extends the prefix), fixed anyway.
+
+**`d3ca42258` / `732b007f1` — the n-gram table gather runs on every thread, with the pages
+advised ahead.** The PLE gather never touches the GPU: `integrated` is hardcoded
+false on CUDA, `GET_ROWS` is never offloaded, and ggml-cpu pinned it to one task,
+so one thread demand-faulted the 28 GB mmap one 90-byte row at a time (every one
+of the live server's ~700k major faults sat on its main thread). A gather of
+4096 rows or more now uses all threads, and `set_input` hands the ubatch's pages
+to the kernel with `MADV_WILLNEED` first (`process_madvise` in batches, plain
+`madvise` fallback). Same bytes out; cold real-text prefill is the target, warm
+prefill and decode unchanged. `LLAMA_QWEN4EXP_PLE_PREFETCH=0` disables the
+advice. Upstream #28136 reaches the same place with a pread worker pool.
+
 ## Measured: what pays and what does not
 
 Ablation at two shapes, same config, one server boot per leg. Acceptance was
