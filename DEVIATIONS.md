@@ -91,13 +91,17 @@ a template branching on it never saw it.
 
 **`45703be51` — revert of upstream `257813839` (TENSOR_READ_LAZY handling).** It
 routes every lazily-read tensor to the generic CPU buffer type, which moves our
-28.8 GB `per_layer_token_embd` out of `CPU_Mapped` and schedules the per-layer PLE
-gathers on the CPU backend. GB10 reports
-`pageableMemoryAccessUsesHostPageTables=1`, so the GPU can read those mmap'd pages
-directly — forcing them to a plain CPU buffer costs **73% of llama-bench prefill**
-(812.70 -> 222.70 t/s) with the GPU at 31.5% busy and 22-38 W, clock unthrottled.
-The work is not slower, it is on the wrong device. Plausibly correct upstream for
-discrete GPUs; wrong for the only part we serve.
+28.8 GB `per_layer_token_embd` out of `CPU_Mapped`. Measured cost: **73% of
+llama-bench prefill** (812.70 -> 222.70 t/s) with the GPU at 31.5% busy and 22-38 W,
+clock unthrottled. The measurement stands; the explanation this entry used to give
+("the GPU reads the mmap'd pages directly, the CPU buffer puts the gather on the
+wrong device") is **wrong** and was corrected on 2026-09-01: `ggml-cuda.cu`
+hardcodes `integrated = false` on non-HIP, `GET_ROWS` has op-batch-size 0 so it is
+never offloaded, and the PLE gather runs on the CPU backend either way — on ONE
+thread (`ggml-cpu.c` pins `GET_ROWS` to `n_tasks = 1`), demand-faulting the mmap one
+row at a time. The live server's main thread carries every one of its ~700k major
+faults. Why the generic buffer is 4x worse than `CPU_Mapped` has not been
+re-diagnosed. See the PLE cold-prefill item in the 2026-09-01 decision.
 
 **`ec4d1e89f` — decode is exempt from the power duty cycle.** The firmware cap the
 throttle exists to dodge is a *prefill* effect; taxing decode too cost ~21% of tg
@@ -105,14 +109,13 @@ for no thermal benefit. Spans shorter than `GGML_CUDA_POWER_EXEMPT_MS` (250) acc
 no debt. Prefill still pays in full — verified by the `[cuda-power]` telemetry
 reporting 85.0% effective duty and zero exempt spans on a pp4096 run.
 
-**`37ac8c297` — qwen4exp joins the recurrent rollback allowlist.** It shares
-qwen35's GatedDeltaNet state and the same generic `build_rs` path but was missed in
-`llm_arch_supports_rs_rollback`, so `n_rs_seq` silently clamped to 0 and the server
-fell back to a full 112 MiB state snapshot to host on every speculative cycle.
-
-**`86b5fdc36` — the n-gram history scan is windowed.** `get_prev_tokens()` swept
-from position 0 to fill a `below` fallback that only an M-RoPE gap can reach; for a
-token ubatch it is O(context) per call for a value nothing reads.
+**Superseded by upstream at the 2026-09-01 rebase onto `3466812d1`, dropped from
+the branch:** `37ac8c297` (qwen4exp in `llm_arch_supports_rs_rollback`; the
+`LLAMA_QWEN4EXP_RS_ROLLBACK` env toggle went with it) and `f2580c704` (per-token
+conv-state snapshots for the ring) are upstream `0eadefebd` (#28123) line for line;
+`86b5fdc36`/`12030fe86` (windowed n-gram history scan, `LLAMA_KV_NGRAM_WINDOW`) is
+subsumed by upstream `b356fa262` (#28040), which makes the lookup O(log n) through a
+per-sequence position set.
 
 **`53eb047b6` — argsort prefers the capture-safe radix sort.** Upstream treats
 `DeviceSegmentedRadixSort` as the constrained fallback; on GB10 it is the faster
@@ -415,8 +418,8 @@ The three that are not obvious:
 - **The recurrent rollback ring is load-bearing at depth.** `qwen4exp` was missing
   from `llm_arch_supports_rs_rollback`, which silently forced a full state snapshot
   to host on every speculative cycle. Flat at 30-token prompts, **+45.9% tg and
-  +16.6% acceptance at 28k** (`37ac8c297`). Rule 2 in the flesh — shallow would
-  have argued for deleting it.
+  +16.6% acceptance at 28k** (`37ac8c297`, now upstream `0eadefebd`). Rule 2 in the
+  flesh — shallow would have argued for deleting it.
 - **Backend sampling is a loss here, and now we know why.** CUDA 13.0 ships CCCL
   3.0.1; `top-k.cu` needs CCCL >= 3.2 for a real `DeviceTopK`, so below that
   `ggml_top_k` falls back to "argsort + copy" — a top-k of 10 becomes a **full sort
@@ -470,9 +473,10 @@ The chain, from `SPEC_TRACE=1`:
 
 Chunk 1 is exact; chunk 2 already reaches 4.29 — a hard step, not accumulation.
 It is also not ours and not qwen4exp's: dense Ministral-3B on the same test
-gives 0.22 (Q4_K_M) and 0.38 (Q8_0). The three env-gated changes of our own that
-touch these paths (`LLAMA_KV_NGRAM_WINDOW`, `GGML_CUDA_ARGSORT_RADIX`,
-`LLAMA_BATCH_USED_LB`) are each bit-identical when disabled.
+gives 0.22 (Q4_K_M) and 0.38 (Q8_0). The env-gated changes of our own that
+touch these paths (`GGML_CUDA_ARGSORT_RADIX`, `LLAMA_BATCH_USED_LB`; the former
+`LLAMA_KV_NGRAM_WINDOW` scan is now upstream's #28040) are each bit-identical when
+disabled.
 
 (An earlier note here said "forcing MMQ changes nothing". Disregard it —
 `GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_FORCE_CUBLAS` are `#ifdef` build macros,
