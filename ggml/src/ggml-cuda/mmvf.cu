@@ -831,7 +831,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {
-                    return ne11 <= 3;
+                    // Fork: upstream hands F32 weights to cuBLAS sgemm (or, when ne01 is a
+                    // multiple of 32, to the TF32 mma path) from ne11 == 4. On qwen4exp the F32
+                    // weights are the tiny HC inject / shared-expert gate / ssm alpha,beta
+                    // matrices and the router, hit 216 times per speculative verify step of
+                    // width 4..8; keeping them on the mat-vec kernel avoids 216 latency-bound
+                    // cuBLAS launches and keeps the router on fp32 FMA at every width.
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
