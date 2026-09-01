@@ -83,20 +83,55 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+    // The pooled keys the scoring reads are cached: the indexer cache's V plane, which attention
+    // never reads, holds one finished block key (mean of the members, norm, rope) per complete
+    // block, as F32 [idx_dim] rows indexed by the compact block id. A graph pools only a window
+    // of blocks and set_rows them into the plane; the window is the blocks this ubatch completes
+    // or touches, or every block after a change the host tables cannot follow.
+    //   win_cells I32 [ratio*n_win, ns] member cells of each window block (pads repeat an entry)
+    //   win_pos   I32 [4*n_win*ns]      mrope position rows of each window block's first token
+    //   win_blk   I32 [n_win, ns]       row each window block is written to
+    // k_idxs is the ubatch's own cells (set_input_k_idxs must have run): a cell written now
+    // invalidates its block even when the same cells make it up, since its key changed.
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * bias,
+                       ggml_tensor * win_cells, ggml_tensor * win_pos, ggml_tensor * win_blk,
+                       const ggml_tensor * k_idxs,
+                       const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
+    // window slots the next graph needs: n_tps while the rows of every sequence in the ubatch
+    // are trusted, else every block. A graph shape parameter, so it is asked at build time
+    int64_t qsa_pool_n_win(const llama_ubatch & ubatch, uint32_t n_ns, int64_t n_blocks) const;
+
+    // 0 when the V plane does not hold pooled keys (unsupported ratio, or LLAMA_QSA_POOL_CACHE=0);
+    // every graph then pools every block into a window of its own and scores that directly
+    uint32_t qsa_pool_ratio() const { return pool_ratio; }
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // every pooled row of every sequence is repooled by its next graph
+    void qsa_pool_invalidate() const;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
+    // the common compress ratio of the indexer layers, set before mem_idx is built
+    uint32_t pool_ratio = 0;
+
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // what each pooled row of a sequence holds. Streams map one to one onto sequences when the
+    // cache is not unified, and a unified stream trusts its rows only while it holds one sequence
+    struct pool_seq {
+        bool dirty = true;             // repool everything at the next graph
+        int32_t n_valid = 0;           // rows [0, n_valid) may hold a key
+        std::vector<int32_t> pb;       // block index of the key each row holds, -1 for none
+        std::vector<int32_t> cells;    // its ratio member cells, in slot order
+    };
+    mutable std::vector<pool_seq> pool_rows;   // indexed by seq id
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -141,9 +176,13 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * bias,
+                       ggml_tensor * win_cells, ggml_tensor * win_pos, ggml_tensor * win_blk,
+                       const ggml_tensor * k_idxs,
+                       const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
+    int64_t  qsa_pool_n_win(const llama_ubatch & ubatch, int64_t n_blocks) const;
+    uint32_t qsa_pool_ratio() const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
