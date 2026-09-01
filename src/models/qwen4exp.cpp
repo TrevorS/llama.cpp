@@ -24,9 +24,9 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
-    // MTP: n_layer_nextn blocks past the trunk. A target GGUF advertises the key but ships no
-    // MTP tensors, so probe for eh_proj and clear it when absent (same guard as deepseek4).
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    // MTP: n_layer_nextn blocks past the trunk (the key itself is read by the base loader).
+    // A target GGUF advertises the key but ships no MTP tensors, so probe for eh_proj and
+    // clear it when absent (same guard as deepseek4).
     if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
@@ -34,7 +34,6 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
             hparams.n_layer_nextn = 0;
         }
     }
-    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
 
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
