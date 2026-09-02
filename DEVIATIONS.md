@@ -173,6 +173,24 @@ to the kernel with `MADV_WILLNEED` first (`process_madvise` in batches, plain
 prefill and decode unchanged. `LLAMA_QWEN4EXP_PLE_PREFETCH=0` disables the
 advice. Upstream #28136 reaches the same place with a pread worker pool.
 
+**`6bd7c7bd2` — the MTP draft attends sparse over its own indexer cache.** The
+reference MTP block is a QSA layer; ours attended dense over a plain KV cache, so
+at depth the draft saw the whole context where it was trained on a 2051-cell
+selection. The draft context now gets the hybrid wrapper with the indexer cache
+and a recurrent cache with no layers (which lets a sequence be cut anywhere, so
+rollback keeps working), and `graph_mtp` runs the trunk's QSA path. The draft
+file already carries the indexer tensors. `LLAMA_QWEN4EXP_MTP_QSA=0` restores the
+dense draft. Acceptance at depth is the measurement that decides the default.
+
+**`7706dc7b4` — QSA selects blocks first, then cells among them.** The single-stage
+selection expanded block scores to every cell and sorted n_kv entries per query,
+a cost and a surface (n_kv x n_tokens f32 at prefill) that grew with the context.
+Two stages: top-k of top_k/ratio + 2 blocks, gather their cells from a per-stream
+block table (the spare block carries the tail, pads marked -inf), then the final
+width over ~2056 candidates. Same selected set, checked by the new `.topk` output
+of `test-qsa-pool-cache`. Engaged at n_kv >= 8192 on single-sequence causal
+streams; `LLAMA_QSA_TWO_STAGE=0` disables, `=2` forces.
+
 ## Measured: what pays and what does not
 
 Ablation at two shapes, same config, one server boot per leg. Acceptance was
