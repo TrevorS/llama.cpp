@@ -900,6 +900,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_qsa_top_k()   const { return t_qsa_top_k; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -937,6 +938,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_qsa_top_k   = nullptr; // I32 [width, n_tokens] QSA selection of the last sparse layer (qsa_capture)
 
     // MTP fused chained-draft export: [K] f32 = drafted token id per chained
     // proposal row (see deepseek4.cpp MTP chain graph)

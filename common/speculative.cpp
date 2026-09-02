@@ -1465,6 +1465,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // stashing the batch rows; the next draft() decodes them fused with its seed row.
     // h pairing: stashed row 0 pairs with pend_h0, row j with verify_h row j-1.
     bool fuse_ingest = false;
+    bool index_share = false;
 
     std::vector<llama_tokens>       verify_tok; // [n_seq] stashed batch tokens (empty = no stash)
     std::vector<llama_pos>          pend_pos0;  // [n_seq] pos of stashed row 0
@@ -1535,6 +1536,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }();
 
         fuse_ingest = fuse_env && !chain_heads && !is_mem_shared;
+
+        // IndexShare: the chain steps attend the selection the seed decode made plus their
+        // own cells, instead of scoring the whole cache on every step. Default ON for a
+        // single sequence; LLAMA_MTP_INDEXSHARE=0 scores every step.
+        static const bool indexshare_env = [] {
+            const char * v = std::getenv("LLAMA_MTP_INDEXSHARE");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+
+        index_share = indexshare_env && n_seq == 1 && !chain_heads;
+
+        if (index_share) {
+            llama_set_qsa_capture(ctx_dft, true);
+        }
 
         // suffix-truncated ingest: a pure-SWA draft over raw KV rows only ever
         // reads the last n_swa rows, so ingesting a long span can skip
@@ -2062,6 +2077,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
 
+            // the seed decode scored the cache; the chain steps reuse its selection
+            if (index_share && i == 0) {
+                int32_t w = 0;
+                const int32_t * row = llama_get_qsa_top_k_ith(ctx_dft, i_last[0], &w);
+                if (row != nullptr && w > 0) {
+                    llama_set_qsa_reuse(ctx_dft, row, w);
+                }
+            }
+
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
@@ -2176,6 +2200,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (index_share) {
+            llama_set_qsa_reuse(ctx_dft, nullptr, 0); // every decode outside the chain scores
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

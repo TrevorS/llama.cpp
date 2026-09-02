@@ -2386,6 +2386,12 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // IndexShare: the one reuse input of a chain-step graph, and the pad bias its gathered
+        // window adds (-inf on slots past the reused cells)
+        class llm_graph_input_qsa_reuse;
+        llm_graph_input_qsa_reuse * qsa_reuse_inp = nullptr;
+        ggml_tensor * qsa_pad_bias = nullptr;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

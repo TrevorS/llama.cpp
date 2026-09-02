@@ -420,8 +420,10 @@ int64_t llama_memory_hybrid_idx::qsa_pool_n_win(const llama_ubatch & ubatch, uin
         }
     }
 
-    // n_tps tokens touch at most n_tps blocks, complete or not
-    return std::min<int64_t>(n_blocks, n_tps);
+    // n_tps tokens touch at most n_tps blocks, complete or not; a draft chain that reused
+    // a selection (IndexShare) wrote keys without pooling, so leave room for the blocks it
+    // completed as well
+    return std::min<int64_t>(n_blocks, n_tps + 8);
 }
 
 // LLAMA_QSA_POOL_TRACE=1 logs every window decision and fill: n_win against n_blocks, and

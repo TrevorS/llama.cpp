@@ -117,6 +117,10 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    void set_qsa_capture(bool value);
+    const int32_t * get_qsa_top_k_ith(int32_t i, int32_t * width);
+    void set_qsa_reuse(const int32_t * cells, int32_t n);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -300,6 +304,12 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // qwen4exp QSA selection capture and reuse (IndexShare), see llama-ext.h
+    std::vector<int32_t> qsa_top_k_buf;
+    int64_t qsa_top_k_width = 0;
+    int64_t qsa_top_k_rows  = 0;
+    std::vector<int32_t> qsa_reuse_cells;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
