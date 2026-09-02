@@ -191,6 +191,22 @@ width over ~2056 candidates. Same selected set, checked by the new `.topk` outpu
 of `test-qsa-pool-cache`. Engaged at n_kv >= 8192 on single-sequence causal
 streams; `LLAMA_QSA_TWO_STAGE=0` disables, `=2` forces.
 
+**`54b6a4da0` — SSE pings cover the wait for the first result.** The stream sent
+nothing until the first token, so a multi-minute prefill at depth looked like a dead
+connection to the client: all 28 cancels in the 2026-09-01 log fired at 292-300 s,
+each one a 134k-token re-prefill thrown away (26% of that day's wall). The first
+result now gets one ping interval; past it the headers go out and the existing
+`--sse-ping-interval` loop pings until it arrives. See "qwen4exp serving" for the
+checkpoint window that removes the re-prefill itself.
+
+**`93e512b57` — the pooled window is gated on real 2d positions.** `is_pos_2d()` is
+`n_pos >= 3`, true for every text batch of an mrope model, so the first GPU run of
+the pooled cache repooled everything on every graph and measured a null
+(10.73 vs 11.08 t/s at d131072). Only tokens whose position rows disagree are
+images. `LLAMA_QSA_POOL_TRACE=1` prints every window decision; the CPU model shows
+prefill windows of 8 and decode windows of 1 after the fix. Lesson: an env-gated
+fast path needs a trace of *which path ran* before its first benchmark.
+
 ## Measured: what pays and what does not
 
 Ablation at two shapes, same config, one server boot per leg. Acceptance was
@@ -469,6 +485,15 @@ listing now sorts a plain vector and builds the array afterwards.
 `serve-qwen` (in `~/bin`) is the validated recipe; every value in it was measured.
 The three that are not obvious:
 
+- **`--ctx-checkpoints 8 --checkpoint-min-step 16384 --cache-ram 0`** (2026-09-01 log
+  mine). pi compacts at 75% of the context and re-sends a prefix cut at the last user
+  message, ~56k behind the head; four checkpoints ~8-11k apart reach back ~35-40k, so
+  every such turn re-prefilled from the system prompt and pi's ~300 s timeout cancelled
+  it, eight cycles in 175 min. Eight checkpoints at >= 16k spacing reach ~131k for ~3 GB
+  host RAM at 200k (a checkpoint is ~1.35 KiB per token of depth). The host prompt cache
+  cannot hold a > 180k session (131k = 5.8 GB) and only serves slot switching, so it is
+  off. The log also shows acceptance FLAT with depth (0.78) with drafted length median
+  3.6, so `n_max 6` is not binding and `p_min 0.7` is.
 - **`-lm mmap --lazy-mode on` is mandatory.** The PLE is marked
   `TENSOR_READ_LAZY`, but `-lm auto` resolves to `none` on GB10, so the default
   loads all 26.82 GiB resident and lazy never fires. Confirm by host memory, not
