@@ -280,6 +280,22 @@ pool arm measured a null because `is_pos_2d()` is true for every mrope text batc
 because the n_kv-wide expand+sort also carried host and launch-gap cost the GPU sort
 share did not show.
 
+### Serving A/B at depth, speculation on (2026-09-01, real-text prompts through llama-server, warm rows)
+
+| arm | tg @37k | acc | tg @141k | acc | cold prefill 37k / 141k |
+| --- | --- | --- | --- | --- | --- |
+| old build | 36.5 | 0.73 | 20.0 | 0.67 | 224 / 202 |
+| new, sparse draft (default) | 36.5 | 0.82 | 30.5 | 0.72 | 488 / 312 |
+| new, dense draft | 34.0 | 0.72 | 31.2 | 0.66 | 491 / 311 |
+| new, gather + pool off | 34.4 | 0.73 | 22.5 | 0.67 | 486 / 308 |
+
+Decode at 141k +52% with speculation on; cold real-text prefill +54% to +118% from
+the PLE gather fix alone (the control arm keeps it); shallow decode unchanged. The
+sparse draft raises acceptance at every depth (+10 points at 37k, +7 at 141k) and its
+per-step indexer cost eats the gain at 141k (-2%, inside the floor) while paying at
+37k (+7%): it stays the default, and reusing the step-0 selection across the chain
+(IndexShare) is the follow-up that cashes the acceptance.
+
 ## Known debt
 
 **The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
