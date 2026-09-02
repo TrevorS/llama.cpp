@@ -4574,6 +4574,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 //                            GGML_CUDA_POWER_MIN (default 60) until the reason
 //                            has stayed clear for 10s (Linux only, dlopen NVML)
 //   GGML_CUDA_POWER_TEMP_MAX=C  additionally treat GPU temp >= C as distress.
+//   GGML_CUDA_POWER_SOC_MAX=C   additionally treat the hottest sysfs thermal zone >= C
+//                            as distress (release below C-5): the GB10 wedge is a
+//                            package event the GPU sensor does not see.
 //                            Throttle reasons are lagging -- the cap has already
 //                            engaged by the time they assert -- so this is the
 //                            leading tripwire. 0 (default) disables.
@@ -4742,6 +4745,38 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                       "is unavailable - temperature tripwire disabled\n", temp_max);
     }
 
+    // SoC tripwire (GGML_CUDA_POWER_SOC_MAX, degrees C; 0 = off). On GB10 the wedge is a
+    // package event: every recorded lockup sat at 94-98 C on the hottest thermal zone
+    // while the GPU sensor read 78-84, so the GPU temperature above cannot see it coming.
+    // The zones are read from sysfs, no NVML involved. Hysteresis of 5 C keeps a fill
+    // from flapping around the threshold: once engaged, the duty stays down until the
+    // package has cooled below max - 5 for the clear period.
+    const int soc_max = [] {
+        const char * e = getenv("GGML_CUDA_POWER_SOC_MAX");
+        return e ? atoi(e) : 0;
+    }();
+    auto read_soc_max_c = []() -> int {
+        int best = -1;
+        for (int z = 0; z < 32; ++z) {
+            char path[96];
+            snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", z);
+            FILE * f = fopen(path, "r");
+            if (f == nullptr) {
+                break;
+            }
+            long mc = -1;
+            if (fscanf(f, "%ld", &mc) == 1 && mc/1000 > best) {
+                best = (int) (mc/1000);
+            }
+            fclose(f);
+        }
+        return best;
+    };
+    if (soc_max > 0) {
+        GGML_LOG_INFO("ggml_cuda: SoC tripwire at %dC (release below %dC), hottest zone now %dC\n",
+                      soc_max, soc_max - 5, read_soc_max_c());
+    }
+
     bool engaged = false;
     auto last_set = std::chrono::steady_clock::now();
 
@@ -4765,6 +4800,13 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                     }
                 }
             }
+            int soc_c = -1;
+            bool soc_hot = false;
+            if (soc_max > 0) {
+                soc_c = read_soc_max_c();
+                soc_hot = soc_c >= (engaged ? soc_max - 5 : soc_max);
+                distress = distress || soc_hot;
+            }
             const auto now = std::chrono::steady_clock::now();
             if (distress) {
                 last_set = now;
@@ -4775,7 +4817,10 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                     // like a spurious engage otherwise, and the two have different meanings
                     // -- reasons are the firmware reacting, temperature is us getting ahead
                     // of it.
-                    if (reasons == 0 && temp_c >= temp_max) {
+                    if (reasons == 0 && soc_hot) {
+                        GGML_LOG_WARN("ggml_cuda: SoC %dC >= GGML_CUDA_POWER_SOC_MAX=%dC -> duty %d%%\n",
+                                      soc_c, soc_max, ps->min_pct);
+                    } else if (reasons == 0 && temp_c >= temp_max) {
                         GGML_LOG_WARN("ggml_cuda: GPU temp %dC >= GGML_CUDA_POWER_TEMP_MAX=%dC -> duty %d%%\n",
                                       temp_c, temp_max, ps->min_pct);
                     } else {
@@ -4786,7 +4831,7 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
             } else if (engaged && now - last_set > clear_period) {
                 engaged = false;
                 ps->cur_pct.store(ps->base_pct, std::memory_order_relaxed);
-                GGML_LOG_WARN("ggml_cuda: power throttle reason cleared -> duty %d%%\n", ps->base_pct);
+                GGML_LOG_WARN("ggml_cuda: power throttle cleared (SoC %dC) -> duty %d%%\n", soc_c, ps->base_pct);
             }
         }
         std::this_thread::sleep_for(poll_period);
