@@ -10,12 +10,12 @@ static __global__ void k_hc_scatter_add_f32(
         const float * __restrict__ block,
         const float * __restrict__ inject,
         float       * __restrict__ dst,
-        const int n_embd, const int hc, const float inv_hc) {
+        const int n_embd, const int hc, const int s_inj, const float inv_hc) {
 
     const int c = blockIdx.y;            // hyper-connection stream
     const int t = blockIdx.z;            // token
 
-    const float inj = inject[t*hc + c];
+    const float inj = inject[(long long) t*s_inj + c];
     const float w   = 2.0f / (1.0f + expf(-(inj * inv_hc)));
 
     const long long off_r = ((long long) t*hc + c) * n_embd;
@@ -37,7 +37,7 @@ void ggml_cuda_op_hc_scatter_add(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(residual));
     GGML_ASSERT(ggml_is_contiguous(block));
-    GGML_ASSERT(ggml_is_contiguous(inject));
+    GGML_ASSERT(inject->nb[0] == sizeof(float)); // rows may be strided (packed behind lo by the fused mix)
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     const int n_embd   = residual->ne[0];
@@ -54,5 +54,5 @@ void ggml_cuda_op_hc_scatter_add(ggml_backend_cuda_context & ctx, ggml_tensor * 
     k_hc_scatter_add_f32<<<grid, block_size, 0, ctx.stream()>>>(
         (const float *) residual->data, (const float *) block->data,
         (const float *) inject->data,   (float *) dst->data,
-        n_embd, hc, inv_hc);
+        n_embd, hc, (int) (inject->nb[1]/sizeof(float)), inv_hc);
 }

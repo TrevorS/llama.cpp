@@ -2125,6 +2125,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_hc_gate_mix(params, tensor);
             } break;
+        case GGML_OP_HC_MIX_DOWN:
+            {
+                ggml_compute_forward_hc_mix_down(params, tensor);
+            } break;
+        case GGML_OP_HC_MIX_UP:
+            {
+                ggml_compute_forward_hc_mix_up(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_PRE:
             {
                 ggml_compute_forward_dsv4_hc_pre(params, tensor);
@@ -2318,6 +2326,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_HC_SCATTER_ADD:
         case GGML_OP_HC_GATE_MIX:
+        case GGML_OP_HC_MIX_DOWN:
+        case GGML_OP_HC_MIX_UP:
             {
                 n_tasks = n_threads;
             } break;
