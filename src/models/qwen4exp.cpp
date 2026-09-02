@@ -370,6 +370,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         return e == nullptr || atoi(e) != 0;
     }();
 
+    // At decode widths the whole mix runs as two launches: the norm, the down projection with
+    // the injection folded in as extra columns, and the silu in one; the up projection, the
+    // sigmoid and the stream collapse in the other. Eight launches per layer become two, and
+    // the gated [hc*n_embd] intermediates never exist. The kernels dequantize the weights
+    // element-wise, so the dot products are float where the mat-vec path quantized the
+    // activation to Q8_1 -- a different rounding, gated by the PPL re-baseline.
+    // Prefill keeps the mat-mul path: the fused kernels stream the weights per token.
+    // GGML_QWEN4EXP_HC_MIX2=0 disables it.
+    static const int hc_mix2_max_tokens = [] {
+        const char * e = getenv("GGML_QWEN4EXP_HC_MIX2");
+        return e == nullptr ? 32 : atoi(e) == 1 ? 32 : atoi(e);
+    }();
+
+    auto hc_mix2_type_ok = [](const ggml_tensor * w) {
+        return w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q6_K;
+    };
+
+    if (hc_mix2_max_tokens > 0 && nt <= hc_mix2_max_tokens &&
+            hc_mix2_type_ok(w_down) && hc_mix2_type_ok(w_up) &&
+            (inject == nullptr || (w_inject != nullptr && w_inject->type == GGML_TYPE_F32)) &&
+            (loras == nullptr || loras->empty())) {
+        const int64_t lr = w_down->ne[1];
+
+        ggml_tensor * x2 = ggml_reshape_2d(ctx0, x, hc_dim, nt);
+
+        ggml_tensor * lo_inj = ggml_hc_mix_down(ctx0, x2, w_norm, w_down, inject ? w_inject : nullptr, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        cb(lo_inj, "hc_lo_inj", il);
+
+        ggml_tensor * lo = inject ? ggml_view_2d(ctx0, lo_inj, lr, nt, lo_inj->nb[1], 0) : lo_inj;
+
+        if (inject) {
+            *inject = ggml_view_2d(ctx0, lo_inj, hc, nt, lo_inj->nb[1], lr*ggml_element_size(lo_inj));
+            cb(*inject, "hc_inject", il);
+        }
+
+        ggml_tensor * mixed = ggml_hc_mix_up(ctx0, x2, w_norm, w_up, lo, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        cb(mixed, "hc_mixed", il);
+
+        return mixed;
+    }
+
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);

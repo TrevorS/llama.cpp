@@ -1082,10 +1082,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
-    "HC_SCATTER_ADD",
-    "HC_GATE_MIX",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "HC_SCATTER_ADD",
+    "HC_GATE_MIX",
+    "HC_MIX_DOWN",
+    "HC_MIX_UP",
 
     "UNARY",
 
@@ -1110,7 +1112,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_FA_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1206,10 +1208,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
-    "hc_scatter_add(residual, block, inject)",
-    "hc_gate_mix(x, gate)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "hc_scatter_add(residual, block, inject)",
+    "hc_gate_mix(x, gate)",
+    "hc_mix_down(x, gamma, w_down, w_inject)",
+    "hc_mix_up(x, gamma, w_up, lo)",
 
     "unary(x)",
 
@@ -1234,7 +1238,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_fa_merge(a,b)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6803,6 +6807,97 @@ struct ggml_tensor * ggml_hc_gate_mix(
     return result;
 }
 
+// ggml_hc_mix_down
+
+struct ggml_tensor * ggml_hc_mix_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_inject,
+        int                   hc,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t hc_dim   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t lr       = w_down->ne[1];
+
+    GGML_ASSERT(hc_dim % hc == 0);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(gamma) && gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim);
+    GGML_ASSERT(ggml_is_contiguous(w_down) && w_down->ne[0] == hc_dim && w_down->ne[2] == 1 && w_down->ne[3] == 1);
+    GGML_ASSERT(w_down->type == GGML_TYPE_F32 || w_down->type == GGML_TYPE_F16 || w_down->type == GGML_TYPE_Q8_0 || w_down->type == GGML_TYPE_Q6_K);
+    if (w_inject) {
+        GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(w_inject) && w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc && w_inject->ne[2] == 1 && w_inject->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr + (w_inject ? hc : 0), n_tokens);
+
+    int32_t params_i[1] = { hc };
+    ggml_set_op_params(result, params_i, sizeof(params_i));
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_HC_MIX_DOWN;
+    result->src[0] = x;
+    result->src[1] = gamma;
+    result->src[2] = w_down;
+    result->src[3] = w_inject;
+
+    return result;
+}
+
+// ggml_hc_mix_up
+
+struct ggml_tensor * ggml_hc_mix_up(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gamma,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * lo,
+        int                   hc,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(x->type     == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
+    GGML_ASSERT(lo->type    == GGML_TYPE_F32);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t hc_dim   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t lr       = w_up->ne[0];
+
+    GGML_ASSERT(hc_dim % hc == 0);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(gamma) && gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim);
+    GGML_ASSERT(ggml_is_contiguous(w_up) && w_up->ne[1] == hc_dim && w_up->ne[2] == 1 && w_up->ne[3] == 1);
+    GGML_ASSERT(w_up->type == GGML_TYPE_F32 || w_up->type == GGML_TYPE_F16 || w_up->type == GGML_TYPE_Q8_0 || w_up->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(lo->ne[0] == lr && lo->ne[1] == n_tokens && lo->ne[2] == 1 && lo->ne[3] == 1);
+    GGML_ASSERT(lo->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim / hc, n_tokens);
+
+    int32_t params_i[1] = { hc };
+    ggml_set_op_params(result, params_i, sizeof(params_i));
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+
+    result->op     = GGML_OP_HC_MIX_UP;
+    result->src[0] = x;
+    result->src[1] = gamma;
+    result->src[2] = w_up;
+    result->src[3] = lo;
+
+    return result;
+}
+
 // ggml_hc_scatter_add
 
 struct ggml_tensor * ggml_hc_scatter_add(
@@ -6825,7 +6920,7 @@ struct ggml_tensor * ggml_hc_scatter_add(
     GGML_ASSERT(inject->ne[0] == hc      && inject->ne[1] == n_tokens && inject->ne[2] == 1 && inject->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(residual));
     GGML_ASSERT(ggml_is_contiguous(block));
-    GGML_ASSERT(ggml_is_contiguous(inject));
+    GGML_ASSERT(inject->nb[0] == sizeof(float)); // rows may be strided: the fused mix packs it behind lo
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
 

@@ -6,6 +6,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/hc-scatter-add.cuh"
 #include "ggml-cuda/hc-gate-mix.cuh"
+#include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -2446,6 +2447,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_HC_GATE_MIX:
             ggml_cuda_op_hc_gate_mix(ctx, dst);
+            break;
+        case GGML_OP_HC_MIX_DOWN:
+            ggml_cuda_op_hc_mix_down(ctx, dst);
+            break;
+        case GGML_OP_HC_MIX_UP:
+            ggml_cuda_op_hc_mix_up(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_PRE:
             ggml_cuda_op_dsv4_hc_pre(ctx, dst);
@@ -6171,6 +6178,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // two sources only -- src[2] is null here, unlike the three-source HC ops below
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_HC_MIX_DOWN:
+        case GGML_OP_HC_MIX_UP:
+            {
+                const ggml_type wt = op->src[2]->type;
+                return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    (wt == GGML_TYPE_F32 || wt == GGML_TYPE_F16 || wt == GGML_TYPE_Q8_0 || wt == GGML_TYPE_Q6_K) &&
+                    (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32);
+            }
         case GGML_OP_HC_SCATTER_ADD:
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
