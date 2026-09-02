@@ -2309,13 +2309,14 @@ struct test_get_rows : public test_case {
     const int be1; // batch size
     const int be2; // batch size
     const bool v; // view (non-contiguous src1)
+    const ggml_type type_out; // F32, or F16 for an F16/F32 source
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n, m, r, be1, be2, v);
+        return VARS_TO_STR8(type, n, m, r, be1, be2, v, type_out);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, ggml_type type_out = GGML_TYPE_F32)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), type_out(type_out) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
@@ -2328,13 +2329,13 @@ struct test_get_rows : public test_case {
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = ggml_is_matrix(in) && ggml_is_vector(rows);
+        const bool grad_supported = ggml_is_matrix(in) && ggml_is_vector(rows) && type_out == GGML_TYPE_F32;
         if (grad_supported) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
         }
 
-        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_tensor * out = type_out == GGML_TYPE_F32 ? ggml_get_rows(ctx, in, rows) : ggml_get_rows_type(ctx, in, rows, type_out);
         ggml_set_name(out, "out");
 
         return out;
@@ -9220,6 +9221,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // F16 results: F16 rows gathered unchanged, F32 rows rounded; the wide case is a QSA window
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 256,    5,    4, 1, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 512, 1024, 2304, 2, 1, false, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 256,    5,    4, 3, 1, true,  GGML_TYPE_F16));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256,    5,    4, 1, 1, false, GGML_TYPE_F16));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -10746,6 +10752,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
 
     test_cases.emplace_back(new test_pad());
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F16));
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F16, {256, 2051, 2, 1}, 0, 253, false)); // a QSA window padded to 2304 rows
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular
     test_cases.emplace_back(new test_pad_ext());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 1, 1, 1}, 1, 0, false));

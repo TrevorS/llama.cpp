@@ -1689,6 +1689,13 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // same as ggml_get_rows with the result in `type`: F32, F16, or I32 for an I32 source
+    GGML_API struct ggml_tensor * ggml_get_rows_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b,  // row indices
+            enum   ggml_type      type);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
