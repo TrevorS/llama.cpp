@@ -68,7 +68,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         uint32_t ratio = 0;
         bool uniform = true;
 
-        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        // n_layer_all: an MTP draft's only indexer layer sits past the trunk
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
             if (!filter_idx(il)) {
                 continue;
             }

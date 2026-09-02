@@ -76,6 +76,10 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // false when no layer passed the filter: a cache of cells alone, whose sequences can be
+    // cut anywhere because there is no state to un-summarise (an MTP draft over a hybrid)
+    bool has_state = false;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build

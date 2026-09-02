@@ -2427,11 +2427,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
+                // qwen4exp's MTP block is a QSA layer in the reference: give the draft the
+                // indexer cache too, in the hybrid wrapper with no recurrent layers
+                const bool mtp_qsa_qwen4exp =
+                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                    hparams.indexer_head_size > 0 && llama_model_qwen4exp::mtp_qsa_enabled();
+
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_QWEN4EXP  || arch == LLM_ARCH_BAILINGMOE3);
+                     (arch == LLM_ARCH_QWEN4EXP && !mtp_qsa_qwen4exp) || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2465,6 +2471,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
+                    } else if (mtp_qsa_qwen4exp) {
+                        // the MTP block alone: the dense-attention layers past the trunk, no state
+                        filter_attn = [&](uint32_t il) {
+                            return il >= hparams.n_layer();
+                        };
+                        filter_recr = [](uint32_t) {
+                            return false;
+                        };
+                        filter_idx = filter_attn;
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
