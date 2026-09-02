@@ -706,6 +706,66 @@ public:
     const bool blk_bias;
 };
 
+// IndexShare: a chain step of the MTP draft attends the cells its step 0 selected plus the
+// chain's own cells. The context hands over the captured selection; each step appends its
+// own cell for the steps after it. Slots past the used cells repeat the first cell and
+// carry -inf in the pad bias, so the gathered window never counts them.
+class llama_model_qwen4exp::graph::llm_graph_input_qsa_reuse : public llm_graph_input_i {
+public:
+    llm_graph_input_qsa_reuse(const llama_memory_hybrid_idx_context * mctx, std::vector<int32_t> * reuse, int64_t width)
+        : mctx(mctx), reuse(reuse), width(width) {}
+    virtual ~llm_graph_input_qsa_reuse() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->n_tokens == 1);
+        GGML_ASSERT(ggml_backend_buffer_is_host(cells->buffer) && ggml_backend_buffer_is_host(pad->buffer));
+
+        mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+
+        const int32_t cur = ((const int32_t *) k_idxs->data)[0];
+
+        int32_t * dst_cells = (int32_t *) cells->data;
+        float   * dst_pad   = (float   *) pad->data;
+
+        int64_t n = 0;
+        for (const int32_t c : *reuse) {
+            if (n >= width) {
+                break;
+            }
+            dst_cells[n] = c;
+            dst_pad[n]   = 0.0f;
+            n++;
+        }
+        if (n < width) {
+            dst_cells[n] = cur;
+            dst_pad[n]   = 0.0f;
+            n++;
+        }
+        for (int64_t w = n; w < width; ++w) {
+            dst_cells[w] = dst_cells[0];
+            dst_pad[w]   = -INFINITY;
+        }
+
+        // the steps after this one attend this token too
+        reuse->push_back(cur);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        return mctx->get_idx() != nullptr && params.ubatch.n_tokens == 1 &&
+               params.cparams.qsa_reuse == reuse && reuse != nullptr && !reuse->empty();
+    }
+
+    ggml_tensor * k_idxs = nullptr;   // I32 [1]
+    ggml_tensor * cells  = nullptr;   // I32 [width]
+    ggml_tensor * pad    = nullptr;   // F32 [width]
+
+    const llama_memory_hybrid_idx_context * mctx;
+    std::vector<int32_t> * reuse;
+    const int64_t width;
+};
+
 // Two-stage selection: top-k over the blocks, then top-k over the cells of the chosen blocks.
 // The candidate list is ~ratio*(top_k/ratio + 2) cells instead of n_kv, so the sort no longer
 // scales with the context, and the per-cell score surface (n_kv x n_tokens) is never built.
@@ -761,6 +821,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // ropes n_blocks rows per layer per token. The finished keys live in the indexer cache's
     // V plane instead, and a graph pools only a window: the blocks this ubatch completes or
     // touches (n_tps at most), or every block after a change the memory could not follow.
+    // IndexShare (MTP draft chain steps): attend the captured selection instead of scoring.
+    // The raw key of this token is still written, so the next full selection sees it.
+    if (cparams.qsa_reuse != nullptr && !cparams.qsa_reuse->empty() && n_tps == 1 && n_stream == 1) {
+        const int64_t width_r = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1 + cparams.qsa_reuse_extra);
+
+        if (qsa_reuse_inp == nullptr) {
+            auto inp_r = std::make_unique<llm_graph_input_qsa_reuse>(mctx_hyb, cparams.qsa_reuse, width_r);
+
+            inp_r->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+            inp_r->cells  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, width_r);
+            inp_r->pad    = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, width_r);
+            ggml_set_input(inp_r->cells);
+            ggml_set_input(inp_r->pad);
+
+            qsa_reuse_inp = inp_r.get();
+            res->add_input(std::move(inp_r));
+        }
+
+        ggml_tensor * k_raw_r = build_lora_mm(model.layers[il].index_k_proj, cur);
+        k_raw_r = ggml_reshape_3d(ctx0, k_raw_r, idx_dim, 1, n_tokens);
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw_r, qsa_reuse_inp->k_idxs, il));
+
+        qsa_pad_bias = ggml_reshape_4d(ctx0, qsa_reuse_inp->pad, width_r, 1, 1, 1);
+
+        ggml_tensor * sel = ggml_reshape_4d(ctx0, qsa_reuse_inp->cells, width_r, 1, 1, 1);
+        cb(sel, "indexer_top_k_reuse", il);
+
+        return sel;
+    }
+
     const bool    pool  = mctx_hyb->qsa_pool_ratio() == (uint32_t) r;
     const int64_t n_win = mctx_hyb->qsa_pool_n_win(ubatch, n_blocks);
 
@@ -960,6 +1050,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
     }
 
+    // the draft context exports its selection for the chain steps to reuse (IndexShare)
+    if (cparams.qsa_capture) {
+        ggml_set_output(top_k);
+        res->t_qsa_top_k = top_k;
+    }
+
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
     cb(top_k, "indexer_top_k", il);
@@ -1146,6 +1242,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
     mask = ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q);
+
+    // a reused selection carries pad slots that repeat a real cell: their bias is -inf
+    if (qsa_pad_bias != nullptr) {
+        mask = ggml_add(ctx0, mask, qsa_pad_bias);
+        qsa_pad_bias = nullptr;
+    }
 
     // the flash attention kernels pick their vector and GQA paths only when the K rows are a
     // multiple of 256, so pad the window with zero rows that a -inf mask tail keeps out of the

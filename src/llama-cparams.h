@@ -21,6 +21,13 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // qwen4exp QSA selection sharing across an MTP draft chain (IndexShare): the draft's
+    // step-0 selection is exported (qsa_capture) and, on the chain steps, attended in place
+    // of a fresh scoring (qsa_reuse: the captured cells, then the chain's own cells)
+    bool qsa_capture = false;
+    std::vector<int32_t> * qsa_reuse = nullptr;
+    int32_t qsa_reuse_extra = 8;
+
     float rope_freq_base;
     float rope_freq_scale;
 
