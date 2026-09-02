@@ -670,8 +670,7 @@ public:
         const int64_t n_win = res ? mctx->qsa_pool_n_win(params.ubatch, n_blocks) : 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
+        res &= cell_blk == nullptr || (cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_stream);
         res &= win_cells->ne[0] == (int64_t) ratio*n_win;
         res &= win_cells->ne[1] == n_stream;
         res &= win_pos->ne[0]   == 4*n_win*n_stream;
@@ -683,6 +682,7 @@ public:
         const bool two_stage = res && llama_model_qwen4exp::graph::qsa_two_stage(mctx, params.ubatch, blk_bias, n_kv);
 
         res &= (blk_cells != nullptr) == two_stage;
+        res &= (cell_blk == nullptr) == two_stage;
         res &= blk_cells == nullptr || (blk_cells->ne[0] == (int64_t) ratio*(n_blocks + 1) && blk_cells->ne[1] == n_stream);
 
         return res;
@@ -785,7 +785,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        // two-stage never expands block scores to cells, and an input no node reads has no memory
+        qsa->cell_blk  = two_stage ? nullptr : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->win_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_win, n_stream);
         qsa->win_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_win*n_stream);
         // an input no node reads gets no memory, so the row map exists only with the plane
@@ -799,7 +800,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->blk_pad);
         }
 
-        ggml_set_input(qsa->cell_blk);
+        if (!two_stage) {
+            ggml_set_input(qsa->cell_blk);
+        }
         ggml_set_input(qsa->win_cells);
         ggml_set_input(qsa->win_pos);
         if (pool) {

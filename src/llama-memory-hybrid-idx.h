@@ -97,10 +97,11 @@ public:
     //   blk_cells I32 [ratio*(n_blocks+1), ns] member cells of each block, then the spare block's
     //   blk_pad   F32 [ratio*(n_blocks+1), ns] 0 for a real cell, -inf for a pad slot
     // both are null when the graph selects over every cell
+    // cell_blk is null when the graph never expands block scores to cells (two-stage)
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * bias,
                        ggml_tensor * win_cells, ggml_tensor * win_pos, ggml_tensor * win_blk,
                        ggml_tensor * blk_cells, ggml_tensor * blk_pad,
-                       const ggml_tensor * k_idxs,
+                       const ggml_tensor * k_idxs, int64_t n_kv,
                        const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
 
     // every stream of the ubatch holds one sequence on plain positions: block-level selection
