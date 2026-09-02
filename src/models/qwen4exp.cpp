@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -1015,7 +1016,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // =2 forces the gather wherever flash attention allows it (tests, shallow parity runs).
     static const int qsa_gather = []() {
         const char * e = getenv("LLAMA_QWEN4EXP_QSA_GATHER");
-        return e == nullptr ? 1 : atoi(e);
+        if (e != nullptr) {
+            return atoi(e);
+        }
+        // the batch-invariance pins make a verify batch bit-identical to single-token decode;
+        // the gathered FA batches the verify queries on the stream axis, and that kernel is
+        // not the decode kernel (measured 0.5-0.9 max|dlogit| under the pins), so the pins
+        // win by default: the masked scan stays exact under them
+        const char * bi = getenv("GGML_CUDA_BATCH_INVARIANT");
+        return bi != nullptr && strcmp(bi, "0") != 0 ? 0 : 1;
     }();
 
     const bool gather = cparams.flash_attn && (qsa_gather == 2 || (qsa_gather != 0 && 4*n_tps*width < n_kv));
