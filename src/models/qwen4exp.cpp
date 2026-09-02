@@ -910,9 +910,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         GGML_ASSERT(inp->blk_cells != nullptr && blk_bias);
 
         const int64_t n_q   = n_tps*n_stream;
-        const int64_t k_blk = std::min<int64_t>(n_blocks, (int64_t) hparams.indexer_top_k/r + 2);
+        // top_k/r whole blocks, the block the query sits in (its earlier cells are visible),
+        // the spare block carrying the tail, and one more so the final width is always met
+        const int64_t k_blk = std::min<int64_t>(n_blocks, (int64_t) hparams.indexer_top_k/r + 3);
 
-        // stage 1: the blocks. the spare block carries the tail at 1e9, so it is always in
+        // stage 1: the blocks. blocks after the query are -inf in the bias, the spare block
+        // carries the tail at 1e9, so it is always in
         ggml_tensor * sel_blk = ggml_cont(ctx0, ggml_top_k(ctx0, score, k_blk));   // I32 [k_blk, n_tps, n_stream]
         cb(sel_blk, "indexer_sel_blk", il);
 

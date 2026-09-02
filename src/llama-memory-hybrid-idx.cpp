@@ -912,7 +912,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
+                    // a block that starts after the query is future in every cell: the cell
+                    // mask hides it anyway, and a block-level pick (two-stage) must not spend
+                    // a candidate slot on it in place of a visible block
+                    if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id) || bid_idx[b] > q) {
                         cur_blk_bias[b] = -INFINITY;
                         continue;
                     }
