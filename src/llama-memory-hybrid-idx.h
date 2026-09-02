@@ -93,10 +93,19 @@ public:
     //   win_blk   I32 [n_win, ns]       row each window block is written to
     // k_idxs is the ubatch's own cells (set_input_k_idxs must have run): a cell written now
     // invalidates its block even when the same cells make it up, since its key changed.
+    // Two-stage selection (qwen4exp phase 2) picks blocks first and cells among them:
+    //   blk_cells I32 [ratio*(n_blocks+1), ns] member cells of each block, then the spare block's
+    //   blk_pad   F32 [ratio*(n_blocks+1), ns] 0 for a real cell, -inf for a pad slot
+    // both are null when the graph selects over every cell
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * bias,
                        ggml_tensor * win_cells, ggml_tensor * win_pos, ggml_tensor * win_blk,
+                       ggml_tensor * blk_cells, ggml_tensor * blk_pad,
                        const ggml_tensor * k_idxs,
                        const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
+    // every stream of the ubatch holds one sequence on plain positions: block-level selection
+    // and the pooled rows both rely on that
+    bool qsa_single_seq(const llama_ubatch & ubatch, uint32_t n_ns) const;
 
     // window slots the next graph needs: n_tps while the rows of every sequence in the ubatch
     // are trusted, else every block. A graph shape parameter, so it is asked at build time
@@ -178,9 +187,11 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * bias,
                        ggml_tensor * win_cells, ggml_tensor * win_pos, ggml_tensor * win_blk,
+                       ggml_tensor * blk_cells, ggml_tensor * blk_pad,
                        const ggml_tensor * k_idxs,
                        const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
 
+    bool     qsa_single_seq(const llama_ubatch & ubatch) const;
     int64_t  qsa_pool_n_win(const llama_ubatch & ubatch, int64_t n_blocks) const;
     uint32_t qsa_pool_ratio() const;
 
