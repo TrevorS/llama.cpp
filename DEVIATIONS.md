@@ -311,6 +311,29 @@ per-step indexer cost eats the gain at 141k (-2%, inside the floor) while paying
 | selection identity, gather vs scan | 1% of lines (rounding cascade), logits 1.30 / 3 flips |
 | selection identity, two-stage vs single | differed from the engagement step: prefill queries lost visible blocks to their ubatch's own future blocks -> causal block bias (`8ae27d3cb`), rerun queued |
 
+### n_max sweep at depth (2026-09-02, server, sparse draft, warm reps)
+
+| n_max | tg @37k | acc | tg @141k | acc |
+| --- | --- | --- | --- | --- |
+| 4 | 37.9 / 38.5 | 0.78 | 31.6 / 33.0 | 0.77-0.78 |
+| **5** | **40.5 / 41.8** | 0.78 | **32.1 / 33.4** | 0.71 |
+| 6 | 36.3 / 36.4 | 0.82 | 30.9 / 32.2 | 0.72-0.74 |
+| 7 | 39.7 | 0.72 | (box wedged during its 141k prefill) | |
+
+Single legs, so the 37k spread is at the edge of the floor, but 5 leads at both depths
+and 6 trails at both: the serving default moves to `NMAX=5`. Drafted length was median
+3.6 in the logs, so 5 loses nothing there.
+
+### Wedge, 2026-09-02 01:02: the deep-fill rule was not applied to the harnesses
+
+Eight 141k-token prefills at P85 in one night, the last four at the new build's 311 t/s,
+and the journal stopped mid-prefill with no OOM and no Xid: the pattern-8 USB-C PD wedge
+from the crash notes, which already said deep fills need P70 and a SoC abort. Any
+harness that prefills past ~30k must run `GGML_CUDA_POWER=70` and the SoC-temperature
+abort from `experiments/gb10-thermal/soak.sh`; the faster prefill raises sustained draw,
+so the old P85 margin is gone. Lost with `/tmp`: the harness scripts, nsys traces and
+the gate-3 selection dumps; every result was already recorded above.
+
 ## Known debt
 
 **The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
