@@ -4,9 +4,13 @@
 // decodes that complete a block every ratio steps, rollbacks inside the recurrent ring
 // that reuse cells, and wider batches that pool several blocks at once.
 //
-//   LLAMA_QSA_POOL_CACHE=1 test-qsa-pool-cache model.gguf on.bin  [n_ubatch] [n_ctx] [n_prompt]
-//   LLAMA_QSA_POOL_CACHE=0 test-qsa-pool-cache model.gguf off.bin [n_ubatch] [n_ctx] [n_prompt]
+//   LLAMA_QSA_POOL_CACHE=1 test-qsa-pool-cache model.gguf on.bin  [n_ubatch] [n_ctx] [n_prompt] [n_repeat]
+//   LLAMA_QSA_POOL_CACHE=0 test-qsa-pool-cache model.gguf off.bin [n_ubatch] [n_ctx] [n_prompt] [n_repeat]
 //   cmp on.bin off.bin
+//
+// n_repeat > 1 runs the schedule again in a fresh context of the same process (out.bin.2,
+// ...): a second context inherits whatever the first left in freed device memory, which a
+// fresh process never sees.
 //
 // The two files must be identical: every pooled row is a per-row computation on the same
 // cached keys, so caching it cannot change a bit.
@@ -85,6 +89,13 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
 
+    // LLAMA_QSA_LAZY=on|auto|off: the lazy tensor mode (the PLE table read through the mmap on
+    // demand), which the exactness test runs with on
+    if (const char * lz = getenv("LLAMA_QSA_LAZY")) {
+        mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
+        mparams.lazy_mode = strcmp(lz, "on") == 0 ? LLAMA_LAZY_MODE_ON : strcmp(lz, "auto") == 0 ? LLAMA_LAZY_MODE_AUTO : LLAMA_LAZY_MODE_OFF;
+    }
+
     llama_model * model = llama_model_load_from_file(model_path, mparams);
     if (model == nullptr) {
         fprintf(stderr, "failed to load %s\n", model_path);
@@ -93,6 +104,16 @@ int main(int argc, char ** argv) {
 
     topk_capture cap;
     cap.out = fopen((std::string(out_path) + ".topk").c_str(), "w");
+
+    const int n_repeat = argc > 6 ? std::max(1, atoi(argv[6])) : 1;
+
+    const std::string out_base = out_path;
+
+    for (int rep = 1; rep <= n_repeat; ++rep) {
+    const std::string out_rep = rep == 1 ? out_base : out_base + "." + std::to_string(rep);
+    out_path = out_rep.c_str();
+    cap.out = rep == 1 ? cap.out : fopen((std::string(out_path) + ".topk").c_str(), "w");
+    cap.step = 0;
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = n_ctx;
@@ -123,7 +144,26 @@ int main(int argc, char ** argv) {
 
     uint32_t rng = 12345;
 
+    // LLAMA_QSA_PROMPT_TEXT=<text>: the prompt is that text tokenized and then continued
+    // with period 17, the way test-spec-decode-exactness builds its prompt; a periodic prompt
+    // makes whole blocks identical, which random tokens never do
+    std::vector<llama_token> text_toks;
+    if (const char * txt = getenv("LLAMA_QSA_PROMPT_TEXT")) {
+        text_toks.resize(strlen(txt) + 16);
+        const int n = llama_tokenize(vocab, txt, (int32_t) strlen(txt), text_toks.data(), (int32_t) text_toks.size(), true, true);
+        GGML_ASSERT(n > 0);
+        text_toks.resize(n);
+        while ((int) text_toks.size() < n_prompt + 200) {
+            text_toks.push_back(text_toks[text_toks.size() % 17]);
+        }
+    }
+
+    size_t n_text_used = 0;
+
     auto next_tok = [&]() {
+        if (!text_toks.empty()) {
+            return text_toks[n_text_used++ % text_toks.size()];
+        }
         rng = rng*1664525u + 1013904223u;
         return (llama_token) ((rng >> 8) % n_vocab);
     };
@@ -135,6 +175,11 @@ int main(int argc, char ** argv) {
     size_t n_rows = 0;
 
     // a long prompt keeps only its last logit row; the batch may exceed n_batch and is split
+    // LLAMA_QSA_ALL_LOGITS=1 requests a logit row for every prompt token, as
+    // test-spec-decode-exactness does (its 9000-token prefill fills a 9 GB output buffer);
+    // only the last row is written to the file either way
+    static const bool all_logits = getenv("LLAMA_QSA_ALL_LOGITS") != nullptr && atoi(getenv("LLAMA_QSA_ALL_LOGITS")) != 0;
+
     auto decode = [&](const std::vector<llama_token> & toks) {
         const bool last_only = toks.size() > 64;
 
@@ -150,7 +195,7 @@ int main(int argc, char ** argv) {
                 batch.pos[j]       = pos + (llama_pos) (off + i);
                 batch.n_seq_id[j]  = 1;
                 batch.seq_id[j][0] = 0;
-                batch.logits[j]    = !last_only || off + i + 1 == toks.size();
+                batch.logits[j]    = all_logits || !last_only || off + i + 1 == toks.size();
             }
 
             cap.step++;
@@ -161,7 +206,7 @@ int main(int argc, char ** argv) {
             }
 
             for (int j = 0; j < batch.n_tokens; ++j) {
-                if (!batch.logits[j]) {
+                if (!batch.logits[j] || (last_only && off + j + 1 != toks.size())) {
                     continue;
                 }
 
@@ -233,6 +278,8 @@ int main(int argc, char ** argv) {
 
     llama_batch_free(batch);
     llama_free(ctx);
+    } // rep
+
     llama_model_free(model);
     llama_backend_free();
 
