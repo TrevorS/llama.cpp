@@ -340,8 +340,27 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+// an mrope model carries several position rows for every token, so llama_ubatch::is_pos_2d
+// says nothing about images; an image is a token whose rows disagree (its height and width
+// positions differ from its temporal one), and only those make the block ranking unstable
+static bool qsa_ubatch_has_2d(const llama_ubatch & ubatch) {
+    if (ubatch.n_pos < 3 || ubatch.pos == nullptr) {
+        return false;
+    }
+
+    const int64_t n = ubatch.n_tokens;
+
+    for (int64_t i = 0; i < n; ++i) {
+        if (ubatch.pos[i + n] != ubatch.pos[i] || ubatch.pos[i + 2*n] != ubatch.pos[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool llama_memory_hybrid_idx::qsa_single_seq(const llama_ubatch & ubatch, uint32_t n_ns) const {
-    if (mem_idx == nullptr || ubatch.is_pos_2d()) {
+    if (mem_idx == nullptr || qsa_ubatch_has_2d(ubatch)) {
         return false;
     }
 
@@ -371,7 +390,7 @@ bool llama_memory_hybrid_idx::qsa_single_seq(const llama_ubatch & ubatch, uint32
 
 int64_t llama_memory_hybrid_idx::qsa_pool_n_win(const llama_ubatch & ubatch, uint32_t n_ns, int64_t n_blocks) const {
     // 2d positions are ranked, and ranks shift with every insertion: never trusted
-    if (pool_ratio == 0 || ubatch.is_pos_2d()) {
+    if (pool_ratio == 0 || qsa_ubatch_has_2d(ubatch)) {
         return n_blocks;
     }
 
@@ -405,6 +424,13 @@ int64_t llama_memory_hybrid_idx::qsa_pool_n_win(const llama_ubatch & ubatch, uin
     return std::min<int64_t>(n_blocks, n_tps);
 }
 
+// LLAMA_QSA_POOL_TRACE=1 logs every window decision and fill: n_win against n_blocks, and
+// how many blocks were actually stale
+static bool qsa_pool_trace() {
+    static const bool on = getenv("LLAMA_QSA_POOL_TRACE") != nullptr && atoi(getenv("LLAMA_QSA_POOL_TRACE")) != 0;
+    return on;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * bias,
@@ -414,6 +440,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pad,
         const ggml_tensor * k_idxs,
+        int64_t n_kv,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
@@ -421,12 +448,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(get_mem_idx() != nullptr);
     GGML_ASSERT((blk_cells == nullptr) == (blk_pad == nullptr));
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(cell_blk == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(k_idxs->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_ns     = win_cells->ne[1];       // streams in this ubatch
     const int64_t r        = ratio;
+
+    GGML_ASSERT(cell_blk == nullptr || (cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns));
     const int64_t n_blocks = (n_kv + r - 1)/r;
     const int64_t n_win    = win_cells->ne[0]/r;
     const int64_t n_tokens = ubatch->n_tokens;
@@ -441,7 +469,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
     float   * dst_bias      = (float   *) bias->data;
     int32_t * dst_win_cells = (int32_t *) win_cells->data;
     int32_t * dst_win_pos   = (int32_t *) win_pos->data;
@@ -493,7 +521,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_win_cells = dst_win_cells + s*(r*n_win);
         int32_t * cur_win_blk   = dst_win_blk != nullptr ? dst_win_blk + s*n_win : nullptr;
 
@@ -673,7 +701,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 bid_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (cur_cell_blk != nullptr) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
         }
 
         // the block table for two-stage selection: every complete block's cells, then the spare
@@ -743,6 +773,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                 GGML_ASSERT(full || !ps->dirty);
             }
+
+            // a ranking that appeared without a 2d ubatch (it cannot, by construction) would
+            // move every row; refuse loudly rather than pool a stale window
+            GGML_ASSERT((full || !ranked) && "qsa: ranked positions in a windowed graph");
 
             int64_t n_stale = 0;
 
@@ -815,6 +849,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         dst_win_pos[sec*(n_win*n_ns) + s*n_win + w] = pad_pos[sec];
                     }
                 }
+            }
+
+            if (qsa_pool_trace()) {
+                LLAMA_LOG_INFO("qsa-pool: seq %d n_tokens %" PRId64 " n_kv %" PRId64 " n_blocks %" PRId64 " n_bid %d n_win %" PRId64 " stale %" PRId64 " full %d dirty %d\n",
+                        (int) seq_of_stream, n_tokens, n_kv, n_blocks, n_bid, n_win, n_stale, full ? 1 : 0, ps != nullptr && ps->dirty ? 1 : 0);
             }
 
             if (ps != nullptr) {
@@ -1007,7 +1046,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, bias, win_cells, win_pos, win_blk, blk_cells, blk_pad, k_idxs, ubatch, ratio, blk_bias);
+    GGML_ASSERT(get_idx() != nullptr);
+
+    mem->set_input_qsa(cell_blk, bias, win_cells, win_pos, win_blk, blk_cells, blk_pad, k_idxs, get_idx()->get_n_kv(), ubatch, ratio, blk_bias);
 }
 
 bool llama_memory_hybrid_idx_context::qsa_single_seq(const llama_ubatch & ubatch) const {
