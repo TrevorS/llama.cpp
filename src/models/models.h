@@ -2317,6 +2317,15 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
+    public:
+        // two-stage selection (blocks, then their cells) applies to this ubatch; the QSA graph
+        // input asks it too, to keep the decision part of the graph shape
+        static bool qsa_two_stage(
+        const llama_memory_hybrid_idx_context * mctx_hyb,
+                     const llama_ubatch & ubatch,
+                                   bool   blk_bias,
+                                int64_t   n_kv);
+
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
         // trunk-skipping ctor: graph_mtp builds only the MTP block, not the 48 trunk layers
