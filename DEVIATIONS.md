@@ -296,6 +296,21 @@ per-step indexer cost eats the gain at 141k (-2%, inside the floor) while paying
 37k (+7%): it stays the default, and reusing the step-0 selection across the chain
 (IndexShare) is the follow-up that cashes the acceptance.
 
+### Gates after the 2026-09-01 rebase + depth stack (build-next, GB10)
+
+| gate | result |
+| --- | --- |
+| `test-llama-archs -a qwen4exp` | OK, GB10 8.88e-08 / CPU 0.00e+00 |
+| backend-ops | 14739/14739 (was 13919; upstream added cases) |
+| DS4 PPL | **6.0827 +/- 0.10676** vs the 6.0735 anchor: inside the bar, not exact; the fusion-off run (upstream `3466812d1` fused MoE reduction is FMA-contracted) is queued to attribute it |
+| exactness, unpinned | [det]/[ckpt] 0; [shape]/[roll] 4.37, 3/64 flips (was 4.62, 2/21) |
+| exactness, pinned | [shape]/[roll] **0, 0/64** with pooled keys + two-stage in the tree |
+| exactness, pinned + gather forced | 0.92 / 0.52, 0 flips: the ne3-batched verify FA is not the decode FA, so the gather now defers to the pins (`c611cdac5`) |
+| rollback test, real model | stops at the known dirty-ctx stale-ring case (recorded, unreachable in serving) |
+| selection identity at 16k, pooled on vs off | **identical, 218,196 lines, logits max 0** |
+| selection identity, gather vs scan | 1% of lines (rounding cascade), logits 1.30 / 3 flips |
+| selection identity, two-stage vs single | differed from the engagement step: prefill queries lost visible blocks to their ubatch's own future blocks -> causal block bias (`8ae27d3cb`), rerun queued |
+
 ## Known debt
 
 **The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
