@@ -4039,6 +4039,98 @@ struct test_hc_gate_mix : public test_case {
     }
 };
 
+// GGML_OP_HC_MIX_DOWN
+struct test_hc_mix_down : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t lr;
+    const int64_t n_tokens;
+    const bool inject;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX_DOWN";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_w, n_embd, hc, lr, n_tokens, inject);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_hc_mix_down(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 2560, int64_t hc = 4, int64_t lr = 320, int64_t n_tokens = 5, bool inject = true)
+        : type_w(type_w), n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens), inject(inject) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc*n_embd);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_w, hc*n_embd, lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_inject = inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, hc) : nullptr;
+        if (w_inject) {
+            ggml_set_name(w_inject, "w_inject");
+        }
+
+        ggml_tensor * out = ggml_hc_mix_down(ctx, x, gamma, w_down, w_inject, (int) hc, 1e-6f, 1.0f/(float) hc);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_HC_MIX_UP
+struct test_hc_mix_up : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t lr;
+    const int64_t n_tokens;
+    const bool strided;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX_UP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_w, n_embd, hc, lr, n_tokens, strided);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_hc_mix_up(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 2560, int64_t hc = 4, int64_t lr = 320, int64_t n_tokens = 5, bool strided = true)
+        : type_w(type_w), n_embd(n_embd), hc(hc), lr(lr), n_tokens(n_tokens), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc*n_embd);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, type_w, lr, hc*n_embd);
+        ggml_set_name(w_up, "w_up");
+
+        // the graph hands lo over as the first lr rows of the down output, so test that stride
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, lr + (strided ? hc : 0), n_tokens);
+        ggml_set_name(lo, "lo");
+        if (strided) {
+            lo = ggml_view_2d(ctx, lo, lr, n_tokens, lo->nb[1], 0);
+            ggml_set_name(lo, "lo_view");
+        }
+
+        ggml_tensor * out = ggml_hc_mix_up(ctx, x, gamma, w_up, lo, (int) hc, 1e-6f, 1.0f/(float) hc);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_HC_SCATTER_ADD
 struct test_hc_scatter_add : public test_case {
     const int64_t n_embd;
@@ -9160,6 +9252,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 17));
     test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 512));
     test_cases.emplace_back(new test_hc_gate_mix(1024, 2, 33));
+
+    for (ggml_type tw : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_hc_mix_down(tw, 2560, 4, 320, 1, true));
+        test_cases.emplace_back(new test_hc_mix_down(tw, 2560, 4, 320, 6, true));
+        test_cases.emplace_back(new test_hc_mix_down(tw, 2560, 4, 320, 3, false));
+        test_cases.emplace_back(new test_hc_mix_up(tw, 2560, 4, tw == GGML_TYPE_Q6_K ? 256 : 320, 1, true));
+        test_cases.emplace_back(new test_hc_mix_up(tw, 2560, 4, tw == GGML_TYPE_Q6_K ? 256 : 320, 6, true));
+        test_cases.emplace_back(new test_hc_mix_up(tw, 2560, 4, tw == GGML_TYPE_Q6_K ? 256 : 320, 2, false));
+    }
+    test_cases.emplace_back(new test_hc_mix_down(GGML_TYPE_Q8_0, 512, 2, 64, 4, true));
+    test_cases.emplace_back(new test_hc_mix_up(GGML_TYPE_Q8_0, 512, 2, 64, 4, true));
     test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 1));
     test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 17));
     test_cases.emplace_back(new test_hc_scatter_add(2560, 4, 512));

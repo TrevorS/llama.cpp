@@ -576,6 +576,8 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_HC_SCATTER_ADD,
         GGML_OP_HC_GATE_MIX,
+        GGML_OP_HC_MIX_DOWN,
+        GGML_OP_HC_MIX_UP,
 
         GGML_OP_UNARY,
 
@@ -2815,6 +2817,36 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             int                   hc,
+            float                 scale);
+
+    // The whole hyper-connection mix in two launches, for small token counts. Both ops apply
+    // the grouped RMSNorm themselves: xn[e,t] = x[e,t] * rrms[c(e),t] * gamma[e], the rms over
+    // one stream of n_embd, gamma over the full hc*n_embd row.
+    //   down: dst[j,t] = j <  lr : silu(scale * sum_e xn[e,t] * w_down[e,j])
+    //                    j >= lr : sum_e xn[e,t] * w_inject[e,j-lr]          (the raw injection)
+    //     x [hc*n_embd, nt] F32, gamma [hc*n_embd] F32, w_down [hc*n_embd, lr] F32/F16/Q8_0/Q6_K,
+    //     w_inject [hc*n_embd, hc] F32 or NULL  ->  [lr (+hc), nt] F32
+    GGML_API struct ggml_tensor * ggml_hc_mix_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_inject,
+            int                   hc,
+            float                 eps,
+            float                 scale);
+
+    //   up:   dst[e,t] = scale * sum_c xn[e + c*n_embd, t] * sigmoid(sum_l lo[l,t] * w_up[l, e + c*n_embd])
+    //     x [hc*n_embd, nt] F32, gamma [hc*n_embd] F32, w_up [lr, hc*n_embd] F32/F16/Q8_0/Q6_K,
+    //     lo [lr, nt] F32 (rows may be strided)  ->  [n_embd, nt] F32
+    GGML_API struct ggml_tensor * ggml_hc_mix_up(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gamma,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * lo,
+            int                   hc,
+            float                 eps,
             float                 scale);
 
     // custom operators

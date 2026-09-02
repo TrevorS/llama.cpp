@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
+#include <vector>
 #include <set>
 
 // ggml_compute_forward_dup
@@ -11632,6 +11634,159 @@ void ggml_compute_forward_hc_gate_mix(
     }
 }
 
+// ggml_compute_forward_hc_mix_down / ggml_compute_forward_hc_mix_up
+//
+// The reference for the fused hyper-connection mix. The grouped RMSNorm is recomputed per
+// token, each weight column (down) or row (up) is dequantized whole with the type's to_float,
+// and every dot product runs left to right so the CUDA kernels have a fixed order to match.
+
+// one weight row as floats: F32 rows are copied, everything else goes through the type's to_float
+static void hc_mix_load_row(const ggml_tensor * w, int64_t i, float * out, int64_t n) {
+    const char * src = (const char *) w->data + i*w->nb[1];
+    if (w->type == GGML_TYPE_F32) {
+        memcpy(out, src, n*sizeof(float));
+    } else {
+        ggml_get_type_traits(w->type)->to_float(src, out, n);
+    }
+}
+
+static void hc_mix_rrms(const float * x, int64_t n_embd, int hc, float eps, float * rrms) {
+    for (int c = 0; c < hc; ++c) {
+        const float * xs = x + c*n_embd;
+        float s = 0.0f;
+        for (int64_t e = 0; e < n_embd; ++e) {
+            s += xs[e]*xs[e];
+        }
+        rrms[c] = 1.0f / sqrtf(s / (float) n_embd + eps);
+    }
+}
+
+static void ggml_compute_forward_hc_mix_down_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * gamma    = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_inject = dst->src[3];
+
+    const int     hc     = ggml_get_op_params_i32(dst, 0);
+    const float   eps    = ggml_get_op_params_f32(dst, 1);
+    const float   scale  = ggml_get_op_params_f32(dst, 2);
+    const int64_t hc_dim = x->ne[0];
+    const int64_t n_embd = hc_dim / hc;
+    const int64_t nt     = x->ne[1];
+    const int64_t lr     = w_down->ne[1];
+    const int64_t n_col  = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // columns are split across threads: each column is one long dot product per token
+    const int64_t dc = (n_col + nth - 1) / nth;
+    const int64_t c0 = dc * ith;
+    const int64_t c1 = MIN(c0 + dc, n_col);
+
+    std::vector<float> col(hc_dim);
+    std::vector<float> rrms(hc);
+
+    for (int64_t j = c0; j < c1; ++j) {
+        if (j < lr) {
+            hc_mix_load_row(w_down, j, col.data(), hc_dim);
+        } else {
+            memcpy(col.data(), (const char *) w_inject->data + (j - lr)*w_inject->nb[1], hc_dim*sizeof(float));
+        }
+
+        for (int64_t t = 0; t < nt; ++t) {
+            const float * xr = (const float *) ((const char *) x->data + t*x->nb[1]);
+            const float * g  = (const float *) gamma->data;
+
+            hc_mix_rrms(xr, n_embd, hc, eps, rrms.data());
+
+            float acc = 0.0f;
+            for (int64_t e = 0; e < hc_dim; ++e) {
+                acc += xr[e]*rrms[e / n_embd]*g[e] * col[e];
+            }
+
+            float * d = (float *) ((char *) dst->data + t*dst->nb[1]);
+            if (j < lr) {
+                const float v = acc*scale;
+                d[j] = v / (1.0f + expf(-v));
+            } else {
+                d[j] = acc;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_hc_mix_up_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * gamma = dst->src[1];
+    const ggml_tensor * w_up  = dst->src[2];
+    const ggml_tensor * lo    = dst->src[3];
+
+    const int     hc     = ggml_get_op_params_i32(dst, 0);
+    const float   eps    = ggml_get_op_params_f32(dst, 1);
+    const float   scale  = ggml_get_op_params_f32(dst, 2);
+    const int64_t hc_dim = x->ne[0];
+    const int64_t n_embd = hc_dim / hc;
+    const int64_t nt     = x->ne[1];
+    const int64_t lr     = w_up->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t de = (n_embd + nth - 1) / nth;
+    const int64_t e0 = de * ith;
+    const int64_t e1 = MIN(e0 + de, n_embd);
+
+    std::vector<float> row(lr);
+    std::vector<float> rrms(hc);
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const float * xr = (const float *) ((const char *) x->data  + t*x->nb[1]);
+        const float * lr_= (const float *) ((const char *) lo->data + t*lo->nb[1]);
+        const float * g  = (const float *) gamma->data;
+
+        hc_mix_rrms(xr, n_embd, hc, eps, rrms.data());
+
+        float * d = (float *) ((char *) dst->data + t*dst->nb[1]);
+
+        for (int64_t e = e0; e < e1; ++e) {
+            float acc = 0.0f;
+            for (int c = 0; c < hc; ++c) {
+                const int64_t i = c*n_embd + e;
+
+                hc_mix_load_row(w_up, i, row.data(), lr);
+
+                float gsum = 0.0f;
+                for (int64_t l = 0; l < lr; ++l) {
+                    gsum += lr_[l]*row[l];
+                }
+                const float gate = 1.0f / (1.0f + expf(-gsum));
+
+                acc += xr[i]*rrms[c]*g[i] * gate;
+            }
+            d[e] = acc*scale;
+        }
+    }
+}
+
+void ggml_compute_forward_hc_mix_down(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_hc_mix_down_f32(params, dst);
+}
+
+void ggml_compute_forward_hc_mix_up(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_hc_mix_up_f32(params, dst);
+}
+
 // ggml_compute_forward_hc_scatter_add
 
 static void ggml_compute_forward_hc_scatter_add_f32(
@@ -11662,7 +11817,7 @@ static void ggml_compute_forward_hc_scatter_add_f32(
         const int64_t c = i % hc;
         const int64_t t = i / hc;
 
-        const float   inj = ((const float *) inject->data)[t*hc + c];
+        const float   inj = *(const float *) ((const char *) inject->data + t*inject->nb[1] + c*sizeof(float));
         const float   w   = 2.0f / (1.0f + expf(-(inj * inv_hc)));
 
         const float * res_row = (const float *) ((const char *) residual->data + c*residual->nb[1] + t*residual->nb[2]);
