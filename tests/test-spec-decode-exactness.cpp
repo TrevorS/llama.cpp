@@ -497,7 +497,7 @@ int main(int argc, char ** argv) {
                 if (ctx == nullptr) {
                     exit(1);
                 }
-                if (dst_mode > 0 && !decode_span(ctx, other, 0, n_dirty)) {
+                if (dst_mode > 0 && !decode_span(ctx, other, 0, n_dirty, false)) {
                     exit(1);
                 }
                 if (dst_mode == 2 &&
@@ -568,7 +568,7 @@ int main(int argc, char ** argv) {
             if (ctx == nullptr) {
                 exit(1);
             }
-            if (dst_mode == 1 && !decode_span(ctx, other, 0, n_dirty)) {
+            if (dst_mode == 1 && !decode_span(ctx, other, 0, n_dirty, false)) {
                 exit(1);
             }
             ckpt.load_tgt(ctx, 0, 0);
