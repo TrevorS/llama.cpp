@@ -814,6 +814,21 @@ public:
 // the spare block is exactly the tail, and a context deep enough that every query of the
 // ubatch sees more than top_k/ratio complete blocks: then the final selection never reaches
 // a pad slot. LLAMA_QSA_TWO_STAGE=0 keeps the single-stage path, =2 forces it (tests).
+// CUDA's GGML_OP_TOP_K runs CUB's DeviceTopK with determinism not guaranteed, and the candidates
+// of the second stage carry exact ties by construction (the cells of a block share its score).
+// LLAMA_QSA_TOPK_SORT=1 selects through a full argsort instead: past 1024 columns that is CUB's
+// radix sort, which is stable, so equal scores fall to the lower index. It was tried against the
+// context-dependent width-1 result of the deep exactness test and changed nothing there, so it
+// stays opt-in until a tie is shown to matter.
+static ggml_tensor * qsa_top_k(ggml_context * ctx, ggml_tensor * scores, int64_t k) {
+    static const bool sort = [] {
+        const char * e = getenv("LLAMA_QSA_TOPK_SORT");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    return sort ? ggml_argsort_top_k(ctx, scores, (int) k) : ggml_top_k(ctx, scores, (int) k);
+}
+
 bool llama_model_qwen4exp::graph::qsa_two_stage(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         const llama_ubatch & ubatch,
@@ -1047,7 +1062,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // stage 1: the blocks. blocks after the query are -inf in the bias, the spare block
         // carries the tail at 1e9, so it is always in
-        ggml_tensor * sel_blk = ggml_cont(ctx0, ggml_top_k(ctx0, score, k_blk));   // I32 [k_blk, n_tps, n_stream]
+        ggml_tensor * sel_blk = ggml_cont(ctx0, qsa_top_k(ctx0, score, k_blk));   // I32 [k_blk, n_tps, n_stream]
         cb(sel_blk, "indexer_sel_blk", il);
 
         // each query's score of the blocks it chose: rows of size 1 make get_rows a per-query gather
@@ -1068,7 +1083,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cand_score = ggml_reshape_2d(ctx0, cand_score, r*k_blk, n_q);
         cb(cand_score, "indexer_score_cand", il);
 
-        ggml_tensor * sel_c = ggml_cont(ctx0, ggml_top_k(ctx0, cand_score, width));   // I32 [width, n_q]
+        ggml_tensor * sel_c = ggml_cont(ctx0, qsa_top_k(ctx0, cand_score, width));   // I32 [width, n_q]
 
         // back to cell ids
         ggml_tensor * cand_rows = ggml_view_3d(ctx0, cand_cells, 1, r*k_blk, n_q, cand_cells->nb[0], ggml_row_size(cand_cells->type, r*k_blk), 0);
@@ -1088,7 +1103,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
         cb(expanded, "indexer_score_tokens", il);
 
-        top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+        top_k = ggml_cont(ctx0, qsa_top_k(ctx0, expanded, width));
     }
 
     // the draft context exports its selection for the chain steps to reuse (IndexShare)

@@ -135,11 +135,14 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     return llama_init_from_model(model, cparams);
 }
 
-// decode [pos0, pos0 + n) requesting logits for every token
-static bool decode_span(llama_context * ctx, const std::vector<llama_token> & toks, uint32_t pos0, uint32_t n) {
+// decode [pos0, pos0 + n) requesting logits for every token, or only the last one: a prefill
+// only needs the last, and a span of more than INT32_MAX/n_vocab rows (8648 at 248320) makes
+// the CUDA output path write past its tensor (illegal access, or silent corruption of whatever
+// sits next to it, which showed as a width-1 path that differed between two fresh contexts)
+static bool decode_span(llama_context * ctx, const std::vector<llama_token> & toks, uint32_t pos0, uint32_t n, bool logits_all = true) {
     llama_batch batch = llama_batch_init(n, 0, 1);
     for (uint32_t i = 0; i < n; ++i) {
-        common_batch_add(batch, toks[pos0 + i], (llama_pos) (pos0 + i), { 0 }, true);
+        common_batch_add(batch, toks[pos0 + i], (llama_pos) (pos0 + i), { 0 }, logits_all || i + 1 == n);
     }
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
@@ -251,7 +254,7 @@ int main(int argc, char ** argv) {
     const auto run_ar = [&]() {
         run_t out(n_tok);
         llama_context * ctx = make_ctx(params, model, cfg);
-        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre)) {
+        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre, false)) {
             fprintf(stderr, "%s : baseline prefill failed\n", __func__);
             exit(1);
         }
@@ -271,7 +274,7 @@ int main(int argc, char ** argv) {
     const auto run_chunked = [&]() {
         run_t out(n_tok);
         llama_context * ctx = make_ctx(params, model, cfg);
-        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre)) {
+        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre, false)) {
             exit(1);
         }
         for (uint32_t i = 0; i < n_tok; i += chunk) {
@@ -296,7 +299,7 @@ int main(int argc, char ** argv) {
     const auto run_rollback = [&](bool accept_one) {
         run_t out(n_tok);
         llama_context * ctx = make_ctx(params, model, cfg);
-        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre)) {
+        if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre, false)) {
             exit(1);
         }
         uint32_t i = 0, round = 0;
@@ -356,7 +359,7 @@ int main(int argc, char ** argv) {
         const auto capture = [&](uint32_t n) {
             g_trace.clear();
             llama_context * ctx = make_ctx(params, model, cfg);
-            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre)) {
+            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre, false)) {
                 exit(1);
             }
             g_trace_on = true;
@@ -470,12 +473,12 @@ int main(int argc, char ** argv) {
                 }
                 if (src_mode == 0) {
                     // saved from a settled state
-                    if (!decode_span(ctx, toks, 0, n_pre)) {
+                    if (!decode_span(ctx, toks, 0, n_pre, false)) {
                         exit(1);
                     }
                 } else {
                     // saved while a rollback is pending: the live state is in a snapshot plane
-                    if (!decode_span(ctx, toks, 0, n_pre + n_back) ||
+                    if (!decode_span(ctx, toks, 0, n_pre + n_back, false) ||
                         !llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) n_pre, -1)) {
                         fprintf(stderr, "%s : could not save from a rollback plane\n", __func__);
                         exit(1);
@@ -540,7 +543,7 @@ int main(int argc, char ** argv) {
         run_t ref;
         {
             llama_context * ctx = make_ctx(params, model, cfg);
-            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre + n_back)) {
+            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre + n_back, false)) {
                 exit(1);
             }
             ckpt.update_tgt(ctx, 0, 0);
@@ -602,7 +605,7 @@ int main(int argc, char ** argv) {
         printf("\n  rollback deeper than the last ubatch\n");
         for (uint32_t r = 1; r <= std::min(n_rs_seq, n_tok - 1); ++r) {
             llama_context * ctx = make_ctx(params, model, cfg);
-            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre)) {
+            if (ctx == nullptr || !decode_span(ctx, toks, 0, n_pre, false)) {
                 exit(1);
             }
             for (uint32_t i = 0; i < r; ++i) {           // r single-token decodes
