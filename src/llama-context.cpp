@@ -1197,6 +1197,36 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_qsa_capture(bool value) {
+    cparams.qsa_capture = value;
+
+    // the exported selection has to be part of the worst-case allocation, as the
+    // nextn export is, or a graph-shape change recycles its memory
+    sched_need_reserve = true;
+}
+
+const int32_t * llama_context::get_qsa_top_k_ith(int32_t i, int32_t * width) {
+    synchronize();
+
+    if (qsa_top_k_width == 0 || i < 0 || i >= qsa_top_k_rows) {
+        if (width != nullptr) {
+            *width = 0;
+        }
+        return nullptr;
+    }
+
+    if (width != nullptr) {
+        *width = (int32_t) qsa_top_k_width;
+    }
+
+    return qsa_top_k_buf.data() + (size_t) i * qsa_top_k_width;
+}
+
+void llama_context::set_qsa_reuse(const int32_t * cells, int32_t n) {
+    qsa_reuse_cells.assign(cells, cells + (n > 0 ? n : 0));
+    cparams.qsa_reuse = n > 0 ? &qsa_reuse_cells : nullptr;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1814,6 +1844,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    qsa_top_k_rows = 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1974,6 +2006,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+            }
+        }
+
+        // the QSA selection of the last sparse layer, one row per ubatch token (IndexShare)
+        if (cparams.qsa_capture) {
+            ggml_tensor * t_sel = res->get_qsa_top_k();
+
+            if (t_sel != nullptr) {
+                ggml_backend_t backend_s = ggml_backend_sched_get_tensor_backend(sched.get(), t_sel);
+                GGML_ASSERT(backend_s != nullptr);
+
+                const int64_t width = t_sel->ne[0];
+                const int64_t rows  = ggml_nelements(t_sel)/width;
+                const int64_t off   = qsa_top_k_rows;
+
+                qsa_top_k_width = width;
+                qsa_top_k_buf.resize((size_t) (off + rows)*width);
+
+                ggml_backend_tensor_get_async(backend_s, t_sel, qsa_top_k_buf.data() + off*width, 0, rows*width*sizeof(int32_t));
+
+                qsa_top_k_rows = off + rows;
             }
         }
 
@@ -3951,6 +4004,18 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+void llama_set_qsa_capture(llama_context * ctx, bool value) {
+    ctx->set_qsa_capture(value);
+}
+
+const int32_t * llama_get_qsa_top_k_ith(llama_context * ctx, int32_t i, int32_t * width) {
+    return ctx->get_qsa_top_k_ith(i, width);
+}
+
+void llama_set_qsa_reuse(llama_context * ctx, const int32_t * cells, int32_t n) {
+    ctx->set_qsa_reuse(cells, n);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

@@ -107,6 +107,15 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// qwen4exp QSA selection sharing across an MTP draft chain (IndexShare).
+// capture: the last sparse layer's selection is exported per decoded token;
+// get: row i of the last decode (width cells), valid until the next decode;
+// reuse: chain steps attend these cells plus their own instead of scoring
+// (n = 0 clears). Single-sequence contexts only.
+LLAMA_API void llama_set_qsa_capture(struct llama_context * ctx, bool value);
+LLAMA_API const int32_t * llama_get_qsa_top_k_ith(struct llama_context * ctx, int32_t i, int32_t * width);
+LLAMA_API void llama_set_qsa_reuse(struct llama_context * ctx, const int32_t * cells, int32_t n);
+
 // True when every layer of the context's model is standard sliding-window
 // attention over raw KV rows: swa_type == STANDARD, is_swa on every layer, and
 // no layer carries a DSV4 compressor ring (all compress ratios are 0). Under
