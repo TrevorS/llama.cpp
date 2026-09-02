@@ -377,10 +377,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // element-wise, so the dot products are float where the mat-vec path quantized the
     // activation to Q8_1 -- a different rounding, gated by the PPL re-baseline.
     // Prefill keeps the mat-mul path: the fused kernels stream the weights per token.
-    // GGML_QWEN4EXP_HC_MIX2=0 disables it.
+    // Off by default: measured on GB10 (llama-bench tg64, P70) the two launches lose to the
+    // eight -- 16.4 vs 21.6 t/s at d0 with the thread-per-row up kernel, 17.9 after the
+    // warp-cooperative rewrite -- because the mat-vec kernels they replace are the tuned ones
+    // and the launch floor they save is smaller than the bandwidth they waste. Opt in with
+    // GGML_QWEN4EXP_HC_MIX2=1 (or =<n> for a token bound).
     static const int hc_mix2_max_tokens = [] {
         const char * e = getenv("GGML_QWEN4EXP_HC_MIX2");
-        return e == nullptr ? 32 : atoi(e) == 1 ? 32 : atoi(e);
+        return e == nullptr ? 0 : atoi(e) == 1 ? 32 : atoi(e);
     }();
 
     auto hc_mix2_type_ok = [](const ggml_tensor * w) {

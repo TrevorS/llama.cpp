@@ -134,8 +134,13 @@ static __global__ void k_hc_mix_down(
     }
 }
 
-#define HC_MIX_UP_BLOCK 64
+#define HC_MIX_UP_WARPS 8
+#define HC_MIX_UP_BLOCK (HC_MIX_UP_WARPS*WARP_SIZE)
 
+// one warp per output e: the lanes stride the lr-long rows of w_up so consecutive lanes read
+// consecutive quantized bytes (a thread-per-row layout read the 3.5 MB of weights at a
+// 340-byte stride across the warp and cost 24% of decode), and the dot is a warp reduction
+// in a fixed order, so it still does not depend on the token count
 template <typename T>
 static __global__ void k_hc_mix_up(
         const float * __restrict__ x,
@@ -146,8 +151,10 @@ static __global__ void k_hc_mix_up(
         const int hc_dim, const int n_embd, const int hc, const int lr, const int s_lo,
         const float eps, const float scale) {
 
-    const int t = blockIdx.y;
-    const int e = blockIdx.x*HC_MIX_UP_BLOCK + threadIdx.x;
+    const int t    = blockIdx.y;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int e    = blockIdx.x*HC_MIX_UP_WARPS + warp;
 
     extern __shared__ float lo_s[];
     __shared__ float rrms[GGML_HC_MIX_MAX_HC];
@@ -169,14 +176,19 @@ static __global__ void k_hc_mix_up(
         const int64_t i = (int64_t) c*n_embd + e;
 
         float g = 0.0f;
-        for (int l = 0; l < lr; ++l) {
+        for (int l = lane; l < lr; l += WARP_SIZE) {
             g += lo_s[l] * hc_w<T>::get(w_up, i*lr + l);
         }
+        g = warp_reduce_sum(g);
+
         const float gate = 1.0f / (1.0f + expf(-g));
 
         acc += xt[i]*rrms[c]*gamma[i] * gate;
     }
-    dst[(long long) t*n_embd + e] = acc*scale;
+
+    if (lane == 0) {
+        dst[(long long) t*n_embd + e] = acc*scale;
+    }
 }
 
 void ggml_cuda_op_hc_mix_down(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -238,7 +250,7 @@ void ggml_cuda_op_hc_mix_up(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
     GGML_ASSERT(hc <= GGML_HC_MIX_MAX_HC);
 
-    dim3 grid((n_embd + HC_MIX_UP_BLOCK - 1)/HC_MIX_UP_BLOCK, nt, 1);
+    dim3 grid((n_embd + HC_MIX_UP_WARPS - 1)/HC_MIX_UP_WARPS, nt, 1);
     const size_t smem = lr*sizeof(float);
 
 #define HC_MIX_UP_LAUNCH(T) \
