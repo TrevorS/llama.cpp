@@ -258,6 +258,28 @@ across fresh contexts on both qwen4exp and Ministral-3B, `max|dlogit| = 0`. What
 is *not* stable is the same prompt run twice through the speculative server, and
 that is a property of the server loop, not of the model math.
 
+### QSA at depth, measured (2026-09-01, build-next, llama-bench tg64 @ d131072, no spec)
+
+| arm | t/s | vs baseline |
+| --- | --- | --- |
+| baseline (masked FA, repool every graph, cell-level top-k) | 11.08 +/- 0.37 | -- |
+| gather only | 12.31 +/- 0.28 | +11% |
+| pooled keys + two-stage, no gather | 15.95 +/- 0.14 | +44% |
+| gather + pooled keys, two-stage off | 16.92 +/- 0.21 | +53% |
+| **gather + pooled keys + two-stage** | **21.03 +/- 0.03** | **+90%** |
+
+nsys decode windows (32 tokens each, `--cuda-graph-trace=node`): the baseline spent
+~20 ms/token in the re-pooling chain (`k_get_rows_float<half>`, slice adds, norm, rope),
+14 ms in the masked `flash_attn_ext_f16<256,256,1,8>` and ~20 ms/token idle between
+graphs; with everything on, the gathered FA is the vector kernel at 0.4 ms/token, the
+gather + casts ~2 ms, the sort 0.5 ms, idle ~6 ms, and the token is weights again:
+Q8_0 mat-vecs 22.6 ms, experts 7.9, head 2.9, plus 276 tiny F32 mat-vec launches
+(HC inject, shared-expert gate, delta-net alpha/beta, router) for 3.5 ms. The first
+pool arm measured a null because `is_pos_2d()` is true for every mrope text batch
+(`93e512b57`); the two-stage selection is worth ~11 ms/token, four times its estimate,
+because the n_kv-wide expand+sort also carried host and launch-gap cost the GPU sort
+share did not show.
+
 ## Known debt
 
 **The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
