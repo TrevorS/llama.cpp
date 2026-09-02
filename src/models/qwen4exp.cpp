@@ -1026,20 +1026,42 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
+    //
+    // Under the batch-invariance pins the score runs one head at a time: the joint matmul has
+    // n_idx_h*n_tps columns, past the mmvf pin's bound of 8 from n_tps 3, so a verify step
+    // scored its blocks on a different kernel than a single token did, and at depth the
+    // selection follows those scores (at shallow depth every cell is selected whatever the
+    // score, which is why the shallow pinned gate never saw it). Per head the batch is n_tps.
+    static const bool score_per_head = [] {
+        const char * e  = getenv("LLAMA_QSA_SCORE_PER_HEAD");
+        const char * bi = getenv("GGML_CUDA_BATCH_INVARIANT");
+        return e != nullptr ? atoi(e) != 0 : bi != nullptr && strcmp(bi, "0") != 0;
+    }();
 
-    // the heads sit side by side on ne[1] and there are only a few of them
     ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+
+    if (score_per_head) {
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * q_h = ggml_cont(ctx0, ggml_view_3d(ctx0, q, idx_dim, n_tps, n_stream,
+                    q->nb[2], q->nb[2]*n_tps, h*q->nb[1]));
+            ggml_tensor * s_h = ggml_relu(ctx0, ggml_mul_mat(ctx0, pooled, q_h));   // [n_blocks, n_tps, n_stream]
+            summed = summed ? ggml_add(ctx0, summed, s_h) : s_h;
+        }
+    } else {
+        ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+
+        // the heads sit side by side on ne[1] and there are only a few of them
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
     }
 
-    score = summed;
+    ggml_tensor * score = summed;
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
