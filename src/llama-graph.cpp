@@ -2793,6 +2793,12 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv_for(const llama_kv_cache_context * mctx_attn) const {
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_attn);
+
+    return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,

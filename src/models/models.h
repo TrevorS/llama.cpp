@@ -2369,6 +2369,9 @@ struct llama_model_qwen35 : public llama_model_base {
 
 
 struct llama_model_qwen4exp : public llama_model_base {
+    // LLAMA_QWEN4EXP_MTP_QSA=0 keeps the MTP draft's attention dense over a plain KV cache
+    static bool mtp_qsa_enabled();
+
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;

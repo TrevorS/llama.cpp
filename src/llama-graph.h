@@ -1199,6 +1199,10 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
+    // the same input over an attention cache the caller names, for a graph whose memory
+    // context is a hybrid wrapper but which builds no recurrent input of its own
+    llm_graph_input_attn_kv * build_attn_inp_kv_for(const llama_kv_cache_context * mctx_attn) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,

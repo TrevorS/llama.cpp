@@ -30,6 +30,15 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
+bool llama_model_qwen4exp::mtp_qsa_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_QWEN4EXP_MTP_QSA");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    return enabled;
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     // MTP: n_layer_nextn blocks past the trunk (the key itself is read by the base loader).
@@ -311,7 +320,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the MTP attention runs dense, so the indexer tensors are present but unused
         const int64_t idx_dim   = hparams.indexer_head_size;
-        const int     idx_flags = flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        // the draft attends sparse like the trunk when its file carries the indexer (1.7 MB)
+        const int     idx_flags = flags | TENSOR_NOT_REQUIRED | (mtp_qsa_enabled() ? 0 : TENSOR_SKIP);
         layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, idx_flags);
         layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, idx_flags);
         layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, idx_flags);
@@ -1074,9 +1084,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    // mctx_hyb is null for the MTP block, which runs the attention dense
-    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // indexer reads the same block input as q/k/v; no cache, no ratio or no indexer weights
+    // (an MTP draft file converted without them) means dense
+    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0 &&
+        model.layers[il].index_k_proj != nullptr;
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
@@ -1742,7 +1753,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // the draft's memory is the hybrid wrapper with the indexer cache when the sparse draft is
+    // on (see create_memory), a plain KV cache otherwise; no recurrent input in either case
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_idx_context *>(mctx);
+
+    llm_graph_input_attn_kv * inp_attn = mctx_hyb != nullptr
+        ? build_attn_inp_kv_for(mctx_hyb->get_attn())
+        : build_attn_inp_kv();
+
+    if (mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+    }
 
     // the reference norms the whole hyper-connection row and only then splits it into streams,
     // so hnorm is hc*n_embd wide - unlike deepseek4, which norms each stream
@@ -1765,9 +1787,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    // the draft runs the attention dense: a QSA indexer would need its own cache, and one layer
-    // spends its time reading weights, not attending
-    cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il);
+    // sparse over the draft's own indexer cache, as the reference's MTP layer is; dense when
+    // the draft file has no indexer or LLAMA_QWEN4EXP_MTP_QSA=0 (mctx_hyb is null then)
+    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
 
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_hc_attn_post", il);
