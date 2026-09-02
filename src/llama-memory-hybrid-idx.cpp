@@ -489,6 +489,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
     // every graph pools every block when the window covers them all
     const bool full = n_win >= n_blocks;
 
+    const int64_t t_us0 = ggml_time_us();
+
     const int64_t n_blocks_max = ((int64_t) mem_idx->get_size() + r - 1)/r;
 
     std::vector<uint8_t> touched;
@@ -854,8 +856,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
 
             if (qsa_pool_trace()) {
-                LLAMA_LOG_INFO("qsa-pool: seq %d n_tokens %" PRId64 " n_kv %" PRId64 " n_blocks %" PRId64 " n_bid %d n_win %" PRId64 " stale %" PRId64 " full %d dirty %d\n",
-                        (int) seq_of_stream, n_tokens, n_kv, n_blocks, n_bid, n_win, n_stale, full ? 1 : 0, ps != nullptr && ps->dirty ? 1 : 0);
+                LLAMA_LOG_INFO("qsa-pool: seq %d n_tokens %" PRId64 " n_kv %" PRId64 " n_blocks %" PRId64 " n_bid %d n_win %" PRId64 " stale %" PRId64 " full %d dirty %d host %.0f us\n",
+                        (int) seq_of_stream, n_tokens, n_kv, n_blocks, n_bid, n_win, n_stale, full ? 1 : 0, ps != nullptr && ps->dirty ? 1 : 0,
+                        (double) (ggml_time_us() - t_us0));
             }
 
             if (ps != nullptr) {
