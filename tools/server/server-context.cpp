@@ -4710,25 +4710,46 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // in streaming mode, the first error must be treated as non-stream response
         // this is to match the OAI API behavior
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
+        //
+        // Fork: the first result arrives only after the whole prompt is processed, minutes
+        // at depth, and nothing was sent until then: a client with a first-byte timeout gave
+        // up on the silence (28 of 28 cancels at 292-300 s in the 2026-09-01 log, each one a
+        // 134k-token re-prefill thrown away). Wait one ping interval for the first result;
+        // past it, open the stream with the headers alone and let the streaming loop ping
+        // until the result comes. A fast error keeps its non-stream status.
+        bool first_timeout = false;
+        const int64_t first_start = ggml_time_ms();
+        auto first_result = rd.next([&req, &first_timeout, first_start, sse_ping_interval]() {
+            if (req.should_stop()) {
+                return true;
+            }
+            if (sse_ping_interval > 0 && ggml_time_ms() - first_start > (int64_t) sse_ping_interval * 1000) {
+                first_timeout = true;
+                return true;
+            }
+            return false;
+        });
+        if (first_result == nullptr && !first_timeout) {
             GGML_ASSERT(req.should_stop());
             return res; // connection is closed
         }
 
-        if (first_result->is_error()) {
+        if (first_result != nullptr && first_result->is_error()) {
             res->error(first_result->to_json());
             return res;
         }
 
-        GGML_ASSERT(
+        GGML_ASSERT(first_result == nullptr ||
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
 
         // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
+        // to be sent immediately; with no first result yet, only the headers go out now
+        json first_result_json = first_result != nullptr ? first_result->to_json() : json(nullptr);
+        if (first_timeout) {
+            SRV_INF("%s", "first result not ready within the ping interval, streaming pings until it is\n");
+        }
         if (first_result_json == nullptr) {
             res->data = ""; // simply send HTTP headers and status code
         } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
