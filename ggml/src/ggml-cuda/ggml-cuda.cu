@@ -4745,12 +4745,14 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                       "is unavailable - temperature tripwire disabled\n", temp_max);
     }
 
-    // SoC tripwire (GGML_CUDA_POWER_SOC_MAX, degrees C; 0 = off). On GB10 the wedge is a
+    // SoC governor (GGML_CUDA_POWER_SOC_MAX, degrees C; 0 = off). On GB10 the wedge is a
     // package event: every recorded lockup sat at 94-98 C on the hottest thermal zone
     // while the GPU sensor read 78-84, so the GPU temperature above cannot see it coming.
-    // The zones are read from sysfs, no NVML involved. Hysteresis of 5 C keeps a fill
-    // from flapping around the threshold: once engaged, the duty stays down until the
-    // package has cooled below max - 5 for the clear period.
+    // The zones are read from sysfs, no NVML involved. A warm prefill burst moves the
+    // package ~6 C per second (82 -> 94 C in two seconds was measured), so a step at the
+    // limit polled twice a second arrives late: the duty is scaled linearly from the base
+    // at max - 10 down to the minimum at max, the loop polls every 100 ms once the package
+    // is within 12 C of the limit, and the minimum holds until it has cooled 5 C below.
     const int soc_max = [] {
         const char * e = getenv("GGML_CUDA_POWER_SOC_MAX");
         return e ? atoi(e) : 0;
@@ -4806,6 +4808,18 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                 soc_c = read_soc_max_c();
                 soc_hot = soc_c >= (engaged ? soc_max - 5 : soc_max);
                 distress = distress || soc_hot;
+
+                // proportional band below the limit: the duty follows the temperature so
+                // the package is already being held before the hard engage is reached
+                if (!engaged && !distress && soc_c > soc_max - 10) {
+                    const double f   = (double) (soc_c - (soc_max - 10)) / 10.0;
+                    const int    pct = std::max(ps->min_pct, (int) (ps->base_pct - (ps->base_pct - ps->min_pct) * f));
+                    if (pct != ps->cur_pct.load(std::memory_order_relaxed)) {
+                        ps->cur_pct.store(pct, std::memory_order_relaxed);
+                    }
+                } else if (!engaged && !distress && ps->cur_pct.load(std::memory_order_relaxed) != ps->base_pct) {
+                    ps->cur_pct.store(ps->base_pct, std::memory_order_relaxed);
+                }
             }
             const auto now = std::chrono::steady_clock::now();
             if (distress) {
@@ -4834,7 +4848,12 @@ static void ggml_cuda_power_poller(ggml_cuda_power_state * ps) {
                 GGML_LOG_WARN("ggml_cuda: power throttle cleared (SoC %dC) -> duty %d%%\n", soc_c, ps->base_pct);
             }
         }
-        std::this_thread::sleep_for(poll_period);
+        // near the limit the package moves several degrees per second: poll faster there
+        if (soc_max > 0 && read_soc_max_c() > soc_max - 12) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } else {
+            std::this_thread::sleep_for(poll_period);
+        }
     }
 }
 #endif // __linux__
