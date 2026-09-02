@@ -4640,6 +4640,12 @@ struct ggml_cuda_power_state {
     int  min_pct  = 60;
     int  chunk_nodes = 0; // 0 = per-graph pacing (default); >0 = pace every N launched nodes in direct-exec
     double exempt_below_ms = 250.0; // graph computes shorter than this pay no duty tax (0 = tax all)
+    // layer granularity: a chunk shorter than this is decode-sized and pays decode_pct, never the
+    // governed pct. The SoC governor holds its floor until the package is 5 C under the limit,
+    // which decode load after a hot prefill never reaches, so without this every decode after a
+    // long prefill ran at the floor (30%) for the rest of the request: 40 -> 21 t/s at 37k.
+    double chunk_exempt_ms = 4.0;   // GGML_CUDA_POWER_CHUNK_EXEMPT_MS (0 = govern every chunk)
+    int    decode_pct      = 0;     // GGML_CUDA_POWER_DECODE: duty for decode-sized chunks (0 = base)
     std::atomic<int>  cur_pct{100};
     std::atomic<bool> stop_poller{false};
     std::thread poller;
@@ -4902,6 +4908,15 @@ static ggml_cuda_power_state & ggml_cuda_power(void) {
         // engage the power cap this throttle exists to dodge. Sized well above the
         // longest decode compute (a deep-context MTP verify batch, tens of ms) and
         // well below the shortest prefill ubatch (~1.5 s at ub1024).
+        if (const char * e = getenv("GGML_CUDA_POWER_CHUNK_EXEMPT_MS")) {
+            ps.chunk_exempt_ms = atof(e);
+        }
+        if (const char * e = getenv("GGML_CUDA_POWER_DECODE")) {
+            const int v = atoi(e);
+            if (v >= 1 && v <= 100) {
+                ps.decode_pct = v;
+            }
+        }
         const char * env_exempt = getenv("GGML_CUDA_POWER_EXEMPT_MS");
         if (env_exempt != nullptr) {
             const double v = atof(env_exempt);
@@ -4910,9 +4925,10 @@ static ggml_cuda_power_state & ggml_cuda_power(void) {
             }
         }
         ps.cur_pct.store(ps.base_pct, std::memory_order_relaxed);
-        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s exempt=%.0fms\n",
+        GGML_LOG_INFO("ggml_cuda: power duty cycle enabled: base=%d%% adapt=%s min=%d%% granularity=%s exempt=%.0fms chunk-exempt=%.1fms decode=%d%%\n",
                       ps.base_pct, ps.adapt ? "on" : "off", ps.min_pct,
-                      ps.chunk_nodes > 0 ? "layer" : "graph", ps.exempt_below_ms);
+                      ps.chunk_nodes > 0 ? "layer" : "graph", ps.exempt_below_ms, ps.chunk_exempt_ms,
+                      ps.decode_pct > 0 ? ps.decode_pct : ps.base_pct);
 #ifdef __linux__
         if (ps.adapt) {
             ps.poller = std::thread(ggml_cuda_power_poller, &ps);
@@ -4949,12 +4965,22 @@ static void ggml_cuda_power_chunk_node(ggml_backend_cuda_context * cuda_ctx) {
     if (++d.chunk_n_nodes < ps.chunk_nodes) {
         return;
     }
-    const int pct = ps.cur_pct.load(std::memory_order_relaxed);
-    if (pct >= 1 && pct <= 99) {
+    int pct = ps.cur_pct.load(std::memory_order_relaxed);
+    const int decode_pct = ps.decode_pct > 0 ? ps.decode_pct : ps.base_pct;
+    if ((pct >= 1 && pct <= 99) || (decode_pct >= 1 && decode_pct <= 99)) {
         CUDA_CHECK(cudaEventRecord(d.chunk_stop, cuda_ctx->stream()));
         CUDA_CHECK(cudaEventSynchronize(d.chunk_stop));
         float ms = 0.0f;
         if (cudaEventElapsedTime(&ms, d.chunk_start, d.chunk_stop) == cudaSuccess && ms > 0.05f) {
+            // a decode-sized chunk is paced at the decode duty, whatever the governor holds
+            if (ps.chunk_exempt_ms > 0.0 && (double) ms < ps.chunk_exempt_ms) {
+                pct = decode_pct;
+            }
+            if (pct < 1 || pct > 99) {
+                CUDA_CHECK(cudaEventRecord(d.chunk_start, cuda_ctx->stream()));
+                d.chunk_n_nodes = 0;
+                return;
+            }
             const double pay = std::min((double) ms * (100 - pct) / pct, 5000.0);
             std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(pay * 1000.0)));
             d.n_chunks++;
