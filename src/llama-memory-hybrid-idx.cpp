@@ -340,6 +340,35 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+bool llama_memory_hybrid_idx::qsa_single_seq(const llama_ubatch & ubatch, uint32_t n_ns) const {
+    if (mem_idx == nullptr || ubatch.is_pos_2d()) {
+        return false;
+    }
+
+    GGML_ASSERT(n_ns > 0 && ubatch.n_tokens % n_ns == 0);
+    const int64_t n_tps = ubatch.n_tokens/n_ns;
+
+    for (uint32_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq = ubatch.seq_id[s*n_tps][0];
+
+        const auto & cells = mem_idx->get_cells(seq);
+
+        int n_present = 0;
+
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_present++;
+            }
+        }
+
+        if (n_present > 1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int64_t llama_memory_hybrid_idx::qsa_pool_n_win(const llama_ubatch & ubatch, uint32_t n_ns, int64_t n_blocks) const {
     // 2d positions are ranked, and ranks shift with every insertion: never trusted
     if (pool_ratio == 0 || ubatch.is_pos_2d()) {
@@ -382,12 +411,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * win_cells,
         ggml_tensor * win_pos,
         ggml_tensor * win_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pad,
         const ggml_tensor * k_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
+    GGML_ASSERT((blk_cells == nullptr) == (blk_pad == nullptr));
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(k_idxs->buffer));
@@ -414,6 +446,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_win_cells = (int32_t *) win_cells->data;
     int32_t * dst_win_pos   = (int32_t *) win_pos->data;
     int32_t * dst_win_blk   = win_blk != nullptr ? (int32_t *) win_blk->data : nullptr;
+    int32_t * dst_blk_cells = blk_cells != nullptr ? (int32_t *) blk_cells->data : nullptr;
+    float   * dst_blk_pad   = blk_pad   != nullptr ? (float   *) blk_pad->data   : nullptr;
+
+    if (blk_cells != nullptr) {
+        GGML_ASSERT(blk_cells->ne[0] == r*(n_blocks + 1) && blk_cells->ne[1] == n_ns);
+        GGML_ASSERT(blk_pad->ne[0]   == r*(n_blocks + 1) && blk_pad->ne[1]   == n_ns);
+    }
 
     const int32_t * ub_cells = (const int32_t *) k_idxs->data;
 
@@ -635,6 +674,42 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
 
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+        }
+
+        // the block table for two-stage selection: every complete block's cells, then the spare
+        // block holding the unpooled cells (the tail of a single sequence), pads marked -inf
+        if (dst_blk_cells != nullptr) {
+            int32_t * cur_blk_cells = dst_blk_cells + s*(r*(n_blocks + 1));
+            float   * cur_blk_pad   = dst_blk_pad   + s*(r*(n_blocks + 1));
+
+            std::fill(cur_blk_cells, cur_blk_cells + r*(n_blocks + 1), 0);
+            std::fill(cur_blk_pad,   cur_blk_pad   + r*(n_blocks + 1), -INFINITY);
+
+            std::copy(bid_cells.begin(), bid_cells.end(), cur_blk_cells);
+            std::fill(cur_blk_pad, cur_blk_pad + (size_t) n_bid*r, 0.0f);
+
+            if (have_dead) {
+                int32_t * dead_cells = cur_blk_cells + (size_t) dead_bid*r;
+                float   * dead_pad   = cur_blk_pad   + (size_t) dead_bid*r;
+
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    if (cells.is_empty(j) || blk_of[j] >= 0) {
+                        continue;
+                    }
+
+                    const int64_t idx  = ranked ? rank[j] : cells.pos_get(j);
+                    const int64_t slot = idx%r;
+
+                    // more than one unpooled group means several sequences: a slot already
+                    // taken keeps the first, the caller uses the single-stage path there
+                    if (dead_pad[slot] == 0.0f) {
+                        continue;
+                    }
+
+                    dead_cells[slot] = (int32_t) j;
+                    dead_pad[slot]   = 0.0f;
+                }
+            }
         }
 
         // the window: which complete blocks this graph pools, and where their keys go.
@@ -924,13 +999,21 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * win_cells,
         ggml_tensor * win_pos,
         ggml_tensor * win_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pad,
         const ggml_tensor * k_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, bias, win_cells, win_pos, win_blk, k_idxs, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, bias, win_cells, win_pos, win_blk, blk_cells, blk_pad, k_idxs, ubatch, ratio, blk_bias);
+}
+
+bool llama_memory_hybrid_idx_context::qsa_single_seq(const llama_ubatch & ubatch) const {
+    GGML_ASSERT(mem != nullptr);
+
+    return mem->qsa_single_seq(ubatch, get_n_stream());
 }
 
 int64_t llama_memory_hybrid_idx_context::qsa_pool_n_win(const llama_ubatch & ubatch, int64_t n_blocks) const {
