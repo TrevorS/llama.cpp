@@ -1222,8 +1222,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     // out contiguously, so the flat index of a window is the index of its query
     ggml_tensor * idx_stream = ggml_reshape_2d(ctx0, top_k, width*n_tps, n_stream);
 
-    ggml_tensor * k_sel = ggml_get_rows(ctx0, k_cells, idx_stream);
-    ggml_tensor * v_sel = ggml_get_rows(ctx0, v_cells, idx_stream);
+    // an F16 cache gathers straight into the F16 rows the attention kernels read, instead of an
+    // F32 copy that a cast then rewrites; a quantized cache dequantizes to F32 as before
+    static const bool gather_f16 = [] {
+        const char * e = getenv("LLAMA_QSA_GATHER_F16");
+        return e == nullptr || strcmp(e, "0") != 0;
+    }();
+
+    const ggml_type type_sel = gather_f16 && k_all->type == GGML_TYPE_F16 && v_all->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    ggml_tensor * k_sel = ggml_get_rows_type(ctx0, k_cells, idx_stream, type_sel);
+    ggml_tensor * v_sel = ggml_get_rows_type(ctx0, v_cells, idx_stream, type_sel);
 
     k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
     v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
