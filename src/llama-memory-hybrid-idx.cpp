@@ -428,8 +428,16 @@ int64_t llama_memory_hybrid_idx::qsa_pool_n_win(const llama_ubatch & ubatch, uin
 
 // LLAMA_QSA_POOL_TRACE=1 logs every window decision and fill: n_win against n_blocks, and
 // how many blocks were actually stale
-static bool qsa_pool_trace() {
-    static const bool on = getenv("LLAMA_QSA_POOL_TRACE") != nullptr && atoi(getenv("LLAMA_QSA_POOL_TRACE")) != 0;
+static int qsa_pool_trace() {
+    static const int on = getenv("LLAMA_QSA_POOL_TRACE") != nullptr ? atoi(getenv("LLAMA_QSA_POOL_TRACE")) : 0;
+    return on;
+}
+
+// the identity layout: one sequence, its cells a prefix of the cache, cell j at position j.
+// every block is then its own cell range and the scan that discovers groups can be skipped.
+// LLAMA_QSA_SCAN_IDENTITY=0 forces the scan; LLAMA_QSA_POOL_TRACE=2 runs both and compares.
+static bool qsa_scan_identity() {
+    static const bool on = getenv("LLAMA_QSA_SCAN_IDENTITY") == nullptr || atoi(getenv("LLAMA_QSA_SCAN_IDENTITY")) != 0;
     return on;
 }
 
@@ -613,6 +621,62 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         };
 
+        // the identity layout needs one pass over the positions instead of the group scan
+        auto identity_layout = [&]() -> bool {
+            if (!qsa_scan_identity() || !one_seq) {
+                return false;
+            }
+
+            const int64_t n_used = cells.get_used();
+
+            if (n_used == 0 || n_used > n_kv || cells.used_min() != 0 || (int64_t) cells.used_max_p1() != n_used) {
+                return false;
+            }
+
+            for (int64_t j = 0; j < n_used; ++j) {
+                if (cells.pos_get((uint32_t) j) != (llama_pos) j) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        const bool identity = identity_layout();
+
+        int32_t n_bid = 0;
+
+        // the identity results, kept to check the scan against when tracing at level 2
+        std::vector<int32_t> chk_bid_idx;
+        std::vector<int32_t> chk_blk_of;
+
+        if (identity) {
+            const int64_t n_used = cells.get_used();
+
+            n_bid = (int32_t) (n_used/r);
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                bid_idx  .push_back(b*(int32_t) r);
+                bid_cell .push_back(b*(int32_t) r);
+                bid_slot0.push_back(b*(int32_t) r);
+            }
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                blk_of[j] = j < (int64_t) n_bid*r ? (int32_t) (j/r) : -1;
+            }
+
+            if (qsa_pool_trace() >= 2) {
+                chk_bid_idx = bid_idx;
+                chk_blk_of  = blk_of;
+
+                bid_idx  .clear();
+                bid_cell .clear();
+                bid_slot0.clear();
+            }
+        }
+
+        if (!identity || qsa_pool_trace() >= 2) {
+
         group_cells();
 
         // mrope repeats one position across an image, so rank cells instead of using the position
@@ -653,7 +717,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
-        int32_t n_bid = 0;
+        n_bid = 0;
 
         for (int64_t pb = 0; pb < n_blocks; ++pb) {
             for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
@@ -670,6 +734,24 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         GGML_ASSERT(n_bid <= n_blocks);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int32_t g = cell_grp[j];
+
+            blk_of[j] = g < 0 ? -1 : grp_bid[g];
+        }
+
+        if (identity) {
+            // the scan must agree with the identity shortcut on every block and cell
+            GGML_ASSERT(bid_idx == chk_bid_idx && "qsa: identity layout disagrees with the scan on blocks");
+            GGML_ASSERT(blk_of  == chk_blk_of  && "qsa: identity layout disagrees with the scan on cells");
+
+            for (int32_t b = 0; b < n_bid; ++b) {
+                GGML_ASSERT(bid_cell[b] == b*(int32_t) r && bid_slot0[b] == b*(int32_t) r);
+            }
+        }
+
+        } // !identity || trace >= 2
 
         // the rope position rows of a block: its first token's, in the four mrope sections
         auto blk_sec_pos = [&](int32_t b, int32_t * sec_pos) {
@@ -695,12 +777,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
         bid_cells.assign((size_t) n_bid*r, 0);
 
         for (int64_t j = 0; j < n_kv; ++j) {
-            const int32_t g = cell_grp[j];
-
-            blk_of[j] = g < 0 ? -1 : grp_bid[g];
-
             if (blk_of[j] >= 0) {
-                const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
+                const int64_t idx = identity ? j : ranked ? rank[j] : cells.pos_get(j);
 
                 bid_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
@@ -856,8 +934,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
 
             if (qsa_pool_trace()) {
-                LLAMA_LOG_INFO("qsa-pool: seq %d n_tokens %" PRId64 " n_kv %" PRId64 " n_blocks %" PRId64 " n_bid %d n_win %" PRId64 " stale %" PRId64 " full %d dirty %d host %.0f us\n",
-                        (int) seq_of_stream, n_tokens, n_kv, n_blocks, n_bid, n_win, n_stale, full ? 1 : 0, ps != nullptr && ps->dirty ? 1 : 0,
+                LLAMA_LOG_INFO("qsa-pool: seq %d n_tokens %" PRId64 " n_kv %" PRId64 " n_blocks %" PRId64 " n_bid %d n_win %" PRId64 " stale %" PRId64 " full %d dirty %d identity %d host %.0f us\n",
+                        (int) seq_of_stream, n_tokens, n_kv, n_blocks, n_bid, n_win, n_stale, full ? 1 : 0, ps != nullptr && ps->dirty ? 1 : 0, identity ? 1 : 0,
                         (double) (ggml_time_us() - t_us0));
             }
 
