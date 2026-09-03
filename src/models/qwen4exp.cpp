@@ -1265,9 +1265,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // sparse FA (upstream #27970) stays off here: the gathered path already reads only the
-    // selected cells at decode, and the scan path's A/B against it is a separate step
-    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, /*n_kv_max*/ 0, kq_scale, il);
+    // sparse FA (upstream #27970): the mask is compacted to the selected cells' indices and
+    // the MMA kernel reads only those. The gathered path already does this at decode; at
+    // prefill the scan path masks 98% of the KV per query, so this is where it can pay.
+    // LLAMA_QSA_SPARSE_FA=1 enables it on the scan path (A/B pending); it changes the
+    // accumulation order, so it stays off under the batch-invariance pins.
+    static const bool sparse_fa = [] {
+        const char * e  = getenv("LLAMA_QSA_SPARSE_FA");
+        const char * bi = getenv("GGML_CUDA_BATCH_INVARIANT");
+        return e != nullptr && atoi(e) != 0 && !(bi != nullptr && strcmp(bi, "0") != 0);
+    }();
+    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, sparse_fa ? top_k->ne[0] : 0, kq_scale, il);
 }
 
 // Key and value traffic follows the budget instead of the cache: every query rides the stream
