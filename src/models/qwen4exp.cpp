@@ -52,7 +52,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
@@ -230,7 +230,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     for (int il = 0; il < (mtp_only ? 0 : n_layer); ++il) {
         auto & layer = layers[il];
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         const int64_t head_k_dim = hparams.ssm_d_state;
@@ -302,7 +302,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
@@ -1265,7 +1265,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+    // sparse FA (upstream #27970) stays off here: the gathered path already reads only the
+    // selected cells at decode, and the scan path's A/B against it is a separate step
+    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, /*n_kv_max*/ 0, kq_scale, il);
 }
 
 // Key and value traffic follows the budget instead of the cache: every query rides the stream
@@ -1361,7 +1363,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
     cb(mask, "qsa_mask_sel", il);
 
-    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, /*n_kv_max*/ 0, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
