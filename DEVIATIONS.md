@@ -439,6 +439,12 @@ governor's: 505 at 4.7k, ~200 on the deep fills where it holds 30% for most of t
 depth is 71k, and the fork's server has no per-request speculative override, so spec is a
 launch-time choice.
 
+At the trained maximum (`CTX=262144`, spec on, P70 per the deep-fill rule): the server
+loads with 35.6 GB to spare; a 241,856-token prompt fills at **144 t/s (27.9 min)** with
+the governor holding 86 C throughout, decode reads 25.0 cold and **28.9 / 32.4 warm**
+(acceptance 0.74-0.77), which is 33-35 at the P75 the shorter rows ran on. Decode keeps
+most of its depth-flatness to the maximum; the price of 262k is the fill.
+
 ### Dense requant ladder (2026-09-02): UD-IQ4_XS with the dense Q8_0 set at Q6_K / Q5_K
 
 The per-token bytes of UD-IQ4_XS are ~63% dense Q8_0 (attention/GDN projections, HC
