@@ -418,6 +418,27 @@ abort from `experiments/gb10-thermal/soak.sh`; the faster prefill raises sustain
 so the old P85 margin is gone. Lost with `/tmp`: the harness scripts, nsys traces and
 the gate-3 selection dumps; every result was already recorded above.
 
+### Spec on/off through serve-qwen on the shipping build (2026-09-02 evening)
+
+build-next, `serve-qwen` (P75 layer duty, decode chunks at the base duty, SOC_MAX 86), one
+server per arm, cold = the request that prefilled, warm = the two that reused the cache.
+The 141k rows ran at `CTX=163840` (the old "p131k" prompt is 177,702 tokens on this
+tokenizer; it was cut to 139,804).
+
+| depth | prefill t/s | spec off cold / warm | spec on cold / warm | acceptance | warm gain |
+| --- | --- | --- | --- | --- | --- |
+| 4.7k | 505 / 397 | 24.5 / 27.4 | 34.3 / 39.9-41.7 | 0.74 | +49% |
+| 37k | 340 / 431 | 23.0 / 25.1 | 31.0 / 35.4-35.8 | 0.79 | +42% |
+| 48k | 258 / 262 | 22.7 / 24.2 | 29.5 / 35.4-35.6 | 0.65 | +46% |
+| 140k | 221 / 195 | 21.5 / 24.1 | 30.3 / 38.2-38.4 | 0.81-0.83 | +58% |
+
+Decode is nearly depth-flat now (27.4 -> 24.1 no-spec, 41 -> 38 with spec from 4.7k to
+140k): the gathered attention, the pooled keys and two-stage did their job. Prefill is the
+governor's: 505 at 4.7k, ~200 on the deep fills where it holds 30% for most of the fill.
+`serve-qwen` defaults were `SPEC=0` and `CTX=32768` when this ran; the agent log's median
+depth is 71k, and the fork's server has no per-request speculative override, so spec is a
+launch-time choice.
+
 ### Dense requant ladder (2026-09-02): UD-IQ4_XS with the dense Q8_0 set at Q6_K / Q5_K
 
 The per-token bytes of UD-IQ4_XS are ~63% dense Q8_0 (attention/GDN projections, HC
