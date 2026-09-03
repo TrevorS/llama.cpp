@@ -830,8 +830,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
         {
             touched.assign(n_kv, 0);
 
+            // the cache writes its k_idxs as stream*size + cell (set_input_k_idxs), so a
+            // stream past the first carries an offset the per-stream window must drop:
+            // llama-perplexity at -b 2048 -c 512 packs four sequences and tripped this
+            const int32_t size_idx = (int32_t) mem_idx->get_size();
+
             for (int64_t ii = 0; ii < n_tps; ++ii) {
-                const int32_t c = ub_cells[s*n_tps + ii];
+                const int32_t c = ub_cells[s*n_tps + ii] % size_idx;
 
                 GGML_ASSERT(c >= 0 && c < n_kv);
                 touched[c] = 1;
