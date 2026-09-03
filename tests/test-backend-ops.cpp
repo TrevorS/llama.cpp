@@ -4627,6 +4627,94 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+struct test_gated_delta_net_batch_invariance : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_tokens;
+
+    test_gated_delta_net_batch_invariance(int64_t head_count, int64_t head_size, int64_t n_tokens)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(head_count, head_size, n_tokens);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,         head_count, n_tokens, 1);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,         head_count, n_tokens, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * batched = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+        ggml_tensor * serial_outputs = nullptr;
+        ggml_tensor * serial_state = state;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            auto token_view = [&](ggml_tensor * t) {
+                return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], 1, 1,
+                        t->nb[1], t->nb[2], t->nb[3], i*t->nb[2]);
+            };
+
+            ggml_tensor * serial_step = ggml_gated_delta_net(ctx,
+                    token_view(q), token_view(k), token_view(v), token_view(g), token_view(beta), serial_state, 1);
+
+            ggml_tensor * serial_output = ggml_view_2d(ctx, serial_step,
+                    head_size*head_count, 1, serial_step->nb[1], 0);
+            serial_outputs = serial_outputs == nullptr ? serial_output : ggml_concat(ctx, serial_outputs, serial_output, 1);
+
+            const size_t state_offset = ggml_row_size(GGML_TYPE_F32, head_size*head_count);
+            serial_state = ggml_view_4d(ctx, serial_step,
+                    head_size, head_size, head_count, 1,
+                    ggml_row_size(GGML_TYPE_F32, head_size),
+                    ggml_row_size(GGML_TYPE_F32, head_size*head_size),
+                    ggml_row_size(GGML_TYPE_F32, head_size*head_size*head_count),
+                    state_offset);
+        }
+
+        ggml_tensor * serial_state_2d = ggml_reshape_2d(ctx, serial_state, head_size*head_count, head_size);
+        ggml_tensor * serial = ggml_concat(ctx, serial_outputs, serial_state_2d, 1);
+        ggml_tensor * out = ggml_concat(ctx, batched, serial, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * backend, const float * /*cpu*/, size_t count) override {
+        GGML_ASSERT(count % 2 == 0);
+        return memcmp(backend, backend + count/2, count/2 * sizeof(float)) == 0 ? 0.0 : 1.0;
+    }
+
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t /*backend*/) override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * /*t*/) override { return "GATED_DELTA_NET_BATCH_INVARIANCE"; }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -4820,6 +4908,7 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT: require batched MMVQ columns to match independent columns bit-for-bit.
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -8088,6 +8177,92 @@ struct test_fa_pad : public test_case {
     }
 };
 
+// Qwen3.8 full-attention shape: require a small Q8 KV verification batch to
+// produce the same F32 results as independent one-query flash-attention ops.
+struct test_flash_attn_ext_batch_invariance : public test_case {
+    const int64_t n_tokens;
+    const int64_t n_kv;
+
+    test_flash_attn_ext_batch_invariance(int64_t n_tokens, int64_t n_kv)
+        : n_tokens(n_tokens), n_kv(n_kv) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, n_kv);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t head_size = 256;
+        constexpr int64_t n_head_q  = 24;
+        constexpr int64_t n_head_kv = 4;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                head_size, n_tokens, n_head_q, 1);
+        ggml_tensor * k_store = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0,
+                head_size, 2*n_kv, n_head_kv, 1);
+        ggml_tensor * v_store = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0,
+                head_size, 2*n_kv, n_head_kv, 1);
+        ggml_tensor * k = ggml_view_4d(ctx, k_store, head_size, n_kv, n_head_kv, 1,
+                k_store->nb[1], k_store->nb[2], k_store->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, v_store, head_size, n_kv, n_head_kv, 1,
+                v_store->nb[1], v_store->nb[2], v_store->nb[3], 0);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k_store, "k_store");
+        ggml_set_name(v_store, "v_store");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(mask, "mask");
+
+        auto flash = [&](ggml_tensor * q_i, ggml_tensor * mask_i) {
+            ggml_tensor * result = ggml_flash_attn_ext(ctx, q_i, k, v, mask_i,
+                    1.0f/sqrtf((float) head_size), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
+            return result;
+        };
+
+        ggml_tensor * batched = flash(q, mask);
+        ggml_set_name(batched, "batched");
+
+        ggml_tensor * serial = nullptr;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            ggml_tensor * q_i = ggml_view_4d(ctx, q, head_size, 1, n_head_q, 1,
+                    q->nb[1], q->nb[2], q->nb[3], i*q->nb[1]);
+            ggml_tensor * mask_i = ggml_view_4d(ctx, mask, n_kv, 1, 1, 1,
+                    mask->nb[1], mask->nb[2], mask->nb[3], i*mask->nb[1]);
+            ggml_tensor * out_i = flash(q_i, mask_i);
+            serial = serial == nullptr ? out_i : ggml_concat(ctx, serial, out_i, 2);
+        }
+        ggml_set_name(serial, "serial");
+
+        ggml_tensor * out = ggml_concat(ctx, batched, serial, 2);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "mask") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * backend, const float * /*cpu*/, size_t count) override {
+        GGML_ASSERT(count % 2 == 0);
+        return memcmp(backend, backend + count/2, count/2 * sizeof(float)) == 0 ? 0.0 : 1.0;
+    }
+
+    double max_err() override { return 0.0; }
+    double max_err(ggml_backend_t /*backend*/) override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor * /*t*/) override { return "FLASH_ATTN_EXT_BATCH_INVARIANCE"; }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11048,6 +11223,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1},  512, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    // KV length changes the number of parallel blocks the launcher picks, so a tile
+    // width that is invariant at one KV length is not automatically invariant at another.
+    for (int64_t n_kv : {2048, 7168, 16384}) {
+        for (int64_t n_tokens : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext_batch_invariance(n_tokens, n_kv));
+        }
+    }
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
@@ -11236,6 +11418,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    for (int64_t n_tokens : {1, 2, 3, 4, 5, 8}) {
+        test_cases.emplace_back(new test_gated_delta_net_batch_invariance(48, 128, n_tokens));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
