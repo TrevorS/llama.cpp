@@ -540,6 +540,17 @@ corruption signature, not a numerics one, and should have sent me to the batch
 shape first; and the isolation harness must reproduce the *input contract* of the
 failing test (here: which rows are requested), not only its model and prompt.
 
+### Wedge, 2026-09-02 17:40: a second model instance beside the served one
+
+The serve cut-over came up healthy at 17:39:16 (build-next, the model resident), and at
+17:39:41 the next harness step started `test-qsa-pool-cache` on the same 88 GB model to
+diff selections. At 17:40:12 the driver logged `NVRM: Out of memory [NV_ERR_NO_MEMORY]
+returned from _memdescAlloc` and the box was gone. Not thermal (package 78 C) and not
+earlyoom's problem (it saw 45% free): the GPU allocator ran out, and on UMA a hard GPU
+OOM takes the machine, as the `-m 1,1` note already said. The harness now refuses to
+start any leg while a `llama-server` is alive (`run-guarded.sh`), and the rule is
+absolute: one model instance per box, the served one or a test, never both.
+
 ## Known debt
 
 **The MTP draft-coverage warning is over-eager, and cost me a wrong entry here.**
