@@ -1538,11 +1538,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         fuse_ingest = fuse_env && !chain_heads && !is_mem_shared;
 
         // IndexShare: the chain steps attend the selection the seed decode made plus their
-        // own cells, instead of scoring the whole cache on every step. Default ON for a
-        // single sequence; LLAMA_MTP_INDEXSHARE=0 scores every step.
+        // own cells, instead of scoring the whole cache on every step. Measured neutral on
+        // GB10 (2026-09-02 serving A/B at 37k and 64k: identical drafts and acceptance, tg
+        // inside the 2% floor), so it is opt-in: LLAMA_MTP_INDEXSHARE=1.
         static const bool indexshare_env = [] {
             const char * v = std::getenv("LLAMA_MTP_INDEXSHARE");
-            return v == nullptr || std::atoi(v) != 0;
+            return v != nullptr && std::atoi(v) != 0;
         }();
 
         index_share = indexshare_env && n_seq == 1 && !chain_heads;
