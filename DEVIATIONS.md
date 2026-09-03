@@ -207,6 +207,86 @@ images. `LLAMA_QSA_POOL_TRACE=1` prints every window decision; the CPU model sho
 prefill windows of 8 and decode windows of 1 after the fix. Lesson: an env-gated
 fast path needs a trace of *which path ran* before its first benchmark.
 
+**`11085a721` / `906a8d525` — the duty governor watches the package temperature.**
+Every recorded GB10 wedge sat at 94-98 C on the SoC sensor while the GPU sensor read
+78-84, and a 37k real-text prefill at P85 took the package from 82 to 94 C in about
+two seconds — too fast for a step at a threshold with a 500 ms poll. The adaptive
+poller now reads the hottest `/sys/class/thermal` zone every 100 ms once within 12 C
+of `GGML_CUDA_POWER_SOC_MAX` and lowers the duty proportionally over the last 10 C
+(base at max-10, `GGML_CUDA_POWER_MIN` at max), holding the floor until the package
+is 5 C under the limit. Serving runs `SOC_MAX=86 MIN=30`; the harnesses run the same
+under P70 with an external abort at 93. Measured below: the band engages, holds, and
+releases with no abort, at a cost to sustained prefill that the thermals were going
+to collect one way or the other.
+
+**`2904e53bf` — the MTP draft chain reuses its seed step's QSA selection (IndexShare).**
+The sparse draft selected top-k on every chain step, so a 5-token draft ran the
+indexer scan five times over the same context. The first step's selection is read
+back (`llama_set_qsa_capture` / `llama_get_qsa_top_k_ith`) and the remaining steps
+attend over it (`llama_set_qsa_reuse`), padded with a repeated cell whose bias is
+-inf. Measured neutral (`4d61f3e86`, table under Measured): identical drafts and tg
+inside the floor at 37k and 64k, so it is opt-in with `LLAMA_MTP_INDEXSHARE=1`.
+
+**Not built: folding the 276 tiny F32 mat-vecs.** Merging the F32 weights of one
+layer (HC inject x2, shared-expert gate, delta-net alpha/beta) into one mat-vec is
+launch-neutral: the outputs feed different unary ops that need contiguous inputs, so
+every split output costs the copy it saved, and folding the inject into the HC kernel
+itself needs a cross-block reduction whose order is not fixed (atomics), which the
+batch-invariance pins forbid. The inject went into the two-launch HC mix instead
+(below), where it is four extra columns of a reduction that already has a fixed order.
+
+**`9c311f0a5` — the QSA gather returns F16 rows, and pad handles F16.** `ggml_get_rows`
+only returns F32, so every gathered K/V window (2304 x 128 x heads per query) was
+written as F32 and cast straight back to F16 for the attention kernels.
+`ggml_get_rows_type` adds an F16 result (CPU copies F16 rows and rounds F32 ones;
+CUDA already dispatched on the destination type), the CUDA and CPU pad kernels take
+F16, and the gather asks for F16 when the cache is F16. Byte-identical logits and
+selection on the CPU model; `LLAMA_QSA_GATHER_F16=0` restores the F32 gather.
+
+**`b4e24e0ca` — the hyper-connection mix is two launches at decode widths.** 97 mixes
+per token, eight launches each (grouped norm, down mm, scale, silu, up mm, sigmoid,
+gate-mix, inject mm): a launch floor of ~780 per token. `GGML_OP_HC_MIX_DOWN` norms
+in the kernel, dots every w_down column plus the injection weights as extra columns
+of the same fixed-order reduction, applies the silu, and writes `[lr + hc, nt]` that
+the graph views lo and inject out of (`hc_scatter_add` now reads a row-strided
+inject); `GGML_OP_HC_MIX_UP` norms again with one warp in the same order, dots the
+w_up rows against lo, gates and collapses the streams. Weights dequantize
+element-wise (F32/F16/Q8_0/Q6_K), so the dots are float where mmvq quantized the
+activation to Q8_1 -- not bit-identical to the op path, batch-invariant by
+construction. On at ubatch <= 32 (`GGML_QWEN4EXP_HC_MIX2=<n>` moves the bound, `=0`
+off); prefill keeps the mat-muls. Gates: backend-ops 13/13 + 13/13 on CUDA for the
+four weight types; CPU model agrees with the op path to 3.5e-10 in the logits with
+the same selection, invariant across ubatch 6/8. **Measured a loss and shipped off** (`b35433d0a`): see "Fused HC on GB10" under Measured.
+
+**`bf1bb263e` — the host scan takes the identity layout in one pass.** `set_input_qsa`
+grouped every cell into blocks by walking chains on every ubatch (865 us at 33k, past
+3 ms at 131k, on the host per decode token). Serving always has one sequence whose
+cells are a prefix with cell j at position j (prefill writes it so, a suffix rollback
+refills it in order), and there every block is its own cell range. One pass over the
+positions checks it, the block table/window/pool/bias code runs unchanged on the
+identity results; anything else falls back to the scan. `LLAMA_QSA_POOL_TRACE=2`
+runs both and aborts on disagreement (63/63 ubatches of the CPU schedule agree,
+outputs byte-identical); `=1` now prints the host microseconds; 
+`LLAMA_QSA_SCAN_IDENTITY=0` forces the scan.
+
+**`7443bcc77` — decode-sized chunks pace at the decode duty, never at the governor's floor.**
+At layer granularity every chunk sleeps `ms x (100-pct)/pct` at the *current* pct, and the
+SoC governor holds its floor (30%) until the package is 5 C under the limit. Decode load
+after a hot prefill sits at 82-85 C on this box, so the hold never released and every
+decode after a long prefill ran at 30% for the rest of the request: the IndexShare A/B
+measured 20-24 t/s at 37k where the same build without the hold does ~40. A chunk under
+`GGML_CUDA_POWER_CHUNK_EXEMPT_MS` (4 ms; a decode layer-chunk is under 1 ms, a
+1024-token prefill layer-chunk 20-60 ms) now pays `GGML_CUDA_POWER_DECODE` (default the
+base duty), so the governor only bites prefill, which is the only phase that ever wedged
+the box. Serving must carry this before the cut-over: `serve-qwen` runs `SOC_MAX=86`.
+
+**`89224eb7d` — the pooled window drops the stream offset from the ubatch cell indices.** The
+cache writes `k_idxs` as `stream*size + cell` and the window's touched check read them
+as stream-local, so any ubatch with a second stream aborted in `set_input_qsa`
+(`llama-perplexity -b 2048 -c 512` packs four sequences; the requant KLD ladder found
+it). Serving at `-np 1` never reaches it. Multi-sequence pooled serving has still not
+been exercised beyond this one path.
+
 ## Measured: what pays and what does not
 
 Ablation at two shapes, same config, one server boot per leg. Acceptance was
@@ -302,14 +382,18 @@ per-step indexer cost eats the gain at 141k (-2%, inside the floor) while paying
 | --- | --- |
 | `test-llama-archs -a qwen4exp` | OK, GB10 8.88e-08 / CPU 0.00e+00 |
 | backend-ops | 14739/14739 (was 13919; upstream added cases) |
-| DS4 PPL | **6.0827 +/- 0.10676** vs the 6.0735 anchor: inside the bar, not exact; the fusion-off run (upstream `3466812d1` fused MoE reduction is FMA-contracted) is queued to attribute it |
+| DS4 PPL | **6.0827 +/- 0.10676** vs the 6.0735 anchor: inside the bar, not exact. Fusion off (`GGML_CUDA_DISABLE_FUSION=1`, 2026-09-02) gives 6.0841, so upstream's FMA-contracted fused MoE reduction is not the source; the 0.15% sits somewhere else in the 301 rebased commits and stays unattributed (DS4 is not the served model) |
 | exactness, unpinned | [det]/[ckpt] 0; [shape]/[roll] 4.37, 3/64 flips (was 4.62, 2/21) |
 | exactness, pinned | [shape]/[roll] **0, 0/64** with pooled keys + two-stage in the tree |
 | exactness, pinned + gather forced | 0.92 / 0.52, 0 flips: the ne3-batched verify FA is not the decode FA, so the gather now defers to the pins (`c611cdac5`) |
+| deep exactness, 9000-token prefill (2026-09-02, after the test fix) | every [det]/[ckpt] scenario **0/64 unpinned and pinned**; [shape]/[roll] unpinned 6.58, 0 flips (shallow was 4.37, 3 flips) |
+| deep exactness, pinned [shape] at 9000 | **5.709**, 0 flips, where shallow pinned is 0. Identical with the pooled cache off and with two-stage off; the per-head score under pins (`8d3996709`) moves it to 5.482, so the score matmul's kernel was one contributor. Depth scan (per-head score): **1500: 0** (n_kv under the selection width, every cell in), **3000: 2.937**, **6000: 3.322**, 9000: 5.482, single-stage or two-stage alike -- the variance appears exactly when the selection is real and grows with depth; the stable-argsort leg (`LLAMA_QSA_TOPK_SORT=1`) gives **bit-identical** 2.93724 / 5.48222, so the top-k tie-break is cleared too. Every selection-side knob is excluded and the delta needs a real sparse mask: the FA MMA path over the sparse mask under the pins is what remains; a `-fa off` pinned leg at 3000 is queued as the discriminator. Serving is unpinned, so this is a research property, not a serving defect |
+| pinned exactness at the default prefill, per-head score in the tree | **0 / 0/64** on every line: no shallow regression from today's commits |
+| item 6/7 gates on the GPU (2026-09-02, build-next with f16 gather + fused HC + identity scan + per-head score + governor fix) | backend-ops HC_MIX_DOWN 13/13, HC_MIX_UP 13/13, GET_ROWS 115/115, PAD 30/30, HC_SCATTER_ADD 4/4; tiny model on CUDA: f16 gather **byte-identical** (logits and selection), fused HC within 2.3e-10 of the op path; real-model PPL at decode width (`-ub 8`, 10 chunks): fused HC **1.8120** vs op path **1.8052** (+0.4%, inside the 0.058 bar; MoE numerics move PPL by this much either way); shallow exactness unpinned [shape] 5.52 / 5 flips (was 4.37 / 3), **pinned 0 on every line** |
 | rollback test, real model | stops at the known dirty-ctx stale-ring case (recorded, unreachable in serving) |
 | selection identity at 16k, pooled on vs off | **identical, 218,196 lines, logits max 0** |
 | selection identity, gather vs scan | 1% of lines (rounding cascade), logits 1.30 / 3 flips |
-| selection identity, two-stage vs single | differed from the engagement step: prefill queries lost visible blocks to their ubatch's own future blocks -> causal block bias (`8ae27d3cb`), rerun queued |
+| selection identity, two-stage vs single | differed from the engagement step: prefill queries lost visible blocks to their ubatch's own future blocks -> causal block bias (`8ae27d3cb`); rerun 2026-09-02 at 9000/16k: **identical, 0 of 218,196 lines, logits max 0** |
 
 ### n_max sweep at depth (2026-09-02, server, sparse draft, warm reps)
 
@@ -333,6 +417,128 @@ harness that prefills past ~30k must run `GGML_CUDA_POWER=70` and the SoC-temper
 abort from `experiments/gb10-thermal/soak.sh`; the faster prefill raises sustained draw,
 so the old P85 margin is gone. Lost with `/tmp`: the harness scripts, nsys traces and
 the gate-3 selection dumps; every result was already recorded above.
+
+### Dense requant ladder (2026-09-02): UD-IQ4_XS with the dense Q8_0 set at Q6_K / Q5_K
+
+The per-token bytes of UD-IQ4_XS are ~63% dense Q8_0 (attention/GDN projections, HC
+mixers, shared expert) and ~37% experts (10 of 512), so the dense set is the lever.
+`llama-quantize --allow-requantize --keep-split --tensor-type-file` with every tensor
+pinned to its current type except that set (same type = byte copy; `only_copy` would
+block the overrides). K-quants need 256-column rows: the HC up projections (320) and the
+shared-expert down (640) fall back to Q8_0 / Q5_1. 351 (Q6_K) and 399 (Q5_K) tensors
+converted, 81 s each. KLD against the original, 20 x 512 wiki chunks (the ladder also
+found the multi-stream window bug, `89224eb7d`):
+
+| arm | mean KLD | median | 99% | ln PPL ratio | same top-1 |
+| --- | --- | --- | --- | --- | --- |
+| dense Q6_K | **0.049** | 0.004 | 0.70 | -0.0002 | **93.6%** |
+| dense Q5_K | 0.096 | 0.009 | 1.33 | +0.024 | 91.5% |
+
+A numerics-only perturbation of this MoE flips top-1 on ~5% of tokens (the expert-order
+sensitivity), so Q6_K sits near that floor and Q5_K is a visible cost. Decode, llama-bench
+tg64 at P70, three reps:
+
+| arm | tg d0 | tg d32768 |
+| --- | --- | --- |
+| original | 22.35 +- 0.38 | 20.45 +- 0.28 |
+| dense Q6_K | 22.72 +- 0.40 (+1.7%) | 21.42 +- 0.67 (+4.7%) |
+| dense Q5_K | 23.27 +- 0.62 (+4.1%) | 21.51 +- 0.32 (+5.2%) |
+
+**Negative.** The byte model said -14% per-token bytes for Q6_K; decode moved 2-5%, so
+the dense weights are not the bottleneck the byte count made them look (the expert
+gathers, the PLE row, the attention and the launch floor are the rest), and 0.05-0.10 KLD
+is not worth 2-5%. The original UD-IQ4_XS stays. The two requants sit under
+`~/models/qwen38-flash-next/UD-IQ4_XS-dense{Q6K,Q5K}/` (87 GB each) until deleted.
+
+### IndexShare serving A/B (2026-09-02, after the governor fix, sparse draft, NMAX 5)
+
+| arm | 37k cold | 37k warm | 64k cold | 64k warm | acc 37k/64k |
+| --- | --- | --- | --- | --- | --- |
+| share on | 28.6 | 37.1 / 39.6 | 32.2 | 37.2 / 37.5 | 0.80 / 0.75 |
+| share off | 27.3 | 35.9 / 38.8 | 32.4 | 37.4 / 37.8 | 0.80 / 0.75 |
+
+Identical drafts (same draft_n and acceptance in every row), tg inside the 2% floor at both
+depths. Neutral, so opt-in from now on (`LLAMA_MTP_INDEXSHARE=1`): the chain steps'
+indexer scan was never the cost. The same A/B before the governor fix read 20-24 t/s at
+37k in both arms -- the number that exposed the governor hold.
+
+### Fused HC on GB10: a launch-count win that lost on bandwidth (2026-09-02)
+
+llama-bench tg64, P70 layer duty (decode chunks at the base duty), three reps, build-next
+unless noted:
+
+| arm | d0 | d32768 |
+| --- | --- | --- |
+| fused HC on, f16 gather on (thread-per-row up kernel) | 16.40 +- 0.18 | 15.91 +- 0.45 |
+| fused HC on, f16 gather off | 15.84 +- 0.03 | 14.94 +- 0.19 |
+| fused HC on, warp-cooperative up kernel (`b35433d0a`) | 17.85 +- 0.89 | 17.54 +- 0.52 |
+| **fused HC off, f16 gather on** (the shipping default) | **21.61 +- 0.69** | **20.92 +- 0.15** |
+| fused HC off, f16 gather on, same configuration 20 min later | 25.14 +- 0.52 | 21.59 +- 1.50 |
+| everything off (HC, f16, identity) | 24.17 +- 0.96 | 21.60 +- 1.59 |
+| old production build (`build/`) | 22.42 +- 0.46 | 18.00 +- 0.68 |
+
+The fused pair replaced eight launches with two and lost 24%, then 17% after the up
+kernel was rewritten to read coalesced: the mmvq/mmvf kernels it replaced are the tuned
+ones and the launch floor is smaller than the bandwidth the fused pair still wastes. Off
+by default, ops and tests kept. The f16 gather is +3.5% / +6.5% against the same build
+with it off, inside the arms' spread at d0 but consistent at depth. The new stack with
+the fused HC off is **+16% at d32k over production** (20.9 vs 18.0); the d0 spread
+(21.6 vs 24.2 all-off, and 21.6 vs 25.1 for the *same* configuration 20 minutes apart) is
+the package temperature the arm happened to start at, not a signal: d0 arms carry
++-15% here, d32k arms about +-4%.
+
+### Cold real-text prefill and the governor (2026-09-02, 37k prompt, P70, guarded)
+
+| arm | cold pp t/s | main-thread major faults | warm pp t/s |
+| --- | --- | --- | --- |
+| old build (no governor) | 210.8 | 376,391 | 432.2 (unthrottled, package to 94 C) |
+| PLE gather on all threads | 337.0 | 19,879 | 330.4 (governor engaged at 86 C) |
+| + `MADV_WILLNEED` ahead | **368.0** | **991** | 312.4 (governor engaged) |
+
+Cold is the target and it is +75% with the faults gone (`d3ca42258` / `732b007f1`).
+The warm column is not a build comparison: the old binary has no governor and ran the
+package to the wedge line, the new ones held 86 C at 30% duty and paid for it. A
+warm 37k prefill at P70 under the governor is ~310-350 t/s; the unthrottled 432 is
+the number that crashed the box twice.
+
+The governor check itself: 37k warm prefill at P70 with `SOC_MAX=86 MIN=30` — engaged
+at 86 C, duty to 30%, cleared at 75 C, external abort never fired, 347.8 t/s.
+
+### The width-1 "fault" at depth was the test asking for 2.23e9 logits (2026-09-02)
+
+The first deep exactness run (`SPEC_PREFILL=9000`) reported the width-1 decode path
+as not reproducible across two fresh contexts of one process: max logit delta
+0.688642, 60/64 argmax flips, first at position 0, the same numbers on every run.
+Width 7 agreed with itself. Two-stage off and pooled cache off died instead with a
+CUDA illegal memory access in the prefill, as did the old production build.
+
+Bisected one knob at a time, all leaving the identical delta: fused HC, identity
+scan, batch-invariance pins, gather (off gives the NaN-shaped signature), ring size
+1/4/6, thread count 4/20, CUDA graphs off, a stable argsort in place of the top-k
+kernel. Prefill 8000 was clean. The dump tool never reproduced it: not with three
+contexts in one process, not with the test's own periodic prompt, not with two-stage
+or gather off -- until it requested a logit row for every prompt token the way the
+test's `decode_span` did. Then its second context died with the illegal access.
+
+9000 rows x 248,320 vocabulary = 2.23e9 floats, past INT32_MAX; 8000 rows is 1.99e9.
+The inference is that something on the CUDA output path indexes those elements with a
+32-bit int and writes past its tensor, and what it hits decides the symptom: an abort,
+or a silent corruption of a neighbouring buffer that the rest of the run reads back as
+deterministic garbage, different per context because the allocations differ. The
+boundary is not pinned to the row: 8600 and 8700 rows ran clean in a single context,
+and the 9000-row case also completed its first context, dying only in the second. The
+8000/9000 boundary was read as the two-stage engagement threshold (8192 cells) for
+most of a day. With the prefill requesting one row, the deep test is clean: every
+[det]/[ckpt] scenario 0/64 unpinned and pinned.
+
+Serving cannot reach it (`-ub 1024` caps the rows at 254M floats), llama-perplexity
+asks for 512, but any caller asking for more than 8648 rows at this vocabulary will
+corrupt memory on CUDA. Left as debt in the CUDA backend; the harness is fixed.
+
+Two lessons paid for: a "deterministic but context-dependent" delta is a memory
+corruption signature, not a numerics one, and should have sent me to the batch
+shape first; and the isolation harness must reproduce the *input contract* of the
+failing test (here: which rows are requested), not only its model and prompt.
 
 ## Known debt
 
@@ -371,6 +577,25 @@ five pieces of cross-round driver state (`pending_g_last`, `verify_tok`,
 wrong draft tokens rather than a crash. Do it as its own change, validated
 against the depth harness where acceptance (0.8316) is far more sensitive to
 draft quality than the shallow one.
+
+**Single-stage QSA selection dies above 8192 cells with a wide ubatch.** A 9000-token
+prompt in one ubatch with `LLAMA_QSA_TWO_STAGE=0` (or `LLAMA_QSA_POOL_CACHE=0`, which
+falls back to single-stage) ends in `CUDA error: an illegal memory access` inside the
+prefill graph; the old production build dies the same way on the same shape. 8000
+tokens (n_kv 8192) runs. Serving never sends a 9000-token ubatch (`-ub 1024`) and
+two-stage owns the regime past 8192 by default, so this is latent, but the kernel
+limit behind it (the per-query sort over n_kv columns, most likely) is unlocated.
+Found 2026-09-02 while bisecting the width-1 fault.
+
+**Loops of short graphs run unthrottled: the exemption, not the governor, decides.**
+`GGML_CUDA_POWER_EXEMPT_MS=250` skips the duty cycle for any graph under 250 ms, which
+is every decode step (by design) and also every 8-token prefill ubatch of the dump
+tool and every node chunk of a graphs-off run. The governor logged its engage line and
+the package still climbed to 91-92 C in those legs, one degree under the external
+abort, while the one-ubatch prefills held 74-83 C under the same settings. Harness
+rule: a leg that prefills in small ubatches, or runs with `GGML_CUDA_DISABLE_GRAPHS`,
+sets `GGML_CUDA_POWER_EXEMPT_MS=20` (`run-guarded.sh` now honours a preset value);
+benches keep 250 so decode is measured unthrottled.
 
 ## Gates
 
