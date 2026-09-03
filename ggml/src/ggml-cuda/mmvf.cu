@@ -882,6 +882,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // [TAG_MMVF_BATCH_INVARIANT] BF16 was the one family the pin skipped: qwen4exp's
+                // indexer q/k projections are BF16, so under the pins the indexer query took the
+                // mat-vec at one token and the mma tiles at a verify width, and at depth the
+                // selection followed the rounding (pinned width-1 vs width-7: 0 at 1500 tokens,
+                // 2.9 at 3000, 5.5 at 9000, unchanged by every other knob)
+                if (GGML_CUDA_MMVF_BATCH_INVARIANT || (ggml_cuda_batch_invariant_flags() & GGML_CUDA_BI_MMVF)) {
+                    return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
