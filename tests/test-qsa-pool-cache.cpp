@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -180,7 +181,8 @@ int main(int argc, char ** argv) {
     // only the last row is written to the file either way
     static const bool all_logits = getenv("LLAMA_QSA_ALL_LOGITS") != nullptr && atoi(getenv("LLAMA_QSA_ALL_LOGITS")) != 0;
 
-    auto decode = [&](const std::vector<llama_token> & toks) {
+    std::function<void(const std::vector<llama_token> &)> decode_impl;
+    decode_impl = [&](const std::vector<llama_token> & toks) {
         const bool last_only = toks.size() > 64;
 
         for (size_t off = 0; off < toks.size(); off += cparams.n_batch) {
@@ -217,6 +219,21 @@ int main(int argc, char ** argv) {
         }
 
         pos += (llama_pos) toks.size();
+    };
+
+    // LLAMA_QSA_ONE_AT_A_TIME=1 decodes every step of the schedule after the prompt one token
+    // per llama_decode, so the selections of the wide steps can be diffed against the same
+    // queries seen one at a time (the .topk rows line up by query order)
+    static const bool one_at_a_time = getenv("LLAMA_QSA_ONE_AT_A_TIME") != nullptr && atoi(getenv("LLAMA_QSA_ONE_AT_A_TIME")) != 0;
+
+    auto decode = [&](const std::vector<llama_token> & toks) {
+        if (one_at_a_time && toks.size() > 1 && toks.size() <= 64) {
+            for (const llama_token t : toks) {
+                decode_impl({ t });
+            }
+            return;
+        }
+        decode_impl(toks);
     };
 
     auto rollback = [&](int n) {
