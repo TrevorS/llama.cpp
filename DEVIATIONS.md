@@ -418,6 +418,45 @@ abort from `experiments/gb10-thermal/soak.sh`; the faster prefill raises sustain
 so the old P85 margin is gone. Lost with `/tmp`: the harness scripts, nsys traces and
 the gate-3 selection dumps; every result was already recorded above.
 
+### NMAX x p-min at 37k (2026-09-03 sweep C, warm tg / acceptance, P70)
+
+| | p-min 0.5 | 0.7 (default) | 0.9 |
+| --- | --- | --- | --- |
+| NMAX 4 | **40.1-41.9** / 0.73 | 38.3-39.3 / 0.85 | 37.1-38.0 / 0.96 |
+| NMAX 5 | 39.2-39.9 / 0.64 | 37.1-38.9 / 0.80 | 36.2-36.8 / 0.92 |
+| NMAX 6 | 35.0-36.5 / 0.55 | 36.8-39.0 / 0.78 | 36.4-36.7 / 0.88 |
+
+A lower p-min drafts more and wins on throughput at this depth despite the acceptance it
+gives up; n4/p0.5 leads the default by ~5%, above the floor but a single 37k prompt. The
+default changes only if the 140k confirmation (phase D) agrees.
+
+### Prefill ubatch under the governor (2026-09-03 sweep B, 140k fill, P70, spec on)
+
+| ubatch | prefill t/s | peak SoC | warm tg |
+| --- | --- | --- | --- |
+| 512 | 139 | 88 | 38.8 |
+| **1024** | **231** | 84 | 38.0 |
+| 2048 | 178 | 88 | 39.4 |
+
+1024 stays. The package state moves these (the same 1024 fill read 167 t/s at peak 90 in
+sweep A), so treat the ordering as the result, not the absolute numbers.
+
+### Decode duty is not a lever (2026-09-03 sweep A)
+
+`GGML_CUDA_POWER_DECODE` 75 / 90 / 100 through serve-qwen (P70 base, guard 93), spec on:
+
+| depth | 75 | 90 | 100 | peak SoC |
+| --- | --- | --- | --- | --- |
+| 37k warm | 37.3 / 39.7 | 35.8 / 40.8 | 39.2 / 41.5 | 85-91 |
+| 140k warm | 36.6 / 36.7 | 38.3 / 38.3 | 38.1 / 38.2 | 90-91 |
+
+All inside the rig's floor. The reason is structural: batch-1 decode runs as a CUDA graph
+replay, and the per-chunk pacing (`ggml_cuda_power_chunk_node`) only exists on the
+direct-exec path, so decode was never paced by the duty cycle at all; the exemption and
+yesterday's decode-chunk rule matter only for the non-graph decode shapes (verify widths
+under `-fa` fallbacks, graphs disabled). The duty cycle is a prefill governor. The
+"+25-30% if decode ran free" estimate was wrong because decode already did.
+
 ### Spec on/off through serve-qwen on the shipping build (2026-09-02 evening)
 
 build-next, `serve-qwen` (P75 layer duty, decode chunks at the base duty, SOC_MAX 86), one
@@ -444,6 +483,55 @@ loads with 35.6 GB to spare; a 241,856-token prompt fills at **144 t/s (27.9 min
 the governor holding 86 C throughout, decode reads 25.0 cold and **28.9 / 32.4 warm**
 (acceptance 0.74-0.77), which is 33-35 at the P75 the shorter rows ran on. Decode keeps
 most of its depth-flatness to the maximum; the price of 262k is the fill.
+
+### Phase B (2026-09-03): pread PLE, the two fusions, the input-race fix and the lifted tests, gated on one build
+
+build-next at `b5eae94bd` (`a90c8d7e0` MTP naming, `ed867e9d5` fusions, `b5eae94bd` pread
+PLE, on `7145ec968` #28058 and `5bd067473` #28108/#28109). Real model unless marked tiny:
+
+| gate | result |
+| --- | --- |
+| test-backend-ops HC_GATE_MIX (sigmoid cases added) | 6/6 |
+| test-backend-ops FLASH_ATTN_EXT (with the lifted narrow-width cases) | 2970/2970 |
+| test-backend-ops GATED_DELTA_NET (with the lifted batch-invariance cases) | 36/36 |
+| tiny logits, PLE `on-direct` vs `on` (CPU) | identical |
+| tiny logits, CUDA fusion on vs `GGML_CUDA_DISABLE_FUSION=1` (GPU) | max abs delta 0 |
+| exactness, shallow pinned: det / shape / roll | 0 / 0 / 0 |
+| exactness, deep 9000 pinned: det / shape / roll | 0 / 0 / 0 |
+| PPL 10 chunks, `-lzm on-direct` vs `on` | 1.8175 both |
+
+The `[ckpt-roll]` and `[roll-ar]` arms read their documented stale-snapshot-ring values
+(see "The snapshot ring goes stale after a narrow ubatch"), unchanged from 09-02.
+
+**Pread PLE (upstream #28136) loses to the threaded gather.** Cold real-text prefill, the
+table evicted from the page cache before each arm, P70, spec off:
+
+| prompt | mmap + threads + willneed | `on-direct` (pread pool) |
+| --- | --- | --- |
+| 37k cold / warm | 361.2 / 308.9 | 330.2 / 290.7 |
+| 140k cold / warm | 183.9 / 171.7 | 169.1 / 157.6 |
+
+Upstream's 300 -> 750-800 t/s was against the plain demand-faulting mmap; the threaded
+gather with MADV_WILLNEED had already taken that step here (211 -> 368 on 09-02), and
+against it the pread pool is 8-9% slower at both depths. "Warm" ran second and started
+hot, which is why it reads below "cold" in every arm; only arms in the same slot compare.
+Default stays `-lzm on`; `on-direct` is kept opt-in as upstream carries it.
+
+**Contamination probe (upstream #28056): not reproducible here, before or after the
+fix.** 24 real-text prompts through llama-server, a 54 s concurrent burst against the
+same prompts one at a time, exact match on the completions: 0 mismatches on the old
+build (`build/`, before the fix) and 0 on build-next. The fix's rationale holds on GB10
+(integrated=1, inputs read zero-copy from pinned host memory), so the unconditional
+synchronize stays. The 37k cold prefill above is 2% under 09-02's 368 on the same arm,
+inside the floor.
+
+**Fusion bench.** llama-bench tg64, P70, 3 reps: fusion on 17.37 +- 0.12 (d0) /
+17.29 +- 1.76 (d32768); `GGML_CUDA_DISABLE_FUSION=1` 15.89 +- 0.28 / 14.18 +- 0.66. The
+toggle disables every CUDA fusion (rms-norm+mul, the add chains, softcap, and the new
+scale-silu), so that is the whole set, not the two new ones. These arms ran straight
+after the burst probe with the package at 90 C; the d32k figure sits 17% under 09-02's
+20.92 for the same configuration, beyond that row's +-4% spread, so an interleaved
+old-vs-new decode A/B is owed before the number is believed either way (phase D).
 
 ### Dense requant ladder (2026-09-02): UD-IQ4_XS with the dense Q8_0 set at Q6_K / Q5_K
 
