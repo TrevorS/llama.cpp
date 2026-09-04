@@ -533,6 +533,46 @@ after the burst probe with the package at 90 C; the d32k figure sits 17% under 0
 20.92 for the same configuration, beyond that row's +-4% spread, so an interleaved
 old-vs-new decode A/B is owed before the number is believed either way (phase D).
 
+### State at the close of 2026-09-03
+
+**Shipping.** `serve-qwen` defaults are `build-next`, `SPEC=1`, `CTX=262144`, `-lzm on`;
+build-next is the tree at `b5eae94bd` (docs on top at `35ea116b0`), gated in phase B above.
+Serving on those defaults; `NMAX=5 PMIN=0.7` still, because the n4/p0.5 lead (+8% at 37k,
+sweep C) has not been confirmed at 140k.
+
+**Landed today, unpushed:** `7145ec968` (#28058 input-race sync, recurrent mid-range
+seq_rm reject, server cache-reuse guard), `5bd067473` (#28108/#28109 invariance tests
+lifted), `a90c8d7e0` (Unsloth/upstream MTP head naming accepted), `ed867e9d5` (scale-silu
+fusion, sigmoid folded into hc_gate_mix), `b5eae94bd` (`-lzm on-direct`, opt-in, slower),
+`35ea116b0` (docs). The `.claude/settings.json` permission allowlist is untracked.
+
+**Built but not gated: the upstream merge.** Worktree `../llama-cpp-rebase`, branch
+`rebase-20260903` at `3e2f809b7`: origin/master `d230ddd76` (42 commits) merged into
+`5bd067473` (conflicts in fattn-mma-f16.cuh, fattn.cu, the KV cache, the deepseek4 and
+qwen4exp `build_attn_mha` calls, `n_ff_exp()`), plus `35188587f` (`LLAMA_QSA_SPARSE_FA=1`
+hands the scan path's selection width to upstream's #27970 sparse flash attention; off by
+default and off under pins) and the marker fix. The CUDA build passed; `test-llama-archs`
+qwen4exp passed on it (GB10 9.05e-08, CPU 0); the full backend-ops run was cut at the
+end of the day. Not run on the merged tree: exactness (unpinned, pinned, deep), PPL, the
+sparse-FA prefill A/B at 37k and 140k, the Unsloth head acceptance through the naming
+shim. Scripts: `experiments/sweeps-20260903/phase-c.sh` (the gates and both A/Bs) and
+`phase-d.sh` (rebases `5bd067473..HEAD` onto the merge with a "no commit on any remote"
+guard, rebuilds build-next, quick gates, an interleaved production-vs-new decode A/B at
+d32768, the 140k n4/p0.5 confirmation, then serves). Both wait on markers; phase D also
+needs `phase-d.go` recreated.
+
+**Open number.** Phase B's llama-bench d32768 tg64 read 17.29 +- 1.76 on build-next,
+against 20.92 +- 0.15 on 09-02 for the same configuration, but it ran straight after the
+burst probe with the package at 90 C. Serving numbers through the day (35-38 t/s at
+37k-140k with spec) match 09-02, so this is filed as a thermal artifact until the
+interleaved A/B in phase D says otherwise. If it is real, the candidate is the
+unconditional sched synchronize in `7145ec968`, which has no runtime toggle.
+
+**Remote.** `trevor/ds4-flash-experiments` is the 08-31 push; the 09-01 rebase rewrote
+everything after `e4b9af007`, so the remote holds pre-rebase copies of 68 local commits
+plus the 3 rollback-ring commits dropped for #28123. The next push is a force push, as
+after every rebase; nothing local is missing.
+
 ### Dense requant ladder (2026-09-02): UD-IQ4_XS with the dense Q8_0 set at Q6_K / Q5_K
 
 The per-token bytes of UD-IQ4_XS are ~63% dense Q8_0 (attention/GDN projections, HC
