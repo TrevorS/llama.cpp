@@ -437,7 +437,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+    // the sigmoid rides inside the gate-mix kernel on the fused path (one launch fewer per
+    // mix); the op path keeps it as a node
+    ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
+    ggml_tensor * gate = hc_fused ? gate_logits : ggml_sigmoid(ctx0, gate_logits);
     cb(gate, "hc_gate", il);
 
     // Gate the streams and collapse them to their mean. Fused: the chain this replaces
@@ -445,7 +448,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // out in full only to read it straight back -- 168 MB per call at 4k tokens.
     ggml_tensor * mixed;
     if (hc_fused) {
-        mixed = ggml_hc_gate_mix(ctx0, xn, gate, (int) hc, 1.0f / (float) hc);
+        mixed = ggml_hc_gate_mix_sigmoid(ctx0, xn, gate, (int) hc, 1.0f / (float) hc);
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);

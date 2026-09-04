@@ -7,6 +7,7 @@
 #include "ggml-cuda/hc-scatter-add.cuh"
 #include "ggml-cuda/hc-gate-mix.cuh"
 #include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/scale-silu.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -3545,6 +3546,29 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * silu  = cgraph->nodes[node_idx+1];
+
+        if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != scale) {
+            return false;
+        }
+        if (scale->src[0]->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(scale->src[0]) || !ggml_is_contiguous(silu)) {
+            return false;
+        }
+        // scale with a bias is a different op
+        float bias;
+        memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+        if (bias != 0.0f) {
+            return false;
+        }
+        return true;
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
@@ -4319,6 +4343,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, cgraph->nodes[i + 1], node);
+        return 1;
     }
 
     return 0;

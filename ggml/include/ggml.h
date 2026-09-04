@@ -2819,6 +2819,14 @@ extern "C" {
             int                   hc,
             float                 scale);
 
+    // same, with the sigmoid applied to `gate` inside the kernel (gate holds the logits)
+    GGML_API struct ggml_tensor * ggml_hc_gate_mix_sigmoid(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            int                   hc,
+            float                 scale);
+
     // The whole hyper-connection mix in two launches, for small token counts. Both ops apply
     // the grouped RMSNorm themselves: xn[e,t] = x[e,t] * rrms[c(e),t] * gamma[e], the rms over
     // one stream of n_embd, gamma over the full hc*n_embd row.

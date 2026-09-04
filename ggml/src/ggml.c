@@ -6789,11 +6789,23 @@ struct ggml_tensor * ggml_hc_gate_mix(
     int32_t params_i[1] = { hc };
     ggml_set_op_params(result, params_i, sizeof(params_i));
     ggml_set_op_params_f32(result, 1, scale);
+    ggml_set_op_params_i32(result, 2, 0);
 
     result->op     = GGML_OP_HC_GATE_MIX;
     result->src[0] = x;
     result->src[1] = gate;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_gate_mix_sigmoid(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        int                   hc,
+        float                 scale) {
+    struct ggml_tensor * result = ggml_hc_gate_mix(ctx, x, gate, hc, scale);
+    ggml_set_op_params_i32(result, 2, 1);
     return result;
 }
 
