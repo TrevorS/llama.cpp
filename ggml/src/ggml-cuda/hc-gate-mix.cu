@@ -11,7 +11,7 @@ static __global__ void k_hc_gate_mix_f32(
         const float * __restrict__ x,
         const float * __restrict__ gate,
         float       * __restrict__ dst,
-        const int n_embd, const int hc, const float scale) {
+        const int n_embd, const int hc, const float scale, const int sigmoid) {
 
     const int t = blockIdx.y;
     const long long base = (long long) t * hc * n_embd;
@@ -20,7 +20,8 @@ static __global__ void k_hc_gate_mix_f32(
         float acc = 0.0f;
         for (int c = 0; c < hc; ++c) {
             const long long i = base + (long long) c*n_embd + e;
-            acc += x[i] * gate[i];
+            const float g = sigmoid ? 1.0f / (1.0f + expf(-gate[i])) : gate[i];
+            acc += x[i] * g;
         }
         dst[(long long) t*n_embd + e] = acc * scale;
     }
@@ -39,6 +40,7 @@ void ggml_cuda_op_hc_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int hc = ggml_get_op_params_i32(dst, 0);
     const float scale = ggml_get_op_params_f32(dst, 1);
+    const int sigmoid = ggml_get_op_params_i32(dst, 2);
 
     const int n_embd   = dst->ne[0];
     const int n_tokens = dst->ne[1];
@@ -51,5 +53,5 @@ void ggml_cuda_op_hc_gate_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     dim3 grid(nblk_x, n_tokens, 1);
     k_hc_gate_mix_f32<<<grid, block_size, 0, ctx.stream()>>>(
         (const float *) x->data, (const float *) gate->data, (float *) dst->data,
-        n_embd, hc, scale);
+        n_embd, hc, scale, sigmoid);
 }
