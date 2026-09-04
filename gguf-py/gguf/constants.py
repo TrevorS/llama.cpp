@@ -661,6 +661,9 @@ class MODEL_TENSOR(IntEnum):
     HC_HEAD_NORM         = auto() # qwen4exp
     HC_HEAD_DOWN         = auto() # qwen4exp
     HC_HEAD_UP           = auto() # qwen4exp
+    NEXTN_HC_HEAD_NORM   = auto() # qwen4exp MTP head, Unsloth/upstream naming
+    NEXTN_HC_HEAD_DOWN   = auto()
+    NEXTN_HC_HEAD_UP     = auto()
     ROPE_FREQS           = auto()
     ROPE_FACTORS_LONG    = auto()
     ROPE_FACTORS_SHORT   = auto()
@@ -1413,6 +1416,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_HEAD_NORM:              "output_hc_norm",                 # qwen4exp
     MODEL_TENSOR.HC_HEAD_DOWN:              "output_hc_down",                 # qwen4exp
     MODEL_TENSOR.HC_HEAD_UP:                "output_hc_up",                   # qwen4exp
+    MODEL_TENSOR.NEXTN_HC_HEAD_NORM:        "blk.{bid}.nextn.hc_head_norm",
+    MODEL_TENSOR.NEXTN_HC_HEAD_DOWN:        "blk.{bid}.nextn.hc_head_down",
+    MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
     MODEL_TENSOR.ROPE_FREQS:                "rope_freqs",
     MODEL_TENSOR.ROPE_FACTORS_LONG:         "rope_factors_long",
     MODEL_TENSOR.ROPE_FACTORS_SHORT:        "rope_factors_short",

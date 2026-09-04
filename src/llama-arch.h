@@ -591,6 +591,9 @@ enum llm_tensor {
     LLM_TENSOR_HC_HEAD_NORM,   // qwen4exp
     LLM_TENSOR_HC_HEAD_DOWN,   // qwen4exp
     LLM_TENSOR_HC_HEAD_UP,     // qwen4exp
+    LLM_TENSOR_NEXTN_HC_HEAD_NORM, // qwen4exp MTP head in the Unsloth/upstream naming
+    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_HC_HEAD_UP,
     LLM_TENSOR_HC_ATTN_FN,
     LLM_TENSOR_HC_ATTN_BASE,
     LLM_TENSOR_HC_ATTN_SCALE,
