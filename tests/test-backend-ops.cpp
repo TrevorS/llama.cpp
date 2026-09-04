@@ -4101,11 +4101,13 @@ struct test_hc_gate_mix : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, hc, n_tokens);
+        return VARS_TO_STR4(n_embd, hc, n_tokens, sigmoid);
     }
 
-    test_hc_gate_mix(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 17)
-        : n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+    const bool sigmoid;
+
+    test_hc_gate_mix(int64_t n_embd = 2560, int64_t hc = 4, int64_t n_tokens = 17, bool sigmoid = false)
+        : n_embd(n_embd), hc(hc), n_tokens(n_tokens), sigmoid(sigmoid) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
@@ -4114,7 +4116,8 @@ struct test_hc_gate_mix : public test_case {
         ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, n_tokens);
         ggml_set_name(gate, "gate");
 
-        ggml_tensor * out = ggml_hc_gate_mix(ctx, x, gate, (int) hc, 1.0f/(float) hc);
+        ggml_tensor * out = sigmoid ? ggml_hc_gate_mix_sigmoid(ctx, x, gate, (int) hc, 1.0f/(float) hc)
+                                    : ggml_hc_gate_mix(ctx, x, gate, (int) hc, 1.0f/(float) hc);
         ggml_set_name(out, "out");
 
         return out;
@@ -9515,6 +9518,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 17));
     test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 512));
     test_cases.emplace_back(new test_hc_gate_mix(1024, 2, 33));
+    test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 1, true));
+    test_cases.emplace_back(new test_hc_gate_mix(2560, 4, 7, true));
 
     for (ggml_type tw : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_hc_mix_down(tw, 2560, 4, 320, 1, true));

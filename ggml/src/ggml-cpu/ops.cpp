@@ -11594,6 +11594,7 @@ static void ggml_compute_forward_hc_gate_mix_f32(
 
     const int     hc     = ggml_get_op_params_i32(dst, 0);
     const float   scale  = ggml_get_op_params_f32(dst, 1);
+    const int     sigm   = ggml_get_op_params_i32(dst, 2);
     const int64_t n_embd = dst->ne[0];
     const int64_t nt     = dst->ne[1];
 
@@ -11612,7 +11613,8 @@ static void ggml_compute_forward_hc_gate_mix_f32(
             float acc = 0.0f;
             for (int c = 0; c < hc; ++c) {
                 const int64_t i = (int64_t) c*n_embd + e;
-                acc += xr[i] * gr[i];
+                const float g = sigm ? 1.0f / (1.0f + expf(-gr[i])) : gr[i];
+                acc += xr[i] * g;
             }
             dr_[e] = acc * scale;
         }
