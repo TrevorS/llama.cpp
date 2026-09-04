@@ -5774,7 +5774,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 // gains one tail ne3-slice holding lse[h, iq, s] contiguous at element
 // offset DV*n_head*n_q*ne3 — idx = (s*n_q + iq)*n_head + h. The attention
 // output itself is the plain [DV, n_head, n_q, ne3] prefix. Flag lives in
-// op_params i32[4]. Tail must fit: requires DV >= ne3.
+// op_params i32[5]. Tail must fit: requires DV >= ne3.
 struct ggml_tensor * ggml_flash_attn_ext_with_lse(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5794,14 +5794,14 @@ struct ggml_tensor * ggml_flash_attn_ext_with_lse(
     result->nb[2] = result->nb[1]*result->ne[1];
     result->nb[3] = result->nb[2]*result->ne[2];
 
-    ggml_set_op_params_i32(result, 4, 1); // LSE flag
+    ggml_set_op_params_i32(result, 5, 1); // LSE flag
 
     return result;
 }
 
 bool ggml_flash_attn_ext_has_lse(const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    return ggml_get_op_params_i32(a, 4) != 0;
+    return ggml_get_op_params_i32(a, 5) != 0;
 }
 
 void ggml_flash_attn_ext_set_prec(
