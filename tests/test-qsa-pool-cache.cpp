@@ -94,7 +94,7 @@ int main(int argc, char ** argv) {
     // demand), which the exactness test runs with on
     if (const char * lz = getenv("LLAMA_QSA_LAZY")) {
         mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
-        mparams.lazy_mode = strcmp(lz, "on") == 0 ? LLAMA_LAZY_MODE_ON : strcmp(lz, "auto") == 0 ? LLAMA_LAZY_MODE_AUTO : LLAMA_LAZY_MODE_OFF;
+        mparams.lazy_mode = strcmp(lz, "on") == 0 ? LLAMA_LAZY_MODE_ON : strcmp(lz, "direct") == 0 ? LLAMA_LAZY_MODE_DIRECT : strcmp(lz, "auto") == 0 ? LLAMA_LAZY_MODE_AUTO : LLAMA_LAZY_MODE_OFF;
     }
 
     llama_model * model = llama_model_load_from_file(model_path, mparams);
