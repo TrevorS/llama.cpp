@@ -319,7 +319,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
 
-        const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+        const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
@@ -1393,7 +1393,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
     mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
     cb(mask, "qsa_mask_sel", il);
 
-    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, /*n_kv_max*/ 0, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
