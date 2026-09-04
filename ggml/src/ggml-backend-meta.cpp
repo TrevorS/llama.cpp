@@ -1039,7 +1039,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_HC_SCATTER_ADD:
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            // the rest of the fork's hyper-connection, lightning-indexer and split-attention
+            // ops. They mix or gather across the whole row, so a split source is not safe:
+            // scalar_only keeps them on the same conservative arm as the ops above.
+            case GGML_OP_HC_MIX_UP:
+            case GGML_OP_HC_MIX_DOWN:
+            case GGML_OP_DSV4_HC_FUSED:
+            case GGML_OP_DSV4_LID_TOPK:
+            case GGML_OP_DSV4_LID_UNION:
+            case GGML_OP_DSV4_LID_MEMB:
+            case GGML_OP_DSV4_QAT_SET_ROWS:
+            case GGML_OP_DSV4_FA_MERGE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
