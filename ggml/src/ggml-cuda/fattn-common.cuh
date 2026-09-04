@@ -1026,7 +1026,7 @@ void launch_fattn(
     // Opt-in per-row log-sum-exp output, written to a tail slice past the regular result.
     // Only supported on the stream-k (mma) path; enforced by supports_op. Sinks are included
     // in the LSE (they are folded into the per-row (max, rowsum) before the meta/tail writes).
-    const bool has_lse = ggml_get_op_params_i32(KQV, 4) != 0;
+    const bool has_lse = ggml_flash_attn_ext_has_lse(KQV);
     float * lse_base = has_lse ? (float *) KQV->data + (int64_t) DV*Q->ne[1]*Q->ne[2]*Q->ne[3] : nullptr;
     GGML_ASSERT(!has_lse || stream_k);
 
