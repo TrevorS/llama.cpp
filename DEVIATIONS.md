@@ -1457,3 +1457,103 @@ The draft must be built from the 0731 checkpoint's own tail shards via
 `convert_hf_to_gguf.py --dspark --target-model-dir`, which emits arch `dflash`.
 The standalone `-DSpark` HF repo is a pre-0731 preview and silently costs ~9
 points of acceptance. Legacy arch-`dspark` GGUFs no longer load.
+
+### Phase C/D, 2026-09-03 evening into 09-04: the merge gated after one fix, every open number closed
+
+**The merged tree had an op-param collision.** The 20:06 full `test-backend-ops` run on
+`../llama-cpp-rebase` (killed by the SoC guard at 94 C mid-FLASH_ATTN_EXT) had already logged 20
+FAILs: 13 `sentinel mismatch` on upstream's new `FLASH_ATTN_EXT(... n_kv_max=512|768|2048|2304)`
+sparse-FA cases, 6 `FLASH_ATTN_EXT_BATCH_INVARIANCE` at n_tokens 3/4, one q8_0 tolerance-edge miss.
+A sentinel mismatch is an out-of-bounds write. Upstream #27970 stores `n_kv_max` in FLASH_ATTN_EXT
+`op_params[4]`; the fork's opt-in LSE tail output (`ggml_flash_attn_ext_with_lse`, the DSV4
+split-attention merge) used `op_params[4]` as its flag, read raw in `launch_fattn`. Every
+n_kv_max > 0 launch wrote an LSE tail past the output tensor, and the reverse was live too: the
+fork's LSE calls would read to upstream's sparse path as n_kv_max=1. Fix: the LSE flag is
+`op_params[5]` (ggml.c with_lse/has_lse; fattn-common.cuh calls `ggml_flash_attn_ext_has_lse`).
+FA slot map after the merge: [0..2] scale/max_bias/softcap, [3] prec, [4] n_kv_max, [5] LSE.
+`fattn-common.cuh` is in every fattn instance, so it is a full fattn recompile (39 objects, ~1 min
+at -j10). Uncommitted in the worktree.
+
+Control: upstream-clean `d230ddd76` (worktree `../llama-cpp-upstream`, test-backend-ops only) passes
+all 2959 FLASH_ATTN_EXT cases on GB10, sentinel 0. The failures were ours alone.
+
+**Gates on the fixed merged tree, all green.** backend-ops per op 13197/13203, sentinel 0, the q8_0
+edge miss gone; the six left are FLASH_ATTN_EXT_BATCH_INVARIANCE n_tokens 3/4 x n_kv
+{2048, 7168, 16384}, which is exactly the set upstream #28108 (open, unmerged) reports on master for
+an RTX 5080. `5bd067473` lifted only that PR's tests, not its kernel change. The matrix:
+
+| tree | unpinned | `GGML_CUDA_BATCH_INVARIANT=1` |
+| --- | --- | --- |
+| build-next | 6/12 | 12/12 |
+| merged (fixed) | 6/12 | 12/12 |
+
+Our runtime pin covers the widths #28108 targets. Exactness on the merged tree: unpinned [det] 0
+[shape] 4.36863 / 3 of 64 flips first at pos 8 (identical to build-next, phase B); pinned [det] 0
+[shape] 0 [roll] 0; deep pinned (9000-token prefill, 14 steps) 0/0. PPL 10 chunks 1.8175 +/- 0.05839,
+the phase B digits.
+
+**Sparse FA on the scan path: negative.** `LLAMA_QSA_SPARSE_FA=1` (upstream #27970's compacted mask,
+n_kv_max = the scan's top-k width), spec off, P70, SoC 78-82 C in both 37k legs:
+
+| prefill | dense pp t/s (first / second) | sparse pp t/s |
+| --- | --- | --- |
+| 37k | 365.0 / 319.9 | 319.4 / 287.8 |
+| 140k | 188.4 / 167.2 | 186.9 / 166.2 |
+
+-11% at 37k, a wash at 140k: FA is 18% of prefill and depth-flat, and the per-query mask compaction
+is a pass the masked kernel did not need. Stays off. The commit stays for the toggle.
+
+**The open d32k number was the duty exemption, not thermal and not `7145ec968`.** The 09-02 bench-7
+arms (20.92 new, 18.00 old) ran with run-guarded's default `GGML_CUDA_POWER_EXEMPT_MS=250`, so decode
+spans were exempt from the P70 duty. phase-b.sh, phase-c3.sh and phase-d.sh export 20, so their
+decode runs at 70% duty. Interleaved old/new/old/new, tg64 d32768, three reps each:
+
+| exemption | build/ (old) | build-next (new) | new/old |
+| --- | --- | --- | --- |
+| 20 ms (decode duty-cycled) | 13.72 +- 0.07, 13.31 +- 0.28 | 17.11 +- 0.23, 15.82 +- 0.47 | +19-25% |
+| 250 ms (decode exempt, the 09-02 condition) | 19.86 +- 0.74, 18.97 +- 0.30 | 21.08 +- 0.18, 22.26 +- 0.34 | +6-17% |
+
+21.08 reproduces 09-02's 20.92 +- 0.15. Phase B's 17.29 was the 20 ms setting. No regression; the
+unconditional sched synchronize in `7145ec968` is not costing decode at this depth.
+
+**n4/p0.5 not confirmed at 140k.** serve-qwen, P70, cold fill then two warm reps at 139,804 tokens:
+
+| arm | cold | warm | acceptance |
+| --- | --- | --- | --- |
+| n5/p0.7 (default) | 29.16 | 38.18, 37.77 | 0.813 / 0.827 |
+| n4/p0.5 | 33.17 | 38.54, 39.98 | 0.720 / 0.753 |
+
++3.4% warm on two reps against a ~2% floor; the +8% at 37k does not carry. Defaults stay n5/p0.7.
+
+**Unsloth's self-contained MTP head needed two loader fixes before it loaded.** Its head carries
+`blk.48.nextn.hc_head_{norm,down,up}` where ours has `output_hc_*` (same shapes: [10240,320],
+[10240], [320,10240]). The merged worktree predates the naming shim `a90c8d7e0`, so the phase-c3
+leg died on `output_hc_norm.weight` not found. On build-next the shim itself aborted:
+`a90c8d7e0` registered the three names as `LLM_TENSOR_LAYER_OUTPUT`, and `create_tensor` aborts
+when an input/output-layer tensor is created with a layer number. They are `LLM_TENSOR_LAYER_REPEATING`
+now, like every other `blk.%d.nextn.*` entry (main tree, uncommitted). Result at 37k, 3 reps,
+build-next:
+
+| head | cold | warm | acceptance (warm) | draft_n |
+| --- | --- | --- | --- | --- |
+| ours, Q5_K `mtp-qwen4exp-headQ5K.gguf` | 29.05 | 35.62, 38.56 | 0.799 | 179 |
+| Unsloth, Q8_0 `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | 24.83 | 36.21, 38.14 | 0.822 | 174 |
+
+Same head: cold acceptance 0.724 vs 0.726 on the same 185-186 drafts. Unsloth's Q8_0 output.weight buys
++2.3 points of warm acceptance and gives it back in bytes per step; warm tg ties (37.2 vs 37.1). Nothing
+to switch to, the shim now loads their file, and the memory that their MTP GGUFs are ours stands.
+
+**Thermal note for the runbook.** A background CPU build (-j6, nice 10) beside a guarded GPU leg held
+the SoC at 91 C and every `run-guarded.sh` cooling loop stalled; phase-c2 was stopped for it. Builds
+go first, with the GPU idle. The full backend-ops run also cannot survive as one process: per op,
+with `GGML_CUDA_POWER=50 GGML_CUDA_POWER_EXEMPT_MS=0` for FLASH_ATTN_EXT, MUL_MAT, MUL_MAT_ID, CONV_2D,
+IM2COL_3D, OUT_PROD, it ran clean in 10 min.
+
+**Not done.** The rebase of `5bd067473..HEAD` onto `rebase-20260903`: every one of those commits is on
+the remote since the 20:19 push, and phase-d.sh's guard refuses pushed commits by design. It needs a
+force push after; Teej's call. Uncommitted: the slot fix in `../llama-cpp-rebase`, the loader-class fix
+in the main tree, the `.claude/` allowlist.
+
+Scripts: `phase-c3.sh` (builds, gates, both A/Bs, phase D's rebase-free legs), `phase-c5.sh`
+(the exempt-250 pair), `phase-c6.sh` (the Unsloth retry). `phase-c2.sh` and `phase-c4.sh` are the
+stopped and failed attempts, kept for the record.
