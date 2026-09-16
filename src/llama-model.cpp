@@ -1436,12 +1436,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+    if (ml.lazy_mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                ml.lazy_mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
@@ -1912,7 +1912,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
 }
 #else
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+    if (ml.lazy_mode == LLAMA_LAZY_MODE_DIRECT) {
         LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
     }
     return nullptr;
