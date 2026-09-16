@@ -323,11 +323,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
-        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, flags);
+        layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
         layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
-        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, flags);
+        layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
         layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
         layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
@@ -417,7 +417,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
         ggml_tensor * x2 = ggml_reshape_2d(ctx0, x, hc_dim, nt);
 
-        ggml_tensor * lo_inj = ggml_hc_mix_down(ctx0, x2, w_norm, w_down, inject ? w_inject : nullptr, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        ggml_tensor * lo_inj = ggml_hc_mix_down(ctx0, x2, ggml_reshape_1d(ctx0, w_norm, hc_dim), w_down, inject ? w_inject : nullptr, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
         cb(lo_inj, "hc_lo_inj", il);
 
         ggml_tensor * lo = inject ? ggml_view_2d(ctx0, lo_inj, lr, nt, lo_inj->nb[1], 0) : lo_inj;
@@ -427,7 +427,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
             cb(*inject, "hc_inject", il);
         }
 
-        ggml_tensor * mixed = ggml_hc_mix_up(ctx0, x2, w_norm, w_up, lo, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        ggml_tensor * mixed = ggml_hc_mix_up(ctx0, x2, ggml_reshape_1d(ctx0, w_norm, hc_dim), w_up, lo, (int) hc, hparams.f_norm_rms_eps, 1.0f / (float) hc);
         cb(mixed, "hc_mixed", il);
 
         return mixed;
