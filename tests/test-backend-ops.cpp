@@ -8427,7 +8427,7 @@ struct test_flash_attn_ext_lse : public test_case {
 
         ggml_tensor * fa = ggml_flash_attn_ext_with_lse(ctx, q, k, v, m, 1.0f/sqrtf(hsk), 0.0f, logit_softcap);
         ggml_flash_attn_ext_add_sinks(fa, s);
-        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
         ggml_set_name(fa, "fa");
 
         const int64_t n_rows = fa->ne[1]*fa->ne[2]*(fa->ne[3] - 1); // n_head*n_q*ne3
@@ -8495,7 +8495,7 @@ struct test_fa_pad : public test_case {
         }
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, k, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_sinks(out, s);
-        ggml_flash_attn_ext_set_prec (out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
     }
@@ -8585,7 +8585,7 @@ struct test_flash_attn_ext_batch_invariance : public test_case {
         auto flash = [&](ggml_tensor * q_i, ggml_tensor * mask_i) {
             ggml_tensor * result = ggml_flash_attn_ext(ctx, q_i, k, v, mask_i,
                     1.0f/sqrtf((float) head_size), 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
+            ggml_prec_set_acc(result, GGML_PREC_F32);
             return result;
         };
 

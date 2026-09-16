@@ -927,7 +927,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
                     raw_mask, kq_scale, 0.0f, 0.0f);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa_raw, il});
             ggml_flash_attn_ext_add_sinks(fa_raw, sinks);
-            ggml_flash_attn_ext_set_prec (fa_raw, GGML_PREC_F32);
+            ggml_prec_set_acc(fa_raw, GGML_PREC_F32);
             cb(fa_raw, "csa_fa_raw", il);
 
             // union remainder half: per-tile disjoint unions, tiles ride ne3
@@ -940,7 +940,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             ggml_tensor * fa_uni = ggml_flash_attn_ext_with_lse(ctx0, q_tiles, k_uni, v_uni,
                     memb, kq_scale, 0.0f, 0.0f);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa_uni, il});
-            ggml_flash_attn_ext_set_prec(fa_uni, GGML_PREC_F32);
+            ggml_prec_set_acc(fa_uni, GGML_PREC_F32);
             cb(fa_uni, "csa_fa_uni", il);
 
             // rows align between the halves (g = t*W + iq): [hd,n_head,nt_s,1+1]
